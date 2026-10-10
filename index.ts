@@ -1,374 +1,407 @@
 /**
- * dont-stop — model mode selection and loop control plugin.
- * 
- * Provides:
- * - Four deterministic modes: free, cheap, local, power
- * - Model discovery and catalogue with detailed capabilities
- * - Loop start/stop with automatic model switching
- * - Runtime mode switching via state file
- * 
- * Fixes the root-cause issue: profiles now actually change models
- * on running sessions via ctx.session.switchModel().
+ * dont-stop — server entrypoint.
+ *
+ * Wires the engine to the opencode server context and owns everything that
+ * must exist headlessly: the command API, the state-file watcher the TUI
+ * writes through, and the event pump.
+ *
+ * The root-cause fix lives in `lib/apply.ts` and is exercised here: on every
+ * meaningful change we push the plan through *both* channels, so a mode
+ * switch reaches sessions that already pinned a model.
  */
 
 import { watch } from "node:fs"
-import { dirname, basename } from "node:path"
+import { existsSync, readFileSync } from "node:fs"
+import { basename, dirname } from "node:path"
 
-// The plugin system expects a default export with { id, setup }.
-// The setup function receives the opencode context and returns a teardown.
+import { LoopEngine } from "./lib/engine.ts"
+import { createLogger } from "./lib/log.ts"
+import {
+  MODES,
+  readState,
+  statePath,
+  writeState,
+  type Mode,
+  type PluginState,
+} from "./lib/state.ts"
+import { exportSummary } from "./lib/catalogue.ts"
+import { describeMode } from "./lib/modes.ts"
+import { DEFAULT_CLOCKS } from "./lib/clocks.ts"
 
-// Model catalogue interface
-interface CatalogueModel {
-  key: string
-  providerID: string
-  id: string
-  name: string
-  description: string
-  context: number
-  vision: boolean
-  audio: boolean
-  pdf: boolean
-  text: boolean
-  reasoningScore: number
-  codeScore: number
-  verified: boolean
-  available: boolean
-  availabilityReason: string | null
-  inputCost: number
-  outputCost: number
-  status: string
-  deprecated: boolean
-  capabilityScore: number
+/** Where a prompt file may live, resolved against the cwd. */
+function resolvePromptFile(path: string): string {
+  const home = process.env.HOME ?? ""
+  if (path.startsWith("~/")) return `${home}${path.slice(1)}`
+  return path
 }
 
-interface CatalogueState {
-  version: number
-  lastUpdated: number
-  models: CatalogueModel[]
-  byKey: Map<string, CatalogueModel>
-  byProvider: Map<string, CatalogueModel[]>
+/** Read a prompt from a file. Throws a descriptive error on failure. */
+function readPromptFile(path: string): string {
+  const resolved = resolvePromptFile(path)
+  if (!existsSync(resolved)) {
+    throw new Error(`prompt file not found: ${resolved}`)
+  }
+  const text = readFileSync(resolved, "utf8")
+  const trimmed = text.trim()
+  if (trimmed.length === 0) {
+    throw new Error(`prompt file is empty: ${resolved}`)
+  }
+  return trimmed
 }
 
 export default {
   id: "dont-stop",
 
-  async setup(ctx) {
-    // State management
-    const STATE_FILE = `${require("node:os").homedir()}/.config/opencode/dont-stop-state.json`
+  async setup(ctx: unknown) {
+    const context = ctx as PluginServerContext
+    const state: PluginState = readState()
+    const log = createLogger(state)
 
-    // Read persisted state
-    let state = {
-      mode: "free",
-      status: "stopped",
-      sessionID: null,
-      iterations: 0,
-    }
+    const persist = () => writeState(state)
 
-    try {
-      const fs = require("node:fs")
-      if (fs.existsSync(STATE_FILE)) {
-        const saved = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"))
-        state = { ...state, ...saved }
-      }
-    } catch (e) {
-      // Best effort
-    }
+    const engine = new LoopEngine(
+      context as unknown as Parameters<typeof LoopEngine.prototype.constructor>[0],
+      state,
+      log,
+      {
+        clocks: DEFAULT_CLOCKS,
+        onStateChange: persist,
+      },
+    )
 
-    // ------------------------------------------------------------ helper: log
-    function log(prefix: string, message: string) {
-      console.log(`[dont-stop] ${prefix}: ${message}`)
-    }
+    /* ------------------------------------------------------------ command */
 
-    // ------------------------------------------------------------ model catalogue
-    let catalogue: CatalogueState | null = null
-
-    async function buildCatalogue(): Promise<CatalogueState> {
-      const models: CatalogueModel[] = []
-      const byProvider = new Map<string, CatalogueModel[]>()
-      const now = Date.now()
-
-      // 1. Server registry models
-      const registryModels = ctx.model.list?.()?.data ?? []
-      for (const m of registryModels) {
-        const cat = fromRegistry(m.providerID, m)
-        models.push(cat)
-        if (!byProvider.has(m.providerID)) byProvider.set(m.providerID, [])
-        byProvider.get(m.providerID)!.push(cat)
-      }
-
-      // 2. Ollama models (local)
-      const ollamaModels = await fetchOllamaModels()
-      for (const m of ollamaModels) {
-        const cat = fromRegistry("ollama", m)
-        cat.verified = false
-        cat.inputCost = 0
-        cat.outputCost = 0
-        models.push(cat)
-        if (!byProvider.has("ollama")) byProvider.set("ollama", [])
-        byProvider.get("ollama")!.push(cat)
-      }
-
-      // Compute capability scores
-      for (const m of models) {
-        m.capabilityScore =
-          m.reasoningScore * 0.4 +
-          m.codeScore * 0.3 +
-          (m.context / 100000) * 0.2 +
-          (m.verified ? 1 : 0.5) * 0.1
-      }
-
-      const byKey = new Map(models.map((m) => [m.key, m]))
-
-      return { version: 1, lastUpdated: now, models, byKey, byProvider }
-    }
-
-    function fromRegistry(
-      providerID: string,
-      model: any,
-      liveProbe: { available: boolean; reason?: string } = { available: true }
-    ): CatalogueModel {
-      const cost = model.cost ?? []
-      const limit = model.limit ?? {}
-
-      return {
-        key: `${providerID}/${model.id ?? model.modelID ?? "unknown"}`,
-        providerID,
-        id: model.id ?? model.modelID ?? "unknown",
-        name: model.name ?? model.modelID ?? "unknown",
-        description: model.package ? `Model from package ${model.package}` : "",
-        context: limit.context ?? 0,
-        vision:
-          (model.capabilities?.input ?? []).includes("image") ||
-          (model.capabilities?.output ?? []).includes("text"),
-        audio:
-          (model.capabilities?.input ?? []).includes("audio") ||
-          (model.capabilities?.output ?? []).includes("audio"),
-        pdf:
-          (model.capabilities?.input ?? []).includes("pdf") ||
-          (model.capabilities?.output ?? []).includes("pdf"),
-        text:
-          (model.capabilities?.input ?? []).includes("text") ||
-          (model.capabilities?.output ?? []).includes("text"),
-        reasoningScore:
-          model.reasoningScore ??
-          (model.variant?.includes("max")
-            ? 10
-            : model.variant?.includes("high")
-            ? 7
-            : 5),
-        codeScore: model.codeScore ?? (model.variant?.includes("code") ? 10 : 5),
-        verified: true,
-        available: liveProbe.available,
-        availabilityReason: liveProbe.reason ?? null,
-        inputCost: cost?.[0]?.input ?? 0,
-        outputCost: cost?.[0]?.output ?? 0,
-        status: model.status ?? "active",
-        deprecated: model.status === "deprecated",
-        capabilityScore: 0,
-      }
-    }
-
-    async function fetchOllamaModels(): Promise<Array<{ id: string; name?: string }>> {
-      try {
-        const res = await fetch("http://localhost:11434/api/models", {
-          signal: AbortSignal.timeout(5000),
-        })
-        if (!res.ok) return []
-        const data = await res.json()
-        return (data.data ?? []).map((m: any) => ({ id: m.id, name: m.name }))
-      } catch {
-        return []
-      }
-    }
-
-    function exportSummary(cat: CatalogueState): string {
-      const lines = [
-        ` Catalogue: ${cat.models.length} models, updated: ${new Date(
-          cat.lastUpdated
-        ).toLocaleString()}`,
-      ]
-      for (const m of cat.models.slice(0, 20)) {
-        const status = m.available ? "✓" : "✗"
-        const v = m.vision ? "V" : "-"
-        const c = m.codeScore > 0 ? `C${m.codeScore}` : "-"
-        const ctx = `${Math.round(m.context / 1000)}k`
-        lines.push(`  ${status} ${m.providerID}/${m.id} ${v} ${c} ${ctx} ctx`)
-      }
-      return lines.join("\n")
-    }
-
-    // Build catalogue on startup (non-blocking)
-    buildCatalogue().then((cat) => {
-      catalogue = cat
-      log("catalogue", `${cat.models.length} models loaded`)
-    }).catch((error) => {
-      log("catalogue build failed", String(error?.message ?? error))
-    })
-
-    // ------------------------------------------------------------ command handler
-    async function handleCommand(raw: string) {
-      const args = String(raw ?? "").trim()
-      const [verb, ...rest] = args.split(/\s+/)
-
-      const ensureCatalogue = async (): Promise<CatalogueState> => {
-        if (catalogue) return catalogue
-        catalogue = await buildCatalogue()
-        return catalogue
-      }
-
-      // Status command
-      if (!verb || verb === "status") {
-        try {
-          const cat = await ensureCatalogue()
-          const summary = exportSummary(cat)
-          return `dont-stop status:\n  mode: ${state.mode}\n  loop: ${state.status}\n  session: ${state.sessionID || "none"}\n  iterations: ${state.iterations}\n  models: ${cat.models.length} discovered${summary ? `\n${summary}` : ""}`
-        } catch (e) {
-          return `dont-stop status: mode=${state.mode}, loop=${state.status}, error: ${String(e?.message ?? e)}`
-        }
-      }
-
-      // Mode switch: free, cheap, local, power
-      if (["free", "cheap", "local", "power"].includes(verb)) {
-        state.mode = verb
-        state.status = "active"
-        try {
-          const fs = require("node:fs")
-          fs.writeFileSync(STATE_FILE, JSON.stringify(state), "utf8")
-        } catch (e) {
-          // Best effort
-        }
-        // Notify all tracked sessions to switch model
-        for (const [sid, record] of tracked) {
-          try {
-            await ctx.session.switchModel({ sessionID: sid, model: `${state.mode}-model` })
-          } catch (e) {
-            // Some sessions may not support it
-          }
-        }
-        return `mode set to ${verb}`
-      }
-
-      // Start loop
-      if (verb === "start") {
-        const prompt = rest.join(" ")
-        if (!prompt) {
-          return "Usage: /dont-stop-set start <prompt>"
-        }
-        state.status = "active"
-        state.sessionID = state.sessionID || "current"
-        state.iterations = 0
-        try {
-          const fs = require("node:fs")
-          fs.writeFileSync(STATE_FILE, JSON.stringify(state), "utf8")
-        } catch (e) {
-          // Best effort
-        }
-        return `loop started with prompt: "${prompt}" (mode: ${state.mode})`
-      }
-
-      // Stop loop
-      if (verb === "stop") {
-        state.status = "stopped"
-        state.sessionID = null
-        state.iterations = 0
-        try {
-          const fs = require("node:fs")
-          fs.writeFileSync(STATE_FILE, JSON.stringify(state), "utf8")
-        } catch (e) {
-          // Best effort
-        }
-        return "loop stopped"
-      }
-
-      // Probe/discover models
-      if (verb === "probe" || verb === "discover") {
-        try {
-          const cat = await ensureCatalogue()
-          const ollamaModels = cat?.models.filter((m) => m.providerID === "ollama") ?? []
-          return `model discovery: ${cat?.models.length ?? 0} total models\n${ollamaModels.slice(0, 10).map((m) => `  - ${m.providerID}/${m.id} ctx:${Math.round(m.context/1000)}k ver:${m.verified}`).join("\n")}`
-        } catch (e) {
-          return `model discovery: error - ${String(e?.message ?? e)}`
-        }
-      }
-
-      // Best-for agent
-      if (verb === "best-for") {
-        const agentType = rest[0]?.toLowerCase() || "architect"
-        try {
-          const cat = await ensureCatalogue()
-          const best = getBestModelForAgent(cat, agentType)
-          if (best) {
-            return `best model for ${agentType}: ${best.providerID}/${best.id} (context:${Math.round(best.context/1000)}k, code:${best.codeScore}, vision:${best.vision}, reasoning:${best.reasoningScore})`
-          }
-          return `best model for ${agentType}: no suitable model found`
-        } catch (e) {
-          return `best model for ${agentType}: error - ${String(e?.message ?? e)}`
-        }
-      }
-
-      return `Unknown verb: ${verb}. Try: status, mode free/cheap/local/power, start <prompt>, stop, probe, best-for <agent>`
-    }
-
-    // Get best model for agent type
-    function getBestModelForAgent(cat: CatalogueState, agentType: string): CatalogueModel | null {
-      const agentNeeds: Record<string, { vision?: boolean; minContext?: number; prefersCode?: boolean }> = {
-        architect: { vision: true, minContext: 100000, prefersCode: true },
-        build: { vision: false, minContext: 32000, prefersCode: true },
-        review: { vision: false, minContext: 32000, prefersCode: false },
-        general: { vision: false, minContext: 32000, prefersCode: false },
-        explore: { vision: true, minContext: 64000, prefersCode: false },
-      }
-
-      const needs = agentNeeds[agentType] || { minContext: 32000, prefersCode: false }
-      const candidates = cat.models.filter((m) => {
-        if (needs.vision !== undefined && m.vision !== needs.vision) return false
-        if (m.context < needs.minContext) return false
-        return true
-      })
-
-      if (!candidates.length) return null
-
-      candidates.sort((a, b) => {
-        const aCode = a.codeScore || 0
-        const bCode = b.codeScore || 0
-        if (aCode !== bCode) return bCode - aCode
-        if (a.context !== b.context) return b.context - a.context
-        return b.capabilityScore - a.capabilityScore
-      })
-
-      return candidates[0] ?? null
-    }
-
-    // ------------------------------------------------------------ command registration
-    await ctx.command.transform((editor) => {
+    await context.command.transform((editor) => {
       editor.add({
         name: "dont-stop-set",
         description:
-          "Control the loop: status, mode free/cheap/local/power, start <prompt>, stop, probe, best-for",
-        execute: async (input) => {
+          "Control dont-stop: status, mode free|cheap|local|power, start <prompt | --prompt-file PATH>, stop, probe, best-for <agent>, update-model-catalogue",
+        execute: async (input: { prompt?: string | { text?: string }; sessionID?: string }) => {
           const raw =
-            typeof input?.prompt === "string"
-              ? input.prompt
-              : input?.prompt?.text
-          const result = await handleCommand(raw)
-          console.log("dont-stop:", result)
-          return result
+            typeof input?.prompt === "string" ? input.prompt : input?.prompt?.text ?? ""
+          return runCommand(String(raw), {
+            state,
+            engine,
+            log,
+            persist,
+            sessionID: input?.sessionID,
+          })
         },
       })
     })
 
-    // ------------------------------------------------------------ tracked sessions
-    const tracked = new Map()
+    /* ------------------------------------------------------------- events */
 
-    // ------------------------------------------------------------ teardown
-    return async () => {
+    const abort = new AbortController()
+    let iterator: AsyncIterator<{ type: string; properties?: Record<string, unknown> }> | undefined
+
+    const consumer = (async () => {
       try {
-        const fs = require("node:fs")
-        fs.writeFileSync(STATE_FILE, JSON.stringify(state), "utf8")
-      } catch (e) {
-        // Best effort
+        const subscription = context.event.subscribe({ signal: abort.signal })
+        iterator = subscription[Symbol.asyncIterator]()
+        for (;;) {
+          const next = await iterator.next()
+          if (next.done) break
+          engine.observe(next.value)
+          const event = next.value
+          if (event.type === "session.error" || event.type === "message.error") {
+            const props = event.properties as
+              | { info?: { id?: string }; sessionID?: string; error?: { message?: string; status?: number; type?: string }; agent?: string }
+              | undefined
+            await engine.onError({
+              sessionID: props?.sessionID ?? props?.info?.id,
+              agent: props?.agent,
+              message: props?.error?.message,
+              status: props?.error?.status,
+              type: props?.error?.type,
+            })
+          } else if (event.type === "session.idle" && state.loop.status === "active") {
+            engine.completeIteration()
+            persist()
+          }
+        }
+      } catch (error) {
+        if (!abort.signal.aborted) {
+          log.warn(`event consumer stopped: ${messageOf(error)}`)
+        }
       }
-      console.log("dont-stop unloaded, state saved")
+    })()
+
+    /* ------------------------------------------------------- state file watch */
+
+    // The TUI writes this file to request a mode change or a loop. Only the
+    // fields it can legitimately initiate are reconciled; the engine's own
+    // writes already describe the engine and are ignored.
+    let settle: ReturnType<typeof setTimeout> | undefined
+    const watcher = watch(dirname(statePath()), (_event, filename) => {
+      if (filename && basename(filename) !== basename(statePath())) return
+      clearTimeout(settle)
+      settle = setTimeout(() => {
+        void reconcileFromFile()
+      }, 150)
+    })
+
+    async function reconcileFromFile(): Promise<void> {
+      const incoming = readState()
+
+      if (incoming.mode !== state.mode) {
+        const mode = MODES.includes(incoming.mode) ? incoming.mode : state.mode
+        log.info(`mode changed externally to ${mode}`)
+        await engine.setMode(mode)
+        persist()
+      }
+
+      const loop = incoming.loop
+      if (loop?.status === "active" && state.loop.status !== "active") {
+        const sessionID = loop.sessionID ?? newestTracked()
+        const prompt = loop.prompt || resolvePrompt(loop)
+        if (sessionID && prompt) {
+          await engine.start(sessionID, prompt)
+          persist()
+        } else {
+          log.warn("cannot start the loop: no session or no prompt")
+        }
+      } else if (loop?.status === "stopped" && state.loop.status === "active") {
+        await engine.stop(loop.lastResult ?? "stopped from the state file")
+        persist()
+      }
+    }
+
+    /** A prompt may arrive as text or as a `--prompt-file` reference. */
+    function resolvePrompt(loop: { prompt?: string }): string {
+      const prompt = loop.prompt ?? ""
+      const match = /^\s*--prompt-file[=\s]+(.+)$/m.exec(prompt)
+      if (match) {
+        try {
+          return readPromptFile(match[1].trim())
+        } catch (error) {
+          log.error(messageOf(error))
+          return ""
+        }
+      }
+      return prompt
+    }
+
+    function newestTracked(): string | null {
+      let newest: string | null = null
+      let at = 0
+      for (const record of engine.trackedSessions()) {
+        if (record.lastSeen > at) {
+          at = record.lastSeen
+          newest = record.sessionID
+        }
+      }
+      return newest
+    }
+
+    /* ------------------------------------------------------------- startup */
+
+    log.info(`dont-stop starting in ${state.mode} mode (${describeMode(state.mode)})`)
+
+    // Agents from agents/*.md are not in the registry when a transform first
+    // registers, so replay the transform once they have loaded.
+    const timers = [500, 2000, 5000].map((delay) =>
+      setTimeout(() => {
+        void context.agent.reload().catch(() => {})
+      }, delay),
+    )
+
+    // Discovery must not hold up startup; the engine applies the plan the
+    // moment it lands.
+    const heartbeat = setInterval(() => {
+      void engine.beat().catch((error) => log.warn(`heartbeat failed: ${messageOf(error)}`))
+    }, DEFAULT_CLOCKS.intervalMs)
+
+    void engine
+      .discover()
+      .then(() => engine.refresh(true))
+      .catch((error) => log.warn(`startup discovery failed: ${messageOf(error)}`))
+
+    return () => {
+      abort.abort()
+      watcher.close()
+      clearTimeout(settle)
+      clearInterval(heartbeat)
+      for (const timer of timers) clearTimeout(timer)
+      void engine.stop("plugin unloaded")
+      persist()
+      const termination = Promise.allSettled([consumer, iterator?.return?.()])
+      void Promise.race([termination, new Promise((resolve) => setTimeout(resolve, 2000))])
     }
   },
+}
+
+/* ----------------------------------------------------------------- commands */
+
+interface CommandEnv {
+  state: PluginState
+  engine: LoopEngine
+  log: ReturnType<typeof createLogger>
+  persist: () => void
+  sessionID?: string
+}
+
+/**
+ * The headless command surface. Kept as a plain function so it can be tested
+ * without a live server, and so the TUI can call the same verbs.
+ */
+export function runCommand(raw: string, env: CommandEnv): string {
+  const { state, engine, log, persist, sessionID } = env
+  const [verb, ...rest] = raw.trim().split(/\s+/)
+
+  if (!verb || verb === "status" || verb === "help") {
+    return formatStatus(state, engine)
+  }
+
+  if ((MODES as readonly string[]).includes(verb)) {
+    void engine.setMode(verb as Mode).then(persist)
+    return `mode set to ${verb} — ${describeMode(verb as Mode)}`
+  }
+
+  if (verb === "start") {
+    // `--prompt-file PATH` reads the prompt from disk; anything else is the
+    // prompt itself. The flag may appear anywhere in the arguments.
+    const fileIndex = rest.findIndex((arg) => arg === "--prompt-file")
+    if (fileIndex !== -1) {
+      const path = rest[fileIndex + 1]
+      if (!path) return "usage: dont-stop-set start --prompt-file <path>"
+      let prompt: string
+      try {
+        prompt = readPromptFile(path)
+      } catch (error) {
+        return `error: ${messageOf(error)}`
+      }
+      rest.splice(fileIndex, 2)
+      const inline = rest.join(" ").trim()
+      if (inline) prompt = `${inline}\n\n${prompt}`
+      const target = sessionID ?? newestTrackedFor(engine)
+      if (!target) return "error: no session to run the loop on"
+      void engine.start(target, prompt).then(persist)
+      return `loop started from ${path} on ${target} (mode: ${state.mode})`
+    }
+
+    const prompt = rest.join(" ").trim()
+    if (!prompt) return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
+    const target = sessionID ?? newestTrackedFor(engine)
+    if (!target) return "error: no session to run the loop on"
+    void engine.start(target, prompt).then(persist)
+    return `loop started on ${target} (mode: ${state.mode})`
+  }
+
+  if (verb === "stop") {
+    void engine.stop(rest.join(" ").trim() || "stopped by command").then(persist)
+    return "loop stopped"
+  }
+
+  if (verb === "probe" || verb === "discover") {
+    const catalogue = engine.model
+    if (!catalogue) return "catalogue not built yet; try again shortly"
+    return exportSummary(catalogue)
+  }
+
+  if (verb === "best-for") {
+    const agent = rest[0]?.toLowerCase() || "general"
+    const catalogue = engine.model
+    if (!catalogue) return "catalogue not built yet; try again shortly"
+    const ranked = engine.buildPlan()
+    const slot = ranked.agents[agent] ?? ranked.main
+    if (!slot) return `no model assigned for ${agent}`
+    return `${agent}: ${slot.providerID}/${slot.id}`
+  }
+
+  if (verb === "update-model-catalogue" || verb === "update-catalogue") {
+    void engine
+      .discover()
+      .then(() => {
+        persist()
+        return engine.refresh(true)
+      })
+      .then(persist)
+      .catch((error) => log.error(`catalogue update failed: ${messageOf(error)}`))
+    return "model catalogue refresh started"
+  }
+
+  if (verb === "track") {
+    const target = rest[0] ?? sessionID
+    if (!target) return "usage: dont-stop-set track <sessionID>"
+    engine.track(target)
+    return `tracking ${target}`
+  }
+
+  return [
+    `unknown verb: ${verb}`,
+    `try: status · mode ${MODES.filter((m) => m !== "stop").join("|")} · start <prompt | --prompt-file PATH> · stop · probe · best-for <agent> · update-model-catalogue`,
+  ].join("\n")
+}
+
+function formatStatus(state: PluginState, engine: LoopEngine): string {
+  const lines = [
+    `dont-stop — mode ${state.mode}${state.degraded ? ` (degraded from ${state.preferredMode})` : ""}`,
+    `  ${describeMode(state.mode)}`,
+    `  loop: ${state.loop.status}${state.loop.sessionID ? ` on ${state.loop.sessionID}` : ""}`,
+    `  iterations: ${state.loop.iterations}`,
+  ]
+  if (state.loop.prompt) lines.push(`  prompt: ${truncate(state.loop.prompt, 60)}`)
+  if (state.loop.lastResult) lines.push(`  last: ${state.loop.lastResult}`)
+  if (state.main) lines.push(`  main model: ${state.main.providerID}/${state.main.id}`)
+
+  const agents = Object.entries(state.agentModels)
+  if (agents.length > 0) {
+    lines.push("  agents:")
+    for (const [agent, slot] of agents) {
+      lines.push(`    ${agent}: ${slot.providerID}/${slot.id}`)
+    }
+  }
+
+  const cooldowns = Object.entries(state.cooldowns).filter(([, until]) => until > Date.now())
+  if (cooldowns.length > 0) {
+    lines.push(`  cooling: ${cooldowns.map(([key]) => key).join(", ")}`)
+  }
+
+  const catalogue = engine.model
+  if (catalogue) {
+    lines.push(`  catalogue: ${catalogue.models.length} models`)
+  }
+
+  const errors = state.log.filter((entry) => entry.level === "error" || entry.level === "warn").slice(-3)
+  if (errors.length > 0) {
+    lines.push("  recent:")
+    for (const entry of errors) lines.push(`    [${entry.level}] ${entry.message}`)
+  }
+
+  return lines.join("\n")
+}
+
+function newestTrackedFor(engine: LoopEngine): string | null {
+  let newest: string | null = null
+  let at = 0
+  for (const record of engine.trackedSessions()) {
+    if (record.lastSeen > at) {
+      at = record.lastSeen
+      newest = record.sessionID
+    }
+  }
+  return newest
+}
+
+function truncate(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max - 1)}…`
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/* -------------------------------------------------------------------- types */
+
+interface AgentEditor {
+  list(): readonly Array<{ id: string; model?: unknown }>
+  update(id: string, update: (agent: { model?: unknown }) => void): void
+}
+
+interface PluginServerContext {
+  command: { transform(fn: (editor: { add(input: { name: string; description: string; execute: (input: { prompt?: string | { text?: string }; sessionID?: string }) => Promise<string> | string }): void }) => void): Promise<unknown> }
+  agent: { reload(): Promise<unknown> }
+  event: { subscribe(input: { signal: AbortSignal }): AsyncIterable<{ type: string; properties?: Record<string, unknown> }> }
+  model: { list(): Promise<{ data?: unknown }> }
 }
