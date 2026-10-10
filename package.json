@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Self-sustaining agent loop with dynamic model selection.",
+  "description": "Self-sustaining agent loop with deterministic model selection.",
   "exports": {
     ".": "./index.ts",
     "./tui": "./tui.ts"
