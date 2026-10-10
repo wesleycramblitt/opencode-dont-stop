@@ -131,15 +131,20 @@ function rankFree(cat: Catalogue, candidates: CatalogueModel[], task: TaskProfil
  * chain if it can actually do the task — the cheapest *vision* model when
  * vision is required, the cheapest *tool-calling* model when tools are
  * needed. Among rows that qualify, price decides and capability breaks ties.
+ *
+ * The chain has a deliberate shape: the three cheapest rows that qualify, then
+ * the three most capable rows that qualify. The head saves money on the easy
+ * case; the tail gives the loop somewhere to go when a cheap model turns out
+ * to be too weak, without having to leave the mode. Rows that cannot do the
+ * task are excluded up front, so "cheapest" never buys a model that then
+ * fails on capability.
  */
 function rankCheap(candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
   const qualified = candidates.filter((m) => meetsTask(m, task))
   if (qualified.length === 0) return sortBy(candidates, sorts.cheapest)
 
-  const ranked = sortBy(qualified, sorts.cheapest)
-  // Keep the cheapest few, then the most capable few, so a chain has room to
-  // both save money and recover when a cheap model fails.
-  const cheapest = ranked.slice(0, 3)
+  const byPrice = sortBy(qualified, sorts.cheapest)
+  const cheapest = byPrice.slice(0, 3)
   const capable = sortBy(qualified, sorts.capability).slice(0, 3)
   return dedupe([...cheapest, ...capable])
 }
