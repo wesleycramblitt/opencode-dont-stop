@@ -1,0 +1,289 @@
+/**
+ * dont-stop — Mode strategies.
+ *
+ * A mode is a policy, not a list. Each mode answers three questions:
+ *
+ * 1. What does a *task* require of a model? (capability, context, price)
+ * 2. Which models satisfy it, and in what order should they be tried?
+ * 3. When one fails, what does the mode do about it?
+ *
+ * Every strategy is a deterministic filter-and-sort over the catalogue, so a
+ * decision can always be replayed and explained. The ranking adjusts for the
+ * agent type because an architect and a build agent want different things from
+ * the same catalogue.
+ */
+
+import {
+  blendedPrice,
+  filter,
+  isFree,
+  isUsable,
+  meets,
+  sortBy,
+  sorts,
+  type Catalogue,
+  type CatalogueModel,
+  type Requirements,
+} from "./catalogue.ts"
+import type { Mode } from "./state.ts"
+
+/** The agents opencode ships with, plus a catch-all. */
+export type AgentKind = "architect" | "build" | "review" | "general" | "explore" | "other"
+
+/** What a kind of work demands of a model. */
+export interface TaskProfile {
+  kind: AgentKind
+  /** True when the task involves reading images, screenshots or diagrams. */
+  vision: boolean
+  /** Minimum context in tokens worth spending on this task. */
+  minContext: number
+  /** Weight 0-1 on code strength vs general strength for this task. */
+  codeWeight: number
+  /** True when the work is primarily planning rather than editing. */
+  planning: boolean
+}
+
+/** Capability requirements derived from a task profile. */
+export function requirementsFor(task: TaskProfile): Requirements {
+  return {
+    vision: task.vision || undefined,
+    minContext: task.minContext,
+    minCode: task.planning ? undefined : Math.round(4 + task.codeWeight * 4),
+    allowLocal: undefined,
+  }
+}
+
+/** Per-agent baseline profiles. These are defaults; a caller can override. */
+export const AGENT_PROFILES: Record<AgentKind, Omit<TaskProfile, "vision">> = {
+  // Architects read diagrams and reason across a large surface, so they want
+  // vision and the biggest context available, and they benefit from strong
+  // reasoning rather than raw code throughput.
+  architect: { kind: "architect", minContext: 100000, codeWeight: 0.3, planning: true },
+  // Build agents edit code: strong code, enough context for a real file tree,
+  // and no need for vision in the common case.
+  build: { kind: "build", minContext: 32000, codeWeight: 0.8, planning: false },
+  // Review reads diffs and reasons about correctness. Code-heavy, moderate
+  // context, benefits from reasoning.
+  review: { kind: "review", minContext: 64000, codeWeight: 0.7, planning: false },
+  // General purpose assistance.
+  general: { kind: "general", minContext: 32000, codeWeight: 0.5, planning: false },
+  // Exploration reads widely and navigates; vision helps with screenshots.
+  explore: { kind: "explore", minContext: 64000, codeWeight: 0.4, planning: false },
+  other: { kind: "other", minContext: 32000, codeWeight: 0.5, planning: false },
+}
+
+/** Build a task profile for an agent kind, inheriting that kind's defaults. */
+export function profileFor(kind: AgentKind, overrides: Partial<TaskProfile> = {}): TaskProfile {
+  const base = AGENT_PROFILES[kind] ?? AGENT_PROFILES.other
+  return { ...base, ...overrides, kind }
+}
+
+/** Rank rows for one task under one mode. Pure and deterministic. */
+export function rankForMode(cat: Catalogue, mode: Mode, task: TaskProfile): CatalogueModel[] {
+  // `stop` is not a real mode: it selects nothing so the loop can halt.
+  if (mode === "stop") return []
+  const req = requirementsFor(task)
+  const candidates = filter(cat, req)
+  if (candidates.length === 0) return []
+
+  switch (mode) {
+    case "free":
+      return rankFree(cat, candidates, task)
+    case "cheap":
+      return rankCheap(candidates, task)
+    case "local":
+      return rankLocal(candidates, task)
+    case "power":
+      return rankPower(candidates, task)
+  }
+}
+
+/**
+ * Free mode: sweep verified zero-cost models by capability, then fall back to
+ * the best local model. The sweep is over *free* rows only — a paid row never
+ * enters a free chain — so "no free models available" genuinely means the
+ * sweep found nothing and the local fallback is correct, not a silent upgrade.
+ */
+function rankFree(cat: Catalogue, candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
+  const free = candidates.filter(isFree)
+  const paidFree: CatalogueModel[] = []
+  const localFree: CatalogueModel[] = []
+  for (const m of free) {
+    if (m.local) localFree.push(m)
+    else paidFree.push(m)
+  }
+
+  // Verified remote free rows first: confirmed free and confirmed capable.
+  const verifiedFree = sortBy(paidFree.filter((m) => !m.estimation.estimated), sorts.verifiedFirst)
+  const estimatedFree = sortBy(paidFree.filter((m) => m.estimation.estimated), sorts.verifiedFirst)
+  const remote = [...verifiedFree, ...estimatedFree]
+
+  // Local fallback: best local model for the task, cheapest context first.
+  const local = sortBy(localFree, sorts.localFirst)
+
+  // If there is no free remote row at all, local leads so the loop is not
+  // left with an empty chain.
+  return remote.length > 0 ? [...remote, ...local] : [...local, ...remote]
+}
+
+/**
+ * Cheap mode: cheapest first, but capability-gated. A row only enters the
+ * chain if it can actually do the task — the cheapest *vision* model when
+ * vision is required, the cheapest *tool-calling* model when tools are
+ * needed. Among rows that qualify, price decides and capability breaks ties.
+ */
+function rankCheap(candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
+  const qualified = candidates.filter((m) => meetsTask(m, task))
+  if (qualified.length === 0) return sortBy(candidates, sorts.cheapest)
+
+  const ranked = sortBy(qualified, sorts.cheapest)
+  // Keep the cheapest few, then the most capable few, so a chain has room to
+  // both save money and recover when a cheap model fails.
+  const cheapest = ranked.slice(0, 3)
+  const capable = sortBy(qualified, sorts.capability).slice(0, 3)
+  return dedupe([...cheapest, ...capable])
+}
+
+/**
+ * Local mode: best local model for the task, mindful of GPU budget. Local
+ * rows are ranked by capability among those that fit the task; a non-local
+ * row only appears if no local row can serve the task at all, so the mode
+ * stays honest about being "local".
+ */
+function rankLocal(candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
+  const local = sortBy(candidates.filter((m) => m.local && meetsTask(m, task)), sorts.capabilityContext)
+  if (local.length > 0) return local
+  // Fall back to any local row, even one that only partially fits.
+  const loose = sortBy(candidates.filter((m) => m.local), sorts.capability)
+  if (loose.length > 0) return loose
+  // No local model can do this: allow remote rather than fail the task.
+  return sortBy(candidates.filter(meetsTask), sorts.capabilityContext)
+}
+
+/**
+ * Power mode: most capable model that can actually do the task, re-evaluated
+ * per turn. Ranking favours the task's dominant strength and breaks ties on
+ * capability and context, so "power" means "most powerful *for this*", not
+ * "most expensive".
+ */
+function rankPower(candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
+  const qualified = candidates.filter((m) => meetsTask(m, task))
+  const pool = qualified.length > 0 ? qualified : candidates
+  return sortBy(pool, (a, b) => {
+    const dominant = task.codeWeight >= 0.5 ? "code" : "reasoning"
+    const da = dominant === "code" ? a.code : a.reasoning
+    const db = dominant === "code" ? b.code : b.reasoning
+    if (da !== db) return db - da
+    if (a.capability !== b.capability) return b.capability - a.capability
+    return b.context - a.context
+  })
+}
+
+/** Can this row carry the task, judged on capability rather than presence? */
+function meetsTask(m: CatalogueModel, task: TaskProfile): boolean {
+  if (!isUsable(m)) return false
+  const needCode = Math.round(3 + task.codeWeight * 5)
+  if (m.code < needCode) return false
+  if (task.planning && m.reasoning < 4) return false
+  return true
+}
+
+function dedupe(models: CatalogueModel[]): CatalogueModel[] {
+  const seen = new Set<string>()
+  const out: CatalogueModel[] = []
+  for (const m of models) {
+    if (seen.has(m.key)) continue
+    seen.add(m.key)
+    out.push(m)
+  }
+  return out
+}
+
+/* ------------------------------------------------------- mode relationships */
+
+/**
+ * The total order over modes by cost. Used when a mode must degrade: cheap
+ * falls back to free, power falls back through cheap to free to local, and
+ * everything eventually reaches `stop`. Lower is cheaper.
+ */
+const MODE_ORDER: Record<Exclude<Mode, "stop">, number> = {
+  local: 0,
+  free: 1,
+  cheap: 2,
+  power: 3,
+}
+
+/**
+ * The next cheaper mode. Returns the mode itself when already cheapest, so a
+ * caller can loop until the value stops changing.
+ */
+export function degrade(mode: Mode): Mode {
+  if (mode === "stop") return "stop"
+  const current = MODE_ORDER[mode]
+  const cheaper = (Object.keys(MODE_ORDER) as Array<Exclude<Mode, "stop">>).filter(
+    (m) => MODE_ORDER[m] < current,
+  )
+  if (cheaper.length === 0) return mode
+  return cheaper.reduce((best, m) => (MODE_ORDER[m] < MODE_ORDER[best] ? m : best))
+}
+
+/**
+ * The chain of modes a task descends through on repeated failure. Free and
+ * local are terminal: once a free sweep and the local fallback are exhausted
+ * there is nothing left to try but stop.
+ */
+export function degradationChain(mode: Mode): Mode[] {
+  if (mode === "stop") return ["stop"]
+  const chain: Mode[] = [mode]
+  let current = mode
+  for (let i = 0; i < 4; i++) {
+    const next = degrade(current)
+    if (next === current || chain.includes(next)) break
+    chain.push(next)
+    current = next
+  }
+  return chain
+}
+
+/** Is this mode cheaper than that one? */
+export function isCheaperThan(a: Mode, b: Mode): boolean {
+  if (a === "stop" || b === "stop") return a === "stop" && b !== "stop"
+  return MODE_ORDER[a] < MODE_ORDER[b]
+}
+
+/**
+ * Whether a mode should try remote models at all. Free and cheap sweep remote
+ * providers; local and stop do not (local is local, stop is nothing).
+ */
+export function allowsRemote(mode: Mode): boolean {
+  return mode === "free" || mode === "cheap" || mode === "power"
+}
+
+/** Human-readable explanation of a mode's intent, for status output. */
+export function describeMode(mode: Mode): string {
+  switch (mode) {
+    case "free":
+      return "sweep free opencode-go/zen models, fall back to best local"
+    case "cheap":
+      return "cheapest capable model per task; degrade to free on low funds"
+    case "local":
+      return "best local model per task, GPU-aware"
+    case "power":
+      return "most capable model per agent and task, re-evaluated each turn"
+    case "stop":
+      return "loop halted"
+  }
+}
+
+export {
+  blendedPrice,
+  meets,
+  isFree,
+  isUsable,
+  filter,
+  sortBy,
+  sorts,
+  type Catalogue,
+  type CatalogueModel,
+  type Requirements,
+}
