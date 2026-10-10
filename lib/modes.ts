@@ -11,14 +11,16 @@
  * decision can always be replayed and explained. The ranking adjusts for the
  * agent type because an architect and a build agent want different things from
  * the same catalogue.
+ *
+ * Verified rows outrank estimated ones through the comparators, never by being
+ * the only candidates: most of the catalogue is unbenchmarked, so excluding
+ * estimates would leave nearly every query empty.
  */
 
 import {
   blendedPrice,
   filter,
   isFree,
-  isUsable,
-  meets,
   sortBy,
   sorts,
   type Catalogue,
@@ -27,7 +29,7 @@ import {
 } from "./catalogue.ts"
 import type { Mode } from "./state.ts"
 
-/** The agents opencode ships with, plus a catch-all. */
+/** The agent kinds opencode uses, plus a catch-all. */
 export type AgentKind = "architect" | "build" | "review" | "general" | "explore" | "other"
 
 /** What a kind of work demands of a model. */
@@ -48,12 +50,15 @@ export function requirementsFor(task: TaskProfile): Requirements {
   return {
     vision: task.vision || undefined,
     minContext: task.minContext,
-    minCode: task.planning ? undefined : Math.round(4 + task.codeWeight * 4),
+    minCode: task.planning ? undefined : Math.round(3 + task.codeWeight * 5),
     allowLocal: undefined,
   }
 }
 
-/** Per-agent baseline profiles. These are defaults; a caller can override. */
+/**
+ * Per-agent baseline profiles. These are defaults; a caller can override any
+ * field.
+ */
 export const AGENT_PROFILES: Record<AgentKind, Omit<TaskProfile, "vision">> = {
   // Architects read diagrams and reason across a large surface, so they want
   // vision and the biggest context available, and they benefit from strong
@@ -88,61 +93,59 @@ export function rankForMode(cat: Catalogue, mode: Mode, task: TaskProfile): Cata
 
   switch (mode) {
     case "free":
-      return rankFree(cat, candidates, task)
+      return rankFree(candidates, task)
     case "cheap":
       return rankCheap(candidates, task)
     case "local":
-      return rankLocal(candidates, task)
+      return rankLocal(cat, candidates, task)
     case "power":
       return rankPower(candidates, task)
   }
 }
 
 /**
- * Free mode: sweep verified zero-cost models by capability, then fall back to
- * the best local model. The sweep is over *free* rows only — a paid row never
- * enters a free chain — so "no free models available" genuinely means the
- * sweep found nothing and the local fallback is correct, not a silent upgrade.
+ * Free mode: sweep opencode-go/zen free models by capability, then fall back to
+ * the best local model.
+ *
+ * The split matters. Remote free rows come first because that is what the mode
+ * promises; a local row only appears when the free sweep has no remote
+ * candidate, which is the "check again for free models" fallback rather than a
+ * silent substitution. A later sweep that finds a remote free model available
+ * again naturally promotes it ahead of the local fallback.
  */
-function rankFree(cat: Catalogue, candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
-  const free = candidates.filter(isFree)
-  const paidFree: CatalogueModel[] = []
-  const localFree: CatalogueModel[] = []
-  for (const m of free) {
-    if (m.local) localFree.push(m)
-    else paidFree.push(m)
-  }
+function rankFree(candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
+  const remoteFree = candidates.filter((m) => !m.local && isFree(m))
+  const local = candidates.filter((m) => m.local)
 
-  // Verified remote free rows first: confirmed free and confirmed capable.
-  const verifiedFree = sortBy(paidFree.filter((m) => !m.estimation.estimated), sorts.verifiedFirst)
-  const estimatedFree = sortBy(paidFree.filter((m) => m.estimation.estimated), sorts.verifiedFirst)
-  const remote = [...verifiedFree, ...estimatedFree]
+  // Verified free rows first: confirmed free and confirmed capable.
+  const verified = sortBy(remoteFree.filter((m) => !m.provenance.estimated), sorts.verifiedFirst)
+  const estimated = sortBy(remoteFree.filter((m) => m.provenance.estimated), sorts.capabilityContext)
 
-  // Local fallback: best local model for the task, cheapest context first.
-  const local = sortBy(localFree, sorts.localFirst)
+  // Local fallback: best local model for the task.
+  const localRanked = sortBy(local, sorts.capabilityContext)
 
-  // If there is no free remote row at all, local leads so the loop is not
-  // left with an empty chain.
-  return remote.length > 0 ? [...remote, ...local] : [...local, ...remote]
+  return [...verified, ...estimated, ...localRanked]
 }
 
 /**
  * Cheap mode: cheapest first, but capability-gated. A row only enters the
  * chain if it can actually do the task — the cheapest *vision* model when
- * vision is required, the cheapest *tool-calling* model when tools are
- * needed. Among rows that qualify, price decides and capability breaks ties.
+ * vision is required, the cheapest *tool-calling* model when tools are needed.
+ * Among rows that qualify, price decides and capability breaks ties.
  *
  * The chain has a deliberate shape: the three cheapest rows that qualify, then
  * the three most capable rows that qualify. The head saves money on the easy
  * case; the tail gives the loop somewhere to go when a cheap model turns out
  * to be too weak, without having to leave the mode. Rows that cannot do the
- * task are excluded up front, so "cheapest" never buys a model that then
- * fails on capability.
+ * task are excluded up front, so "cheapest" never buys a model that then fails
+ * on capability.
  */
 function rankCheap(candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
   const qualified = candidates.filter((m) => meetsTask(m, task))
   if (qualified.length === 0) return sortBy(candidates, sorts.cheapest)
 
+  // A free row is the cheapest possible outcome and belongs at the head, which
+  // is also the degradation target for this mode.
   const byPrice = sortBy(qualified, sorts.cheapest)
   const cheapest = byPrice.slice(0, 3)
   const capable = sortBy(qualified, sorts.capability).slice(0, 3)
@@ -150,19 +153,30 @@ function rankCheap(candidates: CatalogueModel[], task: TaskProfile): CatalogueMo
 }
 
 /**
- * Local mode: best local model for the task, mindful of GPU budget. Local
- * rows are ranked by capability among those that fit the task; a non-local
- * row only appears if no local row can serve the task at all, so the mode
- * stays honest about being "local".
+ * Local mode: best local model for the task, mindful of GPU budget.
+ *
+ * Local rows are ranked by capability among those that fit the task; a
+ * remote row only appears when no local row can serve the task at all, so the
+ * mode stays honest about being local. Ranking prefers larger parameter counts
+ * implicitly through the derived scores, and verified rows when both exist.
  */
-function rankLocal(candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
-  const local = sortBy(candidates.filter((m) => m.local && meetsTask(m, task)), sorts.capabilityContext)
+function rankLocal(cat: Catalogue, candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
+  const local = sortBy(
+    candidates.filter((m) => m.local && meetsTask(m, task)),
+    sorts.capabilityContext,
+  )
   if (local.length > 0) return local
-  // Fall back to any local row, even one that only partially fits.
-  const loose = sortBy(candidates.filter((m) => m.local), sorts.capability)
+
+  // No local row can carry the task: relax the capability bar before going
+  // remote, so a partially-fitting local row still beats a paid API call.
+  const loose = sortBy(
+    candidates.filter((m) => m.local),
+    sorts.capabilityContext,
+  )
   if (loose.length > 0) return loose
-  // No local model can do this: allow remote rather than fail the task.
-  return sortBy(candidates.filter(meetsTask), sorts.capabilityContext)
+
+  // Nothing local at all: allow remote rather than fail the task.
+  return sortBy(candidates.filter((m) => meetsTask(m, task)), sorts.capabilityContext)
 }
 
 /**
@@ -176,20 +190,21 @@ function rankPower(candidates: CatalogueModel[], task: TaskProfile): CatalogueMo
   const pool = qualified.length > 0 ? qualified : candidates
   return sortBy(pool, (a, b) => {
     const dominant = task.codeWeight >= 0.5 ? "code" : "reasoning"
-    const da = dominant === "code" ? a.code : a.reasoning
-    const db = dominant === "code" ? b.code : b.reasoning
+    const da = dominant === "code" ? a.scores.code : a.scores.reasoning
+    const db = dominant === "code" ? b.scores.code : b.scores.reasoning
     if (da !== db) return db - da
-    if (a.capability !== b.capability) return b.capability - a.capability
+    // Prefer a row whose scores come from a report over a derived estimate.
+    if (a.provenance.estimated !== b.provenance.estimated) return a.provenance.estimated ? 1 : -1
+    if (a.scores.capability !== b.scores.capability) return b.scores.capability - a.scores.capability
     return b.context - a.context
   })
 }
 
 /** Can this row carry the task, judged on capability rather than presence? */
 function meetsTask(m: CatalogueModel, task: TaskProfile): boolean {
-  if (!isUsable(m)) return false
-  const needCode = Math.round(3 + task.codeWeight * 5)
-  if (m.code < needCode) return false
-  if (task.planning && m.reasoning < 4) return false
+  if (!m.available) return false
+  if (m.context > 0 && m.context < task.minContext) return false
+  if (task.planning && m.scores.reasoning < 5) return false
   return true
 }
 
@@ -236,8 +251,9 @@ const MODE_ORDER: Record<Exclude<Mode, "stop">, number> = {
 export function degrade(mode: Mode): Mode {
   if (mode === "stop") return "stop"
   const current = MODE_ORDER[mode]
-  const cheaper = (Object.keys(MODE_ORDER) as Array<Exclude<Mode, "stop">>)
-    .filter((m) => MODE_ORDER[m] < current && MODE_ORDER[m] > 0)
+  const cheaper = (Object.keys(MODE_ORDER) as Array<Exclude<Mode, "stop">>).filter(
+    (m) => MODE_ORDER[m] < current && MODE_ORDER[m] > 0,
+  )
   if (cheaper.length === 0) return mode
   return cheaper.reduce((best, m) => (MODE_ORDER[m] < MODE_ORDER[best] ? m : best))
 }
@@ -293,10 +309,8 @@ export function describeMode(mode: Mode): string {
 
 export {
   blendedPrice,
-  meets,
-  isFree,
-  isUsable,
   filter,
+  isFree,
   sortBy,
   sorts,
   type Catalogue,
