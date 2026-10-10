@@ -202,35 +202,46 @@ function dedupe(models: CatalogueModel[]): CatalogueModel[] {
 /* ------------------------------------------------------- mode relationships */
 
 /**
- * The total order over modes by cost. Used when a mode must degrade: cheap
- * falls back to free, power falls back through cheap to free to local, and
- * everything eventually reaches `stop`. Lower is cheaper.
+ * The order over modes by what a mode costs the user, used when a mode must
+ * degrade.
+ *
+ * `local` is deliberately *not* cheaper than `free` here. Locality is a
+ * different axis from price: a local model is the free-mode *fallback*, not a
+ * tier below it, and a user who asked for free models does not want to be
+ * pushed onto their GPU when the free sweep is merely rate limited. The
+ * degradation the spec asks for is cheap -> free on low funds, so free sits
+ * directly above cheap and the chain ends there.
  */
 const MODE_ORDER: Record<Exclude<Mode, "stop">, number> = {
-  local: 0,
-  free: 1,
-  cheap: 2,
   power: 3,
+  cheap: 2,
+  free: 1,
+  local: 0,
 }
 
 /**
  * The next cheaper mode. Returns the mode itself when already cheapest, so a
  * caller can loop until the value stops changing.
+ *
+ * `local` is terminal on this axis: it is not a fallback for the other modes
+ * (each of them already falls back to a local model on its own when it has no
+ * candidate), so degrading *to* local from free would be a lateral move that
+ * loses the free sweep for no gain.
  */
 export function degrade(mode: Mode): Mode {
   if (mode === "stop") return "stop"
   const current = MODE_ORDER[mode]
-  const cheaper = (Object.keys(MODE_ORDER) as Array<Exclude<Mode, "stop">>).filter(
-    (m) => MODE_ORDER[m] < current,
-  )
+  const cheaper = (Object.keys(MODE_ORDER) as Array<Exclude<Mode, "stop">>)
+    .filter((m) => MODE_ORDER[m] < current && MODE_ORDER[m] > 0)
   if (cheaper.length === 0) return mode
   return cheaper.reduce((best, m) => (MODE_ORDER[m] < MODE_ORDER[best] ? m : best))
 }
 
 /**
- * The chain of modes a task descends through on repeated failure. Free and
- * local are terminal: once a free sweep and the local fallback are exhausted
- * there is nothing left to try but stop.
+ * The chain of modes a task descends through on repeated failure. Free is
+ * terminal on this axis: once the free sweep and its own local fallback are
+ * exhausted there is no cheaper mode to try, so the chain ends at free rather
+ * than detouring through local.
  */
 export function degradationChain(mode: Mode): Mode[] {
   if (mode === "stop") return ["stop"]

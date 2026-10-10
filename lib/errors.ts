@@ -90,7 +90,7 @@ export function classify(input: {
   error?: unknown
 }): ClassifiedError {
   const message = input.message ?? messageOf(input.error) ?? ""
-  const status = input.status ?? statusOf(input.error)
+  const status = input.status ?? statusOfError(input.error)
   const type = (input.type ?? "").toLowerCase()
 
   let kind: ErrorKind = "other"
@@ -237,6 +237,33 @@ export function applyRestriction(
     req.video = false
     req.toolCall = false
   }
+}
+
+/** Pull a message out of anything throwable. */
+function messageOf(error: unknown): string | undefined {
+  if (error instanceof Error) return error.message
+  if (typeof error === "string") return error
+  if (error && typeof error === "object") {
+    const record = error as Record<string, unknown>
+    if (typeof record.message === "string") return record.message
+    if (typeof record.error === "string") return record.error
+  }
+  return undefined
+}
+
+/** Pull an HTTP status out of anything throwable, when it carries one. */
+function statusOfError(error: unknown): number | undefined {
+  if (typeof error === "number") return error
+  if (error && typeof error === "object") {
+    const record = error as Record<string, unknown>
+    for (const key of ["status", "statusCode", "code"]) {
+      const value = record[key]
+      if (typeof value === "number" && Number.isFinite(value)) return value
+    }
+    const nested = record.error ?? record.cause
+    if (nested && nested !== error) return statusOfError(nested)
+  }
+  return undefined
 }
 
 /**

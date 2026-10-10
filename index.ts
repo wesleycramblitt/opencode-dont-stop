@@ -233,6 +233,9 @@ export default {
 
 /* ----------------------------------------------------------------- commands */
 
+/** The mode names a user can select, `stop` excluded: halting is a verb. */
+const MODE_NAMES = MODES.filter((m) => m !== "stop")
+
 interface CommandEnv {
   state: PluginState
   engine: LoopEngine
@@ -253,9 +256,16 @@ export function runCommand(raw: string, env: CommandEnv): string {
     return formatStatus(state, engine)
   }
 
-  if ((MODES as readonly string[]).includes(verb)) {
-    void engine.setMode(verb as Mode).then(persist)
-    return `mode set to ${verb} — ${describeMode(verb as Mode)}`
+  // `mode <name>` and a bare mode name both work. `stop` is a mode in the
+  // state machine but a verb here, so it is handled before the mode branch
+  // and never reaches it.
+  let modeName: string | undefined
+  if (verb === "mode" && rest.length > 0) modeName = rest[0].toLowerCase()
+  else if ((MODES as readonly string[]).includes(verb) && verb !== "stop") modeName = verb
+
+  if (modeName) {
+    void engine.setMode(modeName as Mode).then(persist)
+    return `mode set to ${modeName} — ${describeMode(modeName as Mode)}`
   }
 
   if (verb === "start") {
@@ -330,7 +340,7 @@ export function runCommand(raw: string, env: CommandEnv): string {
 
   return [
     `unknown verb: ${verb}`,
-    `try: status · mode ${MODES.filter((m) => m !== "stop").join("|")} · start <prompt | --prompt-file PATH> · stop · probe · best-for <agent> · update-model-catalogue`,
+    `try: status · mode ${MODE_NAMES.join("|")} · start <prompt | --prompt-file PATH> · stop · probe · best-for <agent> · update-model-catalogue`,
   ].join("\n")
 }
 

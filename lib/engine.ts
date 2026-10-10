@@ -566,12 +566,16 @@ function agentKind(agent: string): AgentKind {
   return "other"
 }
 
-/** The mode degradation chain, mirrored from `modes.ts` to avoid a cycle. */
+/**
+ * The mode degradation chain. Mirrors `lib/modes.ts` so the engine avoids a
+ * circular import; `local` is not a degradation target because it is a
+ * different axis from price, not a cheaper tier.
+ */
 function degradeChainOf(mode: Mode): Mode[] {
   if (mode === "stop") return ["stop"]
-  const order: Record<string, number> = { local: 0, free: 1, cheap: 2, power: 3 }
+  const order: Record<string, number> = { power: 3, cheap: 2, free: 1, local: 0 }
   const current = order[mode] ?? 1
-  const cheaper = Object.keys(order).filter((m) => order[m] < current)
+  const cheaper = Object.keys(order).filter((m) => order[m] < current && order[m] > 0)
   if (cheaper.length === 0) return [mode]
   return [mode, cheaper.reduce((best, m) => (order[m] < order[best] ? m : best))]
 }
