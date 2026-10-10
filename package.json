@@ -1,0 +1,11 @@
+{
+  "name": "dont-stop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-sustaining agent loop with dynamic model selection.",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.ts"
+  }
+}
