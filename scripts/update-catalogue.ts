@@ -9,6 +9,7 @@
  *   npx tsx scripts/update-catalogue.ts --all        # include every provider
  *   npx tsx scripts/update-catalogue.ts --dry-run    # print a summary, write nothing
  *   npx tsx scripts/update-catalogue.ts --table      # print the full table
+ *   npx tsx scripts/update-catalogue.ts --alibaba-key <key>
  *
  * The written file is checked in, so the catalogue is reproducible and does
  * not need network access at plugin load time.
@@ -23,6 +24,7 @@ interface Options {
   dryRun: boolean
   table: boolean
   limit: number
+  alibabaKey: string | undefined
 }
 
 function parseArgs(argv: string[]): Options {
@@ -31,6 +33,7 @@ function parseArgs(argv: string[]): Options {
     dryRun: argv.includes("--dry-run"),
     table: argv.includes("--table"),
     limit: numberAfter(argv, "--limit") ?? 40,
+    alibabaKey: stringAfter(argv, "--alibaba-key") ?? undefined,
   }
 }
 
@@ -41,11 +44,17 @@ function numberAfter(argv: string[], flag: string): number | null {
   return Number.isFinite(value) ? value : null
 }
 
+function stringAfter(argv: string[], flag: string): string | null {
+  const index = argv.indexOf(flag)
+  if (index === -1) return null
+  return argv[index + 1] ?? null
+}
+
 const options = parseArgs(process.argv.slice(2))
 
 console.log("[catalogue] fetching models.dev ...")
 const started = Date.now()
-const document = await fetchCatalogue()
+const document = await fetchCatalogue({ alibabaKey: options.alibabaKey })
 
 /* ------------------------------------------------------------- reporting */
 

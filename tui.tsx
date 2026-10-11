@@ -186,7 +186,15 @@ export default {
      */
     function requestHalt(): void {
       const state = readState()
-      state.intent = { seq: state.intent.seq + 1, action: "halt", at: Date.now() }
+      // Raise the sequence above any intent another writer has in flight, so
+      // two halts racing from the same base cannot stamp the same number and
+      // let one of them be read as already-applied.
+      const theirs = readState().intent
+      state.intent = {
+        seq: Math.max(theirs.seq, state.intent.seq) + 1,
+        action: "halt",
+        at: Date.now(),
+      }
       state.updated = Date.now()
       writeState(state)
       snapshot = state

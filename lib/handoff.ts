@@ -59,7 +59,7 @@ export interface SummaryInput {
 
 export interface HandoffContext {
   session: {
-    list(input?: { parentID?: string | null }): Promise<{ data?: unknown }>
+    list(input?: { parentID?: string | null; limit?: number }): Promise<{ data?: unknown }>
     active(): Promise<unknown>
     create(input?: Record<string, unknown>): Promise<{ id?: string }>
     prompt(input: { sessionID: string; text: string }): Promise<unknown>
@@ -136,7 +136,7 @@ export function descendantIDs(all: readonly SessionRef[], rootID: string): Set<s
 }
 
 /**
- * Which descendants are currently running.
+ * Which of these descendant sessions are currently running.
  *
  * `active` is the server's map of in-flight session ids; its keys are the ids.
  * An unreadable or empty value means "nothing active", which is the safe
@@ -144,14 +144,13 @@ export function descendantIDs(all: readonly SessionRef[], rootID: string): Set<s
  * so an unknown state must not be read as clear.
  */
 export function busyDescendants(
-  all: readonly SessionRef[],
+  descendants: readonly string[],
   active: unknown,
-  rootID: string,
 ): string[] {
   const activeIDs = activeSessionIDs(active)
   if (activeIDs.size === 0) return []
   const out: string[] = []
-  for (const id of descendantIDs(all, rootID)) {
+  for (const id of descendants) {
     if (activeIDs.has(id)) out.push(id)
   }
   return out
@@ -173,6 +172,44 @@ function activeSessionIDs(active: unknown): Set<string> {
     if (nested) return activeSessionIDs(nested)
   }
   return out
+}
+
+/**
+ * Every session beneath `rootID`, fetched one parent at a time.
+ *
+ * The session listing is paginated and location-scoped, so listing every
+ * session and filtering by `parentID` (as `descendantIDs` does) can truncate
+ * a wide tree away. Walking level by level against the `parentID` filter
+ * cannot: each page is the direct children of one session, and the walk stops
+ * when a level comes back empty.
+ *
+ * I/O lives here; the pure tree walk is `descendantIDs`.
+ */
+export async function sessionTree(
+  ctx: Pick<HandoffContext, "session">,
+  rootID: string,
+  limit = 200,
+): Promise<string[]> {
+  const out = new Set<string>()
+  let frontier = [rootID]
+  while (frontier.length > 0) {
+    const next: string[] = []
+    for (const parent of frontier) {
+      let listed: unknown
+      try {
+        listed = await ctx.session.list({ parentID: parent, limit })
+      } catch {
+        return [...out]
+      }
+      for (const ref of toSessionRefs(listed)) {
+        if (ref.id === parent || out.has(ref.id)) continue
+        out.add(ref.id)
+        next.push(ref.id)
+      }
+    }
+    frontier = next
+  }
+  return [...out]
 }
 
 /* ---------------------------------------------------------------- summarising */
@@ -263,15 +300,19 @@ export function transcriptFrom(messages: unknown): { turns: TranscriptTurn[]; fi
     const bucket = role === "user" ? "user" : "assistant"
 
     let text = ""
-    for (const part of asArray(message.parts)) {
+    // v2 lists parts under `content`; older responses under `parts`. Both hold
+    // the same shapes: text, reasoning and tool parts.
+    const parts = [...asArray(message.content), ...asArray(message.parts)]
+    for (const part of parts) {
       if (!isRecord(part)) continue
       const type = typeof part.type === "string" ? part.type : ""
-      if (typeof part.text === "string") text += part.text
-      else if (typeof part.content === "string") text += part.content
+      if (typeof part.text === "string" && (type === "" || type === "text")) text += part.text
+      else if (typeof part.content === "string" && (type === "" || type === "text")) text += part.content
 
-      // A tool part names the file it acted on. Both `input.path` (write/edit)
-      // and `input.filePath` (read) appear in practice.
-      const input = isRecord(part.input) ? part.input : null
+      // A tool part names the file it acted on. v2 puts the arguments under
+      // `state.input`, older shapes under `input`; the field itself is `path`
+      // (write/edit) or `filePath` (read) or `filename`.
+      const input = toolInput(part)
       const candidate = input ? (input.path ?? input.filePath ?? input.filename) : undefined
       if (type.startsWith("tool") && typeof candidate === "string" && !seenFiles.has(candidate)) {
         seenFiles.add(candidate)
@@ -279,10 +320,25 @@ export function transcriptFrom(messages: unknown): { turns: TranscriptTurn[]; fi
       }
     }
 
-    if (text.trim().length > 0) turns.push({ role: bucket, text })
+    if (text.trim().length > 0) {
+      turns.push({ role: bucket, text })
+      continue
+    }
+    // v2 keeps user-turn text on the message itself; older shapes on parts.
+    if (typeof message.text === "string" && message.text.trim().length > 0) {
+      turns.push({ role: bucket, text: message.text })
+    }
   }
 
   return { turns, files }
+}
+
+/** The arguments a tool part ran with, in whichever shape they arrive. */
+function toolInput(part: Record<string, unknown>): Record<string, unknown> | null {
+  if (isRecord(part.input)) return part.input
+  const state = part.state
+  if (isRecord(state) && isRecord(state.input)) return state.input
+  return null
 }
 
 /* -------------------------------------------------------------------- handoff */
@@ -312,13 +368,7 @@ export async function handoff(
   options: { directory: string; agent?: string },
 ): Promise<HandoffResult> {
   // Refuse while any descendant session is live.
-  let sessions: SessionRef[] = []
-  try {
-    const listed = await ctx.session.list()
-    sessions = toSessionRefs(listed)
-  } catch {
-    sessions = []
-  }
+  const descendants = await sessionTree(ctx, input.sessionID)
 
   let active: unknown = null
   try {
@@ -327,7 +377,7 @@ export async function handoff(
     active = null
   }
 
-  const busy = busyDescendants(sessions, active, input.sessionID)
+  const busy = busyDescendants(descendants, active)
   if (busy.length > 0) {
     return { handed: false, deferred: "subagents still running", busy }
   }

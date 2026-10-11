@@ -84,8 +84,6 @@ export interface PluginState {
   main: ModelSlot | null
   /** Per-agent-type model assignments, keyed by agent id. */
   agentModels: Record<string, ModelSlot>
-  /** Rotation cursor per (agent, chain) so fallback walks the chain. */
-  rotation: Record<string, number>
   cooldowns: Cooldowns
   consecutiveErrors: number
   lastEvent: string | null
@@ -122,7 +120,6 @@ export function initialState(): PluginState {
     intent: { seq: 0, action: "none", at: 0 },
     main: null,
     agentModels: {},
-    rotation: {},
     cooldowns: {},
     consecutiveErrors: 0,
     lastEvent: null,
@@ -153,7 +150,6 @@ function mergeState(base: PluginState, patch: Partial<PluginState>): PluginState
   next.loop = { ...base.loop, ...(patch.loop ?? {}) }
   next.intent = { ...base.intent, ...(patch.intent ?? {}) }
   next.agentModels = { ...patch.agentModels }
-  next.rotation = { ...patch.rotation }
   next.cooldowns = { ...patch.cooldowns }
   next.log = [...(patch.log ?? [])]
   return next

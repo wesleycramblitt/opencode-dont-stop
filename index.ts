@@ -16,6 +16,8 @@ import { basename, dirname } from "node:path"
 
 import { LoopEngine } from "./lib/engine.ts"
 import { createLogger } from "./lib/log.ts"
+import { eventData, eventSignals, TURN_END_TYPES, type SessionEvent } from "./lib/events.ts"
+import { fetchCatalogue, writeCatalogue } from "./lib/fetch.ts"
 import {
   MODES,
   readState,
@@ -27,6 +29,8 @@ import {
 import { exportSummary } from "./lib/catalogue.ts"
 import { describeMode } from "./lib/modes.ts"
 import { DEFAULT_CLOCKS } from "./lib/clocks.ts"
+
+/* -------------------------------------------------------------------- types */
 
 /** Where a prompt file may live, resolved against the cwd. */
 function resolvePromptFile(path: string): string {
@@ -93,7 +97,7 @@ export default {
     /* ------------------------------------------------------------- events */
 
     const abort = new AbortController()
-    let iterator: AsyncIterator<{ type: string; properties?: Record<string, unknown> }> | undefined
+    let iterator: AsyncIterator<SessionEvent> | undefined
 
     const consumer = (async () => {
       try {
@@ -102,31 +106,34 @@ export default {
         for (;;) {
           const next = await iterator.next()
           if (next.done) break
-          engine.observe(next.value)
-          const event = next.value
-          if (event.type === "session.error" || event.type === "message.error") {
-            const props = event.properties as
-              | { info?: { id?: string }; sessionID?: string; error?: { message?: string; status?: number; type?: string }; agent?: string }
-              | undefined
-            await engine.onError({
-              sessionID: props?.sessionID ?? props?.info?.id,
-              agent: props?.agent,
-              message: props?.error?.message,
-              status: props?.error?.status,
-              type: props?.error?.type,
-            })
-          } else if (event.type === "session.idle") {
-            // The session finished a turn. When this is the loop's own session
-            // this is the point where it continues rather than ends.
-            // `advance` counts the iteration itself, and it ignores anything
-            // that is not the loop it owns — a subagent going idle, or an idle
-            // event in an instance that is not driving the loop, must not
-            // touch the counter.
-            const sid = (event.properties?.info as { id?: string } | undefined)?.id
-              ?? (event.properties?.sessionID as string | undefined)
-              ?? state.loop.sessionID
-            if (sid !== null && sid === state.loop.sessionID) {
-              await engine.advance(sid)
+          const event = next.value as SessionEvent
+          engine.observe(event)
+
+          // A failed request is the recovery funnel. v2 reports failures as
+          // `session.error` (provider errors) and on `session.execution.failed`
+          // (a turn that ended in failure); both carry the same error shape.
+          if (event.type === "session.error" || event.type === "session.execution.failed") {
+            const signals = eventSignals(event)
+            if (signals.sessionID) {
+              await engine.onError({
+                sessionID: signals.sessionID,
+                agent: signals.agent ?? undefined,
+                message: signals.error?.message,
+                status: signals.error?.status,
+                type: signals.error?.type,
+              })
+            }
+          }
+
+          // A turn of the loop's session ended — this is the loop's driver.
+          // The event names the ending, so a subagent ending its own turn, or
+          // an ending in an instance that is not driving the loop, cannot
+          // touch the counter. `onTurnEnd` also stands down after the hang
+          // path's own interrupts, so the scheduled re-drive owns those.
+          if (TURN_END_TYPES.has(event.type)) {
+            const sid = eventData(event).sessionID
+            if (typeof sid === "string" && sid === state.loop.sessionID) {
+              await engine.onTurnEnd(sid, event.type)
               persist()
             }
           }
@@ -305,15 +312,24 @@ export function runCommand(raw: string, env: CommandEnv): string {
   }
 
   if (verb === "update-model-catalogue" || verb === "update-catalogue" || verb === "catalogue-update") {
-    void engine
-      .refreshCatalogue()
-      .then(() => {
+    // Rebuilds the catalogue from the live sources (models.dev, the local
+    // ollama daemon, and — when a key is configured — Alibaba's own
+    // inventory), writes data/catalogue.json, then reloads it and re-plans.
+    // Network-bound on purpose: it is an explicit command, not a heartbeat.
+    void (async () => {
+      try {
+        const document = await fetchCatalogue()
+        writeCatalogue(document)
+        log.info(`catalogue rebuilt: ${document.models.length} models`)
         persist()
-        return engine.refresh(true)
-      })
-      .then(persist)
-      .catch((error: unknown) => log.error(`catalogue update failed: ${messageOf(error)}`))
-    return "model catalogue refresh started; it writes data/catalogue.json"
+        await engine.discover()
+        await engine.refresh(true)
+        persist()
+      } catch (error) {
+        log.error(`catalogue update failed: ${messageOf(error)}`)
+      }
+    })()
+    return "catalogue rebuild started: fetching live sources into data/catalogue.json"
   }
 
   if (verb === "track") {
@@ -403,6 +419,7 @@ interface AgentEditor {
 interface PluginServerContext {
   command: { transform(fn: (editor: { add(input: { name: string; description: string; execute: (input: { prompt?: string | { text?: string }; sessionID?: string }) => Promise<string> | string }): void }) => void): Promise<unknown> }
   agent: { reload(): Promise<unknown> }
-  event: { subscribe(input: { signal: AbortSignal }): AsyncIterable<{ type: string; properties?: Record<string, unknown> }> }
+  /** v2 events: `{ type, data }`. */
+  event: { subscribe(input: { signal: AbortSignal }): AsyncIterable<SessionEvent> }
   model: { list(): Promise<{ data?: unknown }> }
 }

@@ -248,40 +248,11 @@ export class ClockSet {
   }
 }
 
-/** Map an event type onto a progress kind, or null when it is not progress. */
-export function progressKindOf(eventType: string, properties?: Record<string, unknown>): ProgressKind | null {
-  const type = eventType.toLowerCase()
-
-  if (/message\.(created|updated|completed|part\.updated)/.test(type)) {
-    // A message part update carrying a tool call is progress even if the
-    // assistant text has not moved on.
-    const part = properties?.part as { type?: string } | undefined
-    if (part?.type === "tool") return "tool"
-    if (part?.type === "reasoning") return "reasoning"
-    return "message"
-  }
-  if (/message\.part\.updated/.test(type)) return "token"
-  if (/tool\.(start|end|result)/.test(type)) return "tool"
-  if (/permission\.(asked|replied)/.test(type)) return "permission"
-  if (/session\.(idle|error|abort)/.test(type)) return null
-
-  // Subagent lifecycle events are progress: a fan-out is working even when
-  // the parent session is silent for a long time.
-  if (/subagent|child|task\.(start|end|spawn)/.test(type)) return "subagent"
-  if (/step|turn|iteration/.test(type)) return "step"
-
-  return null
-}
-
 /**
- * Should this event be treated as the session starting or finishing a request?
- * The engine uses this to know when the hang clock may arm.
+ * Turn an event into clock signals.
+ *
+ * The event vocabulary itself is owned by `lib/events.ts` — decoding lives
+ * there so the names the server emits are listed in one place. This module
+ * only maps a decoded signal onto a clock tick: `seen`, `progress`, `start`
+ * and `finish` are the only ways a clock ever moves.
  */
-export function lifecycleOf(eventType: string): "start" | "finish" | null {
-  const type = eventType.toLowerCase()
-  if (/session\.idle|session\.error|session\.abort|turn\.end|step\.end|message\.completed/.test(type)) {
-    return "finish"
-  }
-  if (/session\.busy|turn\.start|step\.start|message\.created/.test(type)) return "start"
-  return null
-}

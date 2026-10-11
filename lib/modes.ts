@@ -119,27 +119,38 @@ export function rankForMode(
 }
 
 /**
- * Free mode: sweep opencode-go/zen free models by capability, then fall back to
- * the best local model.
+ * Free mode: sweep zero-cost models by capability, then quota-backed models,
+ * then fall back to the best local model.
  *
  * The split matters. Remote free rows come first because that is what the mode
- * promises; a local row only appears when the free sweep has no remote
- * candidate, which is the "check again for free models" fallback rather than a
- * silent substitution. A later sweep that finds a remote free model available
- * again naturally promotes it ahead of the local fallback.
+ * promises; quota-backed rows — paid models with a declared promotional free
+ * allowance (see `data/free-tiers.ts`) — come next because they are the next
+ * cheapest thing that can run without a bill; local rows are the tail, reached
+ * only once every remote row has had its try. Rotation walks this list in
+ * order, so a run of rate limits walks down through the free sweep and out the
+ * other side into local rather than stopping or cycling.
+ *
+ * A remote row that comes off cooldown re-enters this list *ahead* of the local
+ * tail, so a rate-limited free model whose timeout is up wins its turn back
+ * before the loop spends one on a local model.
  */
 function rankFree(candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
   const remoteFree = candidates.filter((m) => !m.local && isFree(m))
+  const quota = candidates.filter((m) => !m.local && !isFree(m) && m.freeTier !== null)
   const local = candidates.filter((m) => m.local)
 
   // Verified free rows first: confirmed free and confirmed capable.
   const verified = sortBy(remoteFree.filter((m) => !m.provenance.estimated), sorts.verifiedFirst)
   const estimated = sortBy(remoteFree.filter((m) => m.provenance.estimated), sorts.capabilityContext)
 
+  // Quota-backed rows: the free allowance is the reason they are here, and
+  // within it the better model should be tried first.
+  const quotaRanked = sortBy(quota, sorts.capabilityContext)
+
   // Local fallback: best local model for the task.
   const localRanked = sortBy(local, sorts.capabilityContext)
 
-  return [...verified, ...estimated, ...localRanked]
+  return [...verified, ...estimated, ...quotaRanked, ...localRanked]
 }
 
 /**
@@ -156,10 +167,12 @@ function rankFree(candidates: CatalogueModel[], task: TaskProfile): CatalogueMod
  * are needed. Among rows that qualify, price decides and capability breaks
  * ties.
  *
- * Shape: three cheapest paid rows, then three most capable paid rows, then the
- * free rows and local fallbacks. The head minimises spend; the paid tail gives
- * the loop somewhere to go when a cheap model is too weak, without leaving the
- * mode; the free tail is the degradation target.
+ * Shape: every paid row cheapest-first, then the free rows, then the local
+ * fallbacks — the same walk free mode makes, one try per model, with the paid
+ * head in front. The head minimises spend; the paid tail gives the loop
+ * somewhere to go when a cheap model is too weak, without leaving the mode; the
+ * free and local tails are the degradation targets, reached only once the paid
+ * rows have all had their try.
  */
 function rankCheap(candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
   const qualified = candidates.filter((m) => meetsTask(m, task))
@@ -168,18 +181,13 @@ function rankCheap(candidates: CatalogueModel[], task: TaskProfile): CatalogueMo
   const paid = pool.filter((m) => !isFree(m))
   const free = pool.filter(isFree)
 
-  const byPrice = sortBy(paid, sorts.cheapest)
-  const cheapestPaid = byPrice.slice(0, 3)
-  const capablePaid = sortBy(paid, sorts.capability).slice(0, 3)
-
   // Free remote rows first among the free tail (they are the free sweep), then
   // local models as the last resort.
   const freeRemote = sortBy(free.filter((m) => !m.local), sorts.capabilityContext)
   const freeLocal = sortBy(free.filter((m) => m.local), sorts.capabilityContext)
 
   return dedupe([
-    ...cheapestPaid,
-    ...capablePaid,
+    ...sortBy(paid, sorts.cheapest),
     ...freeRemote,
     ...freeLocal,
   ])
@@ -339,7 +347,7 @@ export function allowsRemote(mode: Mode): boolean {
 export function describeMode(mode: Mode): string {
   switch (mode) {
     case "free":
-      return "sweep free opencode-go/zen models, fall back to best local"
+      return "sweep free models, then quota-backed, then best local"
     case "cheap":
       return "cheapest capable model per task; degrade to free on low funds"
     case "local":

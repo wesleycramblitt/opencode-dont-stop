@@ -20,12 +20,28 @@ On any already-running session, a mode change looked like a no-op.
 
 The second is the one that fixes the reported symptom. Skipping it is the bug.
 
+## V2 events
+
+The engine is event-driven, so it listens to the vocabulary the running
+server actually publishes. OpenCode v2 streams `{ id, created, type, data }`
+with names like `session.execution.started/succeeded/failed/interrupted`,
+`session.step.started`, `session.text.delta`, `session.tool.called` — there
+is no V1 `properties` wrapper and no `message.*` family. `lib/events.ts` is
+the only module that knows those names; it decodes an event into signals
+(turn start/finish, progress, session model/agent, error) that the rest of
+the plugin consumes. An unhandled event shows up as an entry missing from
+that one table rather than a silent regex miss.
+
+The loop is driven by the `session.execution.*` trio — exactly one event
+per turn — rather than by `session.idle`: the idle/status events trail an
+execution result and would double-advance a loop that listened to both.
+
 ## Modes
 
 | Mode | Selects | On failure |
 | --- | --- | --- |
-| `free` | verified zero-cost models, swept by capability, then the best local model as fallback | next free model; re-sweep when the task completes |
-| `cheap` | cheapest model that can actually do the task | next cheapest; degrade to `free` on low funds |
+| `free` | verified zero-cost models swept by capability, then quota-backed models, then the best local model | next untried model in that order; re-sweep when the task completes |
+| `cheap` | paid models cheapest-first, then free models, then local | next untried model in that order; degrade to `free` on low funds |
 | `local` | best local model for the task, GPU-aware | next local model; remote only if nothing local can serve |
 | `power` | most capable model for the agent and task, re-evaluated each turn | next most capable |
 
@@ -59,27 +75,73 @@ network access at plugin load time.
 | Source | What it provides |
 | --- | --- |
 | **models.dev** `/api.json` | The authoritative registry: capabilities, modalities, limits, pricing, knowledge cutoff, release date, and the `canonical_model_id` linking every provider alias to one identity |
+| **Alibaba Model Studio** `/api/v1/models` | The live per-account inventory behind a key: id, name, description, features, per-model prices (standard and thinking bands, cache read/write), context window, max output, and request/response modalities. It lists models models.dev has not caught up with, so a row from it outranks a models.dev row of the same id |
 | **ollama.com** search | The top 100 locally-runnable models by popularity, with context windows, parameter sizes and capability tags |
 | **local ollama** `/api/tags` | What is actually installed on this machine |
 | **`data/benchmarks.ts`** | Curated, cited benchmark scores keyed by canonical id |
+
+Rows without a token price (image generation, video, TTS, ASR, embeddings)
+never enter the catalogue: a row with no pricing must not be mistaken for a
+free one. When two sources share a key the more authoritative row wins —
+local install, then the vendor's own inventory, then models.dev, then the
+popularity scrape.
+
+### Alibaba's inventory
+
+The Alibaba source needs a key, resolved in `resolveAlibabaKey` (in
+`lib/fetch.ts`), in order: an explicit `--alibaba-key` override, the
+`ALIBABA_API_KEY` / `DASHSCOPE_API_KEY` environment variables, then the
+`providers.alibaba` block in `opencode.json` (V2 `settings.apiKey`, or the
+legacy `options.apiKey`). With none of those, the source is skipped with a
+note and the build still succeeds from models.dev. Point the source at a
+dedicated workspace instead of the international endpoint with
+`ALIBABA_MODELS_URL=https://ws-<id>.<region>.maas.aliyuncs.com/api/v1/models`.
+
+Because the inventory is per account, reachability is not the source's job:
+the engine re-derives it from `ctx.model.list()` at load, so only models the
+running server can route to are ever selectable. A workspace model that
+opencode's registry does not list yet sits in the catalogue as `reachable:
+false` — visible to `probe`, excluded from every mode — until you add it to
+`providers.alibaba.models` in `opencode.json`.
 
 `ollama.com/search` is client-rendered and caps the server HTML at 20 models,
 so a plain `fetch` cannot see the rest. `scripts/scrape-ollama.ts` drives a real
 browser to collect the full list; the catalogue update reads the file it writes,
 so the normal path stays pure network I/O.
 
+### Free tiers
+
+Alibaba grants accounts a per-model promotional quota (commonly 1M tokens
+within 90 days). It is not queryable through any API — the console shows
+it — so it is declared data: `data/free-tiers.ts`, keyed by
+`provider/model`, every entry naming its source. The catalogue folds the
+table into rows at build time and re-applies it at load, so a stale file is
+corrected.
+
+A quota-backed row is not priced at zero, but it is a legitimate member of
+the `free` sweep: after the genuinely free rows, before the local fallback.
+When the allowance runs out, requests fail with a quota error, which the
+error classifier reads as `funds` — the model goes on cooldown and the chain
+moves on. Edit the one table when the console says otherwise.
+
+The allowance is account state the plugin deliberately does not pretend to
+measure: there is no usage API, and an invented "remaining" number would be
+a guess presented as a fact.
+
 ### Updating
 
 ```
 npx tsx scripts/update-catalogue.ts             # rewrite data/catalogue.json
+npx tsx scripts/update-catalogue.ts --alibaba-key <key>   # key the env/config do not cover
 npx tsx scripts/update-catalogue.ts --table     # also print the ranked table
 npx tsx scripts/update-catalogue.ts --dry-run   # report only
 npx tsx scripts/scrape-ollama.ts --limit 100    # refresh the ollama popularity list
 ```
 
-The `update-model-catalogue` command reloads the generated file and re-plans.
-Rebuilding the file is a deliberate CLI step, not something a plugin reload
-does: it is slow, network-bound, and produces a committed artifact.
+The `update-model-catalogue` command does the rebuild live — fetch every
+source, write `data/catalogue.json`, reload, and re-plan — because a command
+is an explicit request and a heartbeat is not; the plugin never rewrites the
+file on its own.
 
 ### Provenance
 
@@ -149,13 +211,17 @@ it are where the old design spun:
 - The loop **re-drives itself** 20s later, because the abort removed the idle
   event the loop is normally driven by — without that, one hang silently ended
   the loop's progress while leaving it "active".
-- **Every model gets one try per turn.** Rotation moves to a model that has not
-  been attempted since the last completed turn, so a chain of ten is walked once
-  and then stops instead of cycling through the same three forever. Models that
-  are unreachable or cooling down are filtered out before this point, so they
-  never consume a try.
-- Rotations are additionally budgeted at 10 **per completed turn**, so a wide
-  chain cannot buy an unbounded number of losing bets either.
+- **Every model gets one try per turn.** Rotation moves to the best-ranked model
+  that has not been attempted since the last completed turn, so the chain is
+  walked once in rank order and then stops instead of cycling through the same
+  few forever. In `free` that means the hosted free sweep first and the local
+  models after it, which is the point of having local models at all; in `cheap`
+  it is paid, then free, then local. Models that are unreachable or cooling down
+  are filtered out before this point, so they never consume a try.
+- **A rate limit's timeout buys the model its turn back.** When a cooldown
+  expires the model is not just available again but untried again, so a free
+  model that hit a 60s limit wins its next try *ahead* of the local tail
+  rather than being locked out for the rest of the turn.
 - When the chain is spent, or three interrupts have gone by with nothing
   finished, the loop stops escalating and says which of the two it was.
 
@@ -166,16 +232,21 @@ this plugin.
 ## Errors
 
 Classification is regex + HTTP status, applied before any recovery path. The
-`retry` column is one retry **per model per turn**: a failure that could plausibly
-clear on its own gets a second attempt on the same model before a rotation is
-spent on it, and a second failure rotates. Everything that is a fact about the
-model rotates at once, because a second attempt would only cost time.
+`retry` column is one retry **per model per turn**, and only for failures
+that could plausibly clear on their own — a dropped connection, an
+unclassified error. A rate limit does **not** get one: it is a statement
+about the model right now, and when a second free model is waiting in the
+chain the cheap move is to hand the turn over immediately. The 60-second
+cooldown then buys the limited model its turn back through expiry (`expireCooldowns`
+re-admits it, ahead of the local tail), which is the "try again on free"
+path. Everything that is a fact about the model rotates at once, because a
+second attempt would only cost time.
 
 | Kind | Trigger | Retry | Action |
 | --- | --- | --- | --- |
 | `interrupted` | our own interrupt, a user escape, a cancelled request | — | nothing: not a failure, no cooldown, no rotation |
 | `funds` | insufficient balance / quota | no | cooldown 1h, degrade to a cheaper mode |
-| `rate` | 429, rate limit, throttling | yes | cooldown 1m, rotate, re-sweep |
+| `rate` | 429, rate limit, throttling | no | cooldown 1m, rotate, re-sweep |
 | `capability` | model lacks a required capability | no | cooldown 5m, restrict the pool |
 | `context` | context window exceeded | no | rotate to a larger-context model |
 | `notfound` | model gone or deprecated | no | cooldown 24h, rotate past |
@@ -210,19 +281,30 @@ model down, because the miss is a fact about the task, not a flake.
 `--prompt-file` reads the prompt from disk and errors clearly when the path is
 missing or empty. Any inline text is prepended to the file's contents.
 
+`update-model-catalogue` rebuilds the catalogue from the live sources —
+models.dev, the local ollama daemon, and Alibaba's inventory when a key is
+resolvable — writes `data/catalogue.json`, then reloads and re-plans. The
+equivalent CLI step is `npx tsx scripts/update-catalogue.ts`, which adds
+`--dry-run`, `--table`, and `--alibaba-key`.
+
 ## Layout
 
 ```
 index.ts            server entrypoint: command API, event pump, state watch
 tui.ts              terminal entrypoint: footer status, mode cycling, toasts
+lib/events.ts       the OpenCode v2 event vocabulary, decoded into signals
 lib/catalogue.ts    model rows, filters, sorts, scoring
 lib/modes.ts        mode strategies and per-agent ranking
 lib/errors.ts       error classification and recovery actions
 lib/clocks.ts       interval / idle / hang clocks
 lib/apply.ts        the two channels that reach running sessions
 lib/engine.ts       loop orchestration: discover, plan, apply, rotate
+lib/handoff.ts      context handoff: measure, summarise, re-seed
 lib/state.ts        durable state bridging both halves
 lib/log.ts          structured logging
+lib/fetch.ts        source fetching (models.dev, ollama, alibaba) and scoring
+data/free-tiers.ts  declared promotional free allowances, keyed by provider/model
+scripts/test.ts     unit tests
 ```
 
 Both halves communicate only through the state file, which the server writes
@@ -239,12 +321,12 @@ instruction survives the race with the status writes around it.
 ## The loop
 
 `dont-stop-set start <prompt>` arms a loop on a session. It is driven by the
-session's own idle events, not by a timer: a turn finishes, the session goes
-idle, and `advance()` decides what happens next.
+session's own turn boundaries — the v2 `session.execution.*` events — not by
+a timer: a turn finishes, and `advance()` decides what happens next.
 
 ```
 start                      -> plan, switch model, send opening prompt
-session.idle               -> advance()  (only in the owning instance)
+session.execution.*        -> advance()  (only in the owning instance)
   count the iteration
   if the turn completed    -> reset the try budget (models tried, failures)
   if the turn merely errored into idleness, the budget survives it
@@ -284,6 +366,15 @@ even when the status already reads "stopped": that cleanup is what actually
 ends the interrupt-and-rotate cycle, and skipping it (as it once did) left the
 behaviour running behind a status that said otherwise.
 
+**A halt reaches the whole tree.** The loop's session can spawn subagents,
+and those are child sessions that keep working after the parent has stopped.
+`stop()` — and the hang recovery's interrupt — walk the session tree (root
+first, descendants transitively, one `parentID`-filtered page per level so a
+wide fan-out cannot be truncated away) and interrupt every live member.
+Only running sessions are interrupted; the rest only lose their clocks.
+Descendants are then untracked, so no later beat re-kindles them, while the
+loop's own session stays tracked so a later `start` can find it.
+
 ### Completion
 
 The loop cannot know on its own whether a task is finished — that is a judgement
@@ -294,9 +385,11 @@ it is deterministic and costs no extra model call, which an "is it done?" probe
 would.
 
 Three safety bounds stop a loop whose model never emits the sentinel:
-`maxIterations` (default 100), the consecutive-error budget (5), and the
-rotation budget — one try per model, capped at 10 model swaps without a
-completed turn. A read failure is
+`maxIterations` (default 100), the consecutive-error budget (5), and one try
+per model — the chain is walked once, in rank order, and a loop that has spent
+every model in it stops rather than buying a second round. Three interrupts
+with nothing finished stop it too, since that is the session being wedged and
+no model swap will fix it. A read failure is
 treated as *not complete*, so a broken message read runs the loop to its
 budget rather than halting it.
 
@@ -349,9 +442,18 @@ prose and would have a failure mode that loses the session.
 ## Development
 
 ```
-npx tsx scripts/update-catalogue.ts   # regenerate the catalogue
-./node_modules/.bin/tsc --noEmit -p . # typecheck (excludes tui.tsx)
+npx tsx scripts/test.ts                    # unit tests (no server, no network)
+npx tsx scripts/update-catalogue.ts        # regenerate the catalogue
+./node_modules/.bin/tsc --noEmit -p .      # typecheck (excludes tui.tsx)
 ```
+
+The tests cover the parts with the most sharp edges: the v2 event mapping,
+the clocks (a long quiet-but-progressing turn never trips the hang clock, an
+interrupt disarms it), the error table, the free/quota/local ranking, the
+alibaba shape parsing, and the engine's loop rules — rotation walks the chain
+once, the turn arm prevents a double advance, halt interrupts the tree, a
+foreign session's errors never stop a loop. They run through a fake plugin
+context, so nothing in them can touch a live session.
 
 `tui.tsx` is excluded from the local typecheck because it imports
 `@opencode/plugin/tui` and `@opentui/solid`, which the opencode server provides
@@ -371,10 +473,11 @@ Two checks, in layers:
    /api/model`, which carries the credentials (a plain HTTP fetch to the
    server's port returns 401). Unroutable rows are persisted with
    `reachable: false`.
-2. **At load time** — the engine re-derives it from `ctx.catalog.model.list()`,
-   because the committed file goes stale when credentials change. A failure to
-   list leaves reachability untouched rather than clearing it, so a transient
-   API error cannot empty every mode.
+2. **At load time** — the engine re-derives it from `ctx.model.list()` (with
+   the older `ctx.catalog.model.list()` spelling tolerated), because the
+   committed file goes stale when credentials change. A failure to list
+   leaves reachability untouched rather than clearing it, so a transient API
+   error cannot empty every mode.
 
 `meets()` rejects `reachable === false`, so no mode can select one.
 

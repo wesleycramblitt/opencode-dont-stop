@@ -175,14 +175,21 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
     case "rate":
       return {
         // Long enough to survive a burst limit, short enough not to stall.
+        // The limit clears, the cooldown expires, and `expireCooldowns` puts
+        // the model back into contention — which is the "try again on free"
+        // path: the sweep moves on *now* instead of waiting out the window on
+        // a model that is refusing work.
         cooldownMs: 60 * 1000,
         resweep: true,
         degrade: false,
         restrict: null,
         stop: false,
-        // Rate limits are usually short windows: one more attempt is cheaper
-        // than handing the turn to another model.
-        retry: true,
+        // No retry on the same model: a rate limit is a statement about the
+        // model right now, and when several free models are waiting in the
+        // chain the cheap move is to hand the turn to the next one. When the
+        // window has no other model the rotation is a no-op and the cooldown
+        // expiry brings this one back.
+        retry: false,
         reason: "rate limited; rotating to the next model",
       }
 

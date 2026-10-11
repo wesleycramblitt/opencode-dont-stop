@@ -26,6 +26,7 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { benchmarksFor, type Benchmarks } from "../data/benchmarks.ts"
+import { FREE_TIERS } from "../data/free-tiers.ts"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 export const CATALOGUE_FILE = join(HERE, "..", "data", "catalogue.json")
@@ -33,6 +34,24 @@ export const CATALOGUE_FILE = join(HERE, "..", "data", "catalogue.json")
 export const MODELS_DEV_URL = "https://models.dev/api.json"
 export const OLLAMA_SEARCH_URL = "https://ollama.com/search?o=popular&c=text"
 export const OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
+
+/**
+ * Alibaba Model Studio's live model inventory.
+ *
+ * The Model Studio models API returns the full catalogue for the account
+ * behind the key — id, name, description, features, per-model prices, context
+ * window, input/output modalities — which is strictly more current than the
+ * models.dev snapshot (it lists models models.dev has not caught up with). It
+ * is paginated: `page_no` × `page_size` against `output.total`.
+ *
+ * Override the host with `ALIBABA_MODELS_URL` when the account is a dedicated
+ * workspace (`https://ws-<id>.<region>.maas.aliyuncs.com/api/v1/models`); the
+ * default is the international Model Studio endpoint so no configuration is
+ * needed for the common case.
+ */
+export const ALIBABA_MODELS_URL =
+  process.env.ALIBABA_MODELS_URL ?? "https://dashscope-intl.aliyuncs.com/api/v1/models"
+const ALIBABA_PAGE_SIZE = 100
 
 /** How many popular ollama models to include. */
 export const TOP_OLLAMA = 100
@@ -44,6 +63,8 @@ interface FetchOptions {
   timeoutMs?: number
   /** Skip the local ollama probe (used when testing). */
   skipLocal?: boolean
+  /** Alibaba key override, ahead of env and config resolution. */
+  alibabaKey?: string
 }
 
 async function getJSON(url: string, options: FetchOptions): Promise<unknown> {
@@ -119,7 +140,7 @@ interface RawRow {
   pricing: { input: number; output: number; cacheRead: number; cacheWrite: number }
   canonicalID: string | null
   local: boolean
-  source: "models.dev" | "ollama" | "local"
+  source: "models.dev" | "ollama" | "local" | "alibaba"
   /** Popularity position among local models, when known. */
   rank?: number
   /**
@@ -157,6 +178,19 @@ export const UNKNOWN_WEIGHTS: Weights = {
   active: null,
   moe: false,
   source: "unknown",
+}
+
+/**
+ * Which raw source wins when two rows share a key. Higher wins; ties keep the
+ * first row. The local daemon is ground truth for what runs here; a vendor's
+ * own inventory beats a third-party registry's snapshot of it; the registry
+ * beats a scrape.
+ */
+const SOURCE_PRIORITY: Record<RawRow["source"], number> = {
+  local: 3,
+  alibaba: 2,
+  "models.dev": 1,
+  ollama: 0,
 }
 
 /** Flatten models.dev into raw rows for the requested providers. */
@@ -552,6 +586,230 @@ async function localOllama(options: FetchOptions): Promise<Map<string, { context
   }
 }
 
+/* -------------------------------------------------------- alibaba shaping */
+
+/** A model entry as the Model Studio inventory reports it. */
+export interface AlibabaModelEntry {
+  model: string
+  name?: string
+  description?: string
+  provider?: string
+  published_time?: string
+  features?: string[]
+  capabilities?: string[]
+  inference_metadata?: {
+    request_modality?: string[]
+    response_modality?: string[]
+  }
+  model_info?: {
+    context_window?: number | null
+    max_output_tokens?: number | null
+  }
+  prices?: Array<{
+    prices?: Array<{
+      type?: string
+      price?: string | number
+      time_band?: string
+    }>
+  }>
+}
+
+/**
+ * Resolve the Alibaba credential for the inventory query, in precedence
+ * order. One resolution function keeps every caller honest about where the
+ * key may come from:
+ *
+ *   1. an explicit override (tests, `--alibaba-key`)
+ *   2. the conventional env names (`ALIBABA_API_KEY`, `DASHSCOPE_API_KEY`)
+ *   3. the configured provider block in `opencode.json` (V2 `settings.apiKey`
+ *      or legacy `options.apiKey`)
+ *
+ * Returns null when nothing is configured; the caller then skips the source
+ * with a note rather than failing the whole build.
+ */
+export function resolveAlibabaKey(
+  override?: string,
+  home: string = process.env.HOME ?? "",
+): string | null {
+  if (override && override.length > 0) return override
+  const fromEnv = process.env.ALIBABA_API_KEY ?? process.env.DASHSCOPE_API_KEY
+  if (fromEnv && fromEnv.length > 0) return fromEnv
+  return keyFromConfig(home)
+}
+
+function keyFromConfig(home: string): string | null {
+  const candidates = [
+    join(home, ".config", "opencode", "opencode.json"),
+    join(home, ".config", "opencode", "opencode.jsonc"),
+  ]
+  for (const file of candidates) {
+    if (!existsSync(file)) continue
+    try {
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as {
+        providers?: Record<string, { settings?: { apiKey?: unknown }; options?: { apiKey?: unknown } }>
+      }
+      const provider = parsed.providers?.alibaba
+      const key = provider?.settings?.apiKey ?? provider?.options?.apiKey
+      if (typeof key === "string" && key.length > 0 && !key.startsWith("{env:")) return key
+    } catch {
+      // Unreadable config is not a reason to fail the build; env set it above.
+    }
+  }
+  return null
+}
+
+/**
+ * Parse one inventory payload into model entries. Pure, so it can be tested
+ * against a fixture. Handles both the Model Studio shape
+ * (`output.models[].model`) and the OpenAI-compatible shape (`data[].id`),
+ * which the compatible-mode endpoint returns.
+ */
+export function parseAlibabaInventory(payload: unknown): AlibabaModelEntry[] {
+  const record = (payload ?? {}) as Record<string, unknown>
+  const output = record.output as { models?: unknown } | undefined
+  const rows = output?.models ?? record.data
+  if (!Array.isArray(rows)) return []
+  const out: AlibabaModelEntry[] = []
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue
+    const entry = row as Record<string, unknown>
+    const id = typeof entry.model === "string" ? entry.model
+      : typeof entry.id === "string" ? entry.id
+      : null
+    if (!id) continue
+    const prices = entry.prices
+    const metadata = entry.inference_metadata
+    const info = entry.model_info
+    const infoObj = info && typeof info === "object" ? info as Record<string, unknown> : null
+    out.push({
+      model: id,
+      ...(typeof entry.name === "string" ? { name: entry.name } : {}),
+      ...(typeof entry.description === "string" ? { description: entry.description } : {}),
+      ...(typeof entry.provider === "string" ? { provider: entry.provider } : {}),
+      ...(typeof entry.published_time === "string" ? { published_time: entry.published_time } : {}),
+      ...(Array.isArray(entry.features) ? { features: entry.features as string[] } : {}),
+      ...(Array.isArray(entry.capabilities) ? { capabilities: entry.capabilities as string[] } : {}),
+      ...(metadata && typeof metadata === "object"
+        ? { inference_metadata: metadata as AlibabaModelEntry["inference_metadata"] }
+        : {}),
+      ...(infoObj
+        ? { model_info: infoObj as AlibabaModelEntry["model_info"] }
+        : {}),
+      ...(Array.isArray(prices) ? { prices: prices as AlibabaModelEntry["prices"] } : {}),
+    })
+  }
+  return out
+}
+
+/** The token prices for an entry, preferring standard over thinking bands. */
+function alibabaPricing(entry: AlibabaModelEntry): { input: number; output: number; cacheRead: number; cacheWrite: number } {
+  const bands = entry.prices ?? []
+  const pick = (preferred: string[], fallback: string[]) => {
+    const all = bands.flatMap((band) => band.prices ?? [])
+    const found = all.find((p) => preferred.includes(p.type ?? ""))
+    const alt = found ? null : all.find((p) => fallback.includes(p.type ?? ""))
+    const price = found ?? alt
+    return typeof price?.price === "string" || typeof price?.price === "number" ? Number(price.price) : 0
+  }
+  return {
+    input: pick(["input_token", "thinking_input_token"], ["text_input_token", "omni_no_audio_input_token", "omni_input_token"]),
+    output: pick(["output_token", "thinking_output_token"], ["text_output_token", "omni_text_output_token", "omni_output_token"]),
+    cacheRead: pick(["input_token_cache_read", "thinking_input_token_cache_read"], []),
+    cacheWrite: pick(["input_token_cache_creation_5m", "input_token_cache"], []),
+  }
+}
+
+/** Capabilities from the inventory's feature and modality lists. */
+function alibabaCapabilities(entry: AlibabaModelEntry): Record<string, boolean> {
+  const tags = new Set((entry.features ?? []).map((f) => f.toLowerCase()))
+  const request = new Set((entry.inference_metadata?.request_modality ?? []).map((m) => m.toLowerCase()))
+  const capabilities = new Set((entry.capabilities ?? []).map((c) => c.toLowerCase()))
+  return {
+    text: request.has("text") || capabilities.has("tg"),
+    image: request.has("image"),
+    audio: request.has("audio"),
+    pdf: request.has("pdf"),
+    video: request.has("video"),
+    reasoning: capabilities.has("reasoning") || capabilities.has("thinking"),
+    toolCall: tags.has("function-calling"),
+    structured: tags.has("structured-outputs"),
+    embedding: tags.has("embedding"),
+  }
+}
+
+/**
+ * The raw rows a Model Studio inventory contributes.
+ *
+ * Only rows that can drive a chat/agent turn are emitted: a row must accept
+ * text input and carry token prices. Image/video generation, TTS, ASR and
+ * embedding models have neither (they price per image/character/second), and a
+ * row without pricing must never enter the catalogue as if it were free.
+ */
+export function rowsFromAlibaba(entries: AlibabaModelEntry[]): RawRow[] {
+  const rows: RawRow[] = []
+  for (const entry of entries) {
+    const capabilities = alibabaCapabilities(entry)
+    const pricing = alibabaPricing(entry)
+    if (!capabilities.text) continue
+    if (pricing.input === 0 && pricing.output === 0) continue
+
+    const published = (entry.published_time ?? "").replace(" ", "T")
+    rows.push({
+      providerID: "alibaba",
+      id: entry.model,
+      name: entry.name ?? entry.model,
+      description: entry.description ?? "",
+      family: entry.provider ?? "",
+      releaseDate: published,
+      knowledge: "",
+      openWeights: false,
+      context: Number(entry.model_info?.context_window ?? 0),
+      maxOutput: Number(entry.model_info?.max_output_tokens ?? 0),
+      capabilities,
+      pricing,
+      canonicalID: null,
+      local: false,
+      // The inventory is the vendor's own word on its models; a row from it
+      // outranks the same key from models.dev.
+      source: "alibaba",
+      weights: UNKNOWN_WEIGHTS,
+      cloud: true,
+    })
+  }
+  return rows
+}
+
+/** Fetch the full inventory, paginated. */
+async function fetchAlibabaInventory(options: FetchOptions): Promise<AlibabaModelEntry[]> {
+  const key = resolveAlibabaKey(options.alibabaKey)
+  if (!key) return []
+  const fetchImpl = options.fetchImpl ?? fetch
+  const entries: AlibabaModelEntry[] = []
+  let page = 1
+  for (;;) {
+    const url = `${ALIBABA_MODELS_URL}${ALIBABA_MODELS_URL.includes("?") ? "&" : "?"}page_no=${page}&page_size=${ALIBABA_PAGE_SIZE}`
+    const response = await fetchImpl(url, {
+      signal: AbortSignal.timeout(options.timeoutMs ?? 30000),
+      headers: { accept: "application/json", authorization: `Bearer ${key}` },
+    })
+    if (!response.ok) throw new Error(`${ALIBABA_MODELS_URL} -> HTTP ${response.status}`)
+    const payload = (await response.json()) as Record<string, unknown>
+    const parsed = parseAlibabaInventory(payload)
+    entries.push(...parsed)
+    if (parsed.length === 0) break
+    const total = numberOf((payload.output as { total?: unknown } | undefined)?.total)
+    if (total > 0 && page * ALIBABA_PAGE_SIZE >= total) break
+    if (parsed.length < ALIBABA_PAGE_SIZE) break
+    page += 1
+  }
+  return entries
+}
+
+function numberOf(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value)
+  return Number.isFinite(n) ? n : 0
+}
+
 /* -------------------------------------------------------------------- build */
 
 /** A catalogue row as persisted. Everything here is sourced or derived. */
@@ -589,8 +847,10 @@ export interface CatalogueRow {
   benchmarks: Benchmarks | null
   /** Strength scores 0-10. From benchmarks when available, else derived. */
   scores: { reasoning: number; code: number; agentic: number; general: number; capability: number }
+  /** A declared free allowance, when one is curated for this model. */
+  freeTier: { tokens: number; windowDays: number; source: string } | null
   provenance: {
-    metadata: "models.dev" | "ollama" | "local"
+    metadata: "models.dev" | "ollama" | "local" | "alibaba"
     benchmark: string | null
     /** True when `scores` was derived rather than read from a report. */
     estimated: boolean
@@ -601,7 +861,7 @@ export interface CatalogueRow {
 export interface CatalogueDocument {
   version: number
   generatedAt: string
-  sources: { id: string; url: string; models: number }[]
+  sources: { id: string; url: string; models: number; note?: string }[]
   models: CatalogueRow[]
 }
 
@@ -1039,6 +1299,10 @@ export function toRow(raw: RawRow, ollamaRank?: number): CatalogueRow {
     canonicalID: raw.canonicalID,
     benchmarks,
     scores,
+    // A curated free allowance keyed by `provider/model`. Applied at build
+    // time so the persisted file is self-contained; load time re-applies the
+    // table over stale files (see `lib/catalogue.ts`).
+    freeTier: FREE_TIERS[`${raw.providerID}/${raw.id}`] ?? null,
     provenance: {
       metadata: raw.source,
       benchmark: benchmarks?.source ?? null,
@@ -1077,6 +1341,23 @@ export async function fetchCatalogue(options: FetchOptions = {}): Promise<Catalo
   } catch (error) {
     sourceStats.push({ id: "ollama-search", url: OLLAMA_SEARCH_URL, models: 0 })
     console.error(`[catalogue] ollama search failed: ${messageOf(error)}`)
+  }
+
+  // Alibaba's own inventory. Needs a key; without one the source is skipped
+  // with a note instead of failing the build — models.dev still covers the
+  // provider, just with its older snapshot.
+  try {
+    const entries = await fetchAlibabaInventory(options)
+    const rows = rowsFromAlibaba(entries)
+    raw.push(...rows)
+    if (resolveAlibabaKey(options.alibabaKey)) {
+      sourceStats.push({ id: "alibaba", url: ALIBABA_MODELS_URL, models: rows.length })
+    } else {
+      sourceStats.push({ id: "alibaba", url: ALIBABA_MODELS_URL, models: 0, note: "no ALIBABA_API_KEY configured; skipped" })
+    }
+  } catch (error) {
+    sourceStats.push({ id: "alibaba", url: ALIBABA_MODELS_URL, models: 0 })
+    console.error(`[catalogue] alibaba inventory failed: ${messageOf(error)}`)
   }
 
   const installed = await localOllama(options)
@@ -1141,13 +1422,25 @@ export async function fetchCatalogue(options: FetchOptions = {}): Promise<Catalo
     sourceStats.push({ id: "opencode-registry", url: "server (unreachable)", models: 0 })
   }
 
-  const seen = new Set<string>()
-  const models: CatalogueRow[] = []
+  // Dedupe by key, keeping the most authoritative row for each model. A row
+  // from the local daemon beats the popularity scrape; Alibaba's own
+  // inventory beats models.dev's snapshot of the same provider; models.dev
+  // beats the scrape. Ties keep the first row.
+  const kept = new Map<string, { row: RawRow; rank: number | undefined }>()
   for (const row of raw) {
-    const candidate = toRow(row, row.rank ?? ranks.get(row.id))
+    const candidateKey = row.variant
+      ? `${row.providerID}/${row.id}#${row.variant}`
+      : `${row.providerID}/${row.id}`
+    const priority = SOURCE_PRIORITY[row.source] ?? 0
+    const existing = kept.get(candidateKey)
+    if (existing && priority <= SOURCE_PRIORITY[existing.row.source]) continue
+    kept.set(candidateKey, { row, rank: row.rank ?? ranks.get(row.id) })
+  }
+
+  const models: CatalogueRow[] = []
+  for (const { row, rank } of kept.values()) {
+    const candidate = toRow(row, rank)
     if (row.unroutable) candidate.reachable = false
-    if (seen.has(candidate.key)) continue
-    seen.add(candidate.key)
     models.push(candidate)
   }
 

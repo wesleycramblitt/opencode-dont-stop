@@ -30,6 +30,7 @@ import {
   markAvailable,
   markUnavailable,
   cooldown,
+  clearCooldown,
   filter,
   sortBy,
   sorts,
@@ -47,12 +48,13 @@ import {
   type TaskProfile,
 } from "./modes.ts"
 import { actionFor, classify, type ClassifiedError, type ErrorAction } from "./errors.ts"
-import { ClockSet, DEFAULT_CLOCKS, lifecycleOf, progressKindOf, type ClockOptions } from "./clocks.ts"
+import { ClockSet, DEFAULT_CLOCKS, type ClockOptions } from "./clocks.ts"
 import {
   DEFAULT_HANDOFF_THRESHOLD,
   handoff,
   measureContext,
   shouldHandoff,
+  sessionTree as fetchSessionTree,
   transcriptFrom,
   type HandoffContext,
 } from "./handoff.ts"
@@ -60,6 +62,7 @@ import { handoffDirectory } from "./state.ts"
 import { applyAgentDefaults, applySessionModels, sameSlot, slotFrom, type ApplyContext, type ModelPlan } from "./apply.ts"
 import type { Logger } from "./log.ts"
 import { bumpIntent, readState, type Mode, type ModelSlot, type PluginState } from "./state.ts"
+import { eventSignals, TURN_END_TYPES, type SessionEvent } from "./events.ts"
 
 /** A session the engine is tracking for the loop. */
 export interface TrackedSession {
@@ -87,8 +90,6 @@ export interface EngineOptions {
   handoffDirectory?: string
   /** Identifies this process as the loop's owner. Generated when omitted. */
   instanceID?: string
-  /** Rotations allowed without a completed turn. */
-  maxRotations?: number
   /**
    * Delay before re-driving the loop: after cancelling a hung turn, and
    * before a second attempt on a model that just failed.
@@ -107,17 +108,6 @@ export interface EngineOptions {
 export const DEFAULT_MAX_ITERATIONS = 100
 
 /**
- * Rotations the loop may buy without a single completed turn before it gives
- * up — an absolute cap on top of the one-try-per-model rule.
- *
- * Rotation already refuses to revisit a model within an episode, so a chain of
- * N gives at most N turns before it stops by itself. This cap exists for wide
- * chains: it bounds how many *distinct* losing bets are worth making before
- * concluding that the task, not the model, is stuck.
- */
-export const DEFAULT_MAX_ROTATIONS = 10
-
-/**
  * How long to wait before re-driving the loop — after cancelling a hung turn,
  * or before a second attempt on a model that just failed.
  *
@@ -133,6 +123,15 @@ export const DEFAULT_REDRIVE_DELAY_MS = 20_000
 
 /** How long a model that hung stays out of the chain (10 minutes). */
 export const DEFAULT_HANG_COOLDOWN_MS = 10 * 60_000
+
+/**
+ * How recent an interrupt must be to count as the hang path's own doing.
+ *
+ * The hang path records the moment it interrupts; the resulting
+ * `session.execution.interrupted` event can arrive a beat later, so the check
+ * is a small recency window rather than an exact match.
+ */
+export const HANG_INTERRUPT_RECENCY_MS = 5_000
 
 /** Heartbeat intervals an owner may miss before its loop counts as orphaned. */
 export const LEASE_GRACE_BEATS = 3
@@ -176,7 +175,6 @@ export class LoopEngine {
   private catalogue: Catalogue | null = null
   private readonly tracked = new Map<string, TrackedSession>()
   private readonly clocks: ClockSet
-  private rotation: Record<string, number> = {}
   private restrictions: Record<string, Requirements> = {}
   /**
    * Models that have already had a try since the last completed turn, keyed
@@ -199,6 +197,21 @@ export class LoopEngine {
    * try budget, or a failing model would get an unlimited number of retries.
    */
   private turnFailed = false
+  /**
+   * Whether a turn of the loop's session is in flight. Set when a prompt is
+   * sent and when an execution-start event arrives; cleared by the first
+   * turn-end event. Turn-end events come in pairs on the v2 bus (an execution
+   * result and a later idle/status), and without this flag each pair would
+   * advance the loop twice.
+   */
+  private turnArmed = false
+  /**
+   * When the hang path last interrupted the loop session. The interrupt
+   * produces a `session.execution.interrupted` event; distinguishing it from
+   * a user escape is what lets the engine stand down and let the scheduled
+   * re-drive own the next prompt instead of advancing immediately.
+   */
+  private lastHangInterruptAt = 0
 
   /**
    * This process's identity. Written into the state file as the loop's owner,
@@ -219,7 +232,6 @@ export class LoopEngine {
   private readonly sentinel: string
   private readonly handoffThreshold: number
   private readonly handoffDirectory: string
-  private readonly maxRotations: number
   private readonly redriveDelayMs: number
   private readonly hangCooldownMs: number
   private readonly leaseGraceMs: number
@@ -238,7 +250,6 @@ export class LoopEngine {
     this.sentinel = options.completionSentinel ?? COMPLETION_SENTINEL
     this.handoffThreshold = options.handoffThreshold ?? DEFAULT_HANDOFF_THRESHOLD
     this.handoffDirectory = options.handoffDirectory ?? handoffDirectory()
-    this.maxRotations = options.maxRotations ?? DEFAULT_MAX_ROTATIONS
     this.redriveDelayMs = options.redriveDelayMs ?? DEFAULT_REDRIVE_DELAY_MS
     this.hangCooldownMs = options.hangCooldownMs ?? DEFAULT_HANG_COOLDOWN_MS
     this.leaseGraceMs = clocks.intervalMs * LEASE_GRACE_BEATS
@@ -300,35 +311,128 @@ export class LoopEngine {
   }
 
   /** Feed an event into the clocks and the session tracker. */
-  observe(event: { type: string; properties?: Record<string, unknown> }): void {
-    const sessionID = (event.properties?.info as { id?: string } | undefined)?.id
-      ?? (event.properties?.sessionID as string | undefined)
+  observe(event: SessionEvent): void {
+    const signals = eventSignals(event)
+    const sessionID = signals.sessionID
     if (!sessionID) return
 
     this.track(sessionID)
 
-    const lifecycle = lifecycleOf(event.type)
-    const progress = progressKindOf(event.type, event.properties)
     const clocks = this.clocks.clocksFor(sessionID)
+    const now = Date.now()
 
-    if (progress) clocks.progress(Date.now())
-    else clocks.seen(Date.now())
+    if (signals.progress) clocks.progress(now)
+    else clocks.seen(now)
 
-    if (lifecycle === "start") {
-      clocks.start(Date.now())
+    if (signals.lifecycle === "start") {
+      clocks.start(now)
+      // A started turn is a turn in flight: the first turn-end event for the
+      // loop's session is the one that gets to advance it.
+      if (sessionID === this.state.loop.sessionID) this.turnArmed = true
       const record = this.tracked.get(sessionID)
       if (record) {
-        const info = event.properties?.info as { model?: { providerID?: string; id?: string }; agent?: string } | undefined
-        if (info?.model) {
-          record.model = { providerID: info.model.providerID ?? "", id: info.model.id ?? "" }
-        }
-        if (info?.agent) record.agent = info.agent
+        if (signals.model) record.model = signals.model
+        if (signals.agent) record.agent = signals.agent
       }
-    } else if (lifecycle === "finish") {
-      clocks.finish(Date.now())
+    } else if (signals.lifecycle === "finish") {
+      clocks.finish(now)
+    } else {
+      // Metadata events (created, updated, model/agent selected) refresh the
+      // tracked record without moving the clocks.
+      const record = this.tracked.get(sessionID)
+      if (record) {
+        if (signals.model) record.model = signals.model
+        if (signals.agent) record.agent = signals.agent
+      }
     }
 
     this.state.lastEvent = event.type
+  }
+
+  /* --------------------------------------------------------------- turn end */
+
+/**
+   * A turn of the loop's session ended. This is the driver hook the server
+   * entrypoint calls on the turn-end events; the loop continues by advancing,
+   * unless the ending was the hang path's own interrupt, in which case the
+   * scheduled re-drive owns the next prompt.
+   *
+   * Only the `session.execution.*` trio drives the loop (see
+   * `TURN_END_TYPES`): they are exactly one per turn, while the idle/status
+   * events that trail an execution result would double-advance it.
+   */
+  async onTurnEnd(sessionID: string, eventType: string): Promise<void> {
+    if (!TURN_END_TYPES.has(eventType)) return
+    if (!this.ownsLoop() || this.state.loop.sessionID !== sessionID) return
+    if (!this.turnArmed) return
+    this.turnArmed = false
+
+    if (eventType === "session.execution.interrupted") {
+      // An interrupt ends a turn without completing it. When it was ours —
+      // the hang path interrupting before a rotation — the re-drive deadline
+      // owns the next prompt, and advancing now would double-drive. When it
+      // was the user's escape, nothing else is scheduled, so the re-drive
+      // gives the loop a moment before continuing it.
+      const ours = Date.now() - this.lastHangInterruptAt < HANG_INTERRUPT_RECENCY_MS
+      if (ours) return
+      if (this.redriveAt === null) this.redriveAt = Date.now() + this.redriveDelayMs
+      return
+    }
+
+    await this.advance(sessionID)
+  }
+
+  /* ------------------------------------------------------------ session tree */
+
+  /** The loop session and every descendant session, at any depth. */
+  private async sessionTree(rootID: string): Promise<string[]> {
+    const ctx = this.ctx as unknown as Pick<HandoffContext, "session">
+    try {
+      return [rootID, ...(await fetchSessionTree(ctx, rootID))]
+    } catch {
+      // The tree could not be walked; the root is still the root.
+      return [rootID]
+    }
+  }
+
+  /** The session ids currently running, per the server's own activity map. */
+  private async activeSessionIDs(): Promise<Set<string>> {
+    try {
+      const api = this.ctx as unknown as {
+        session: { active(): Promise<unknown> }
+      }
+      const active = await api.session.active()
+      const ids = new Set<string>()
+      if (Array.isArray(active)) {
+        for (const entry of active) {
+          if (typeof entry === "string") ids.add(entry)
+          else if (entry && typeof entry === "object") {
+            const id = (entry as Record<string, unknown>).id ?? (entry as Record<string, unknown>).sessionID
+            if (typeof id === "string") ids.add(id)
+          }
+        }
+      } else if (active && typeof active === "object") {
+        const data = (active as Record<string, unknown>).data
+        for (const key of Object.keys(data && typeof data === "object" ? data : active)) ids.add(key)
+      }
+      return ids
+    } catch {
+      return new Set()
+    }
+  }
+
+  /**
+   * Interrupt the loop session and every live descendant: a subagent running
+   * when its parent is hung or halted keeps writing into work the loop has
+   * abandoned, so the recovery has to reach the whole tree, not just the root.
+   */
+  private async interruptTree(rootID: string): Promise<void> {
+    const tree = await this.sessionTree(rootID)
+    const active = await this.activeSessionIDs()
+    for (const id of tree) {
+      const running = active.has(id) || this.clocks.peek(id)?.activity.running === true
+      if (running) await this.interrupt(id)
+    }
   }
 
   /* ------------------------------------------------------------ discovery */
@@ -379,7 +483,14 @@ export class LoopEngine {
   private async applyReachability(): Promise<void> {
     if (!this.catalogue) return
     try {
-      const result = await (this.ctx as unknown as { catalog?: { model: { list(): Promise<{ data?: unknown }> } } }).catalog?.model.list()
+      const api = this.ctx as unknown as {
+        model?: { list(): Promise<{ data?: unknown }> }
+        catalog?: { model: { list(): Promise<{ data?: unknown }> } }
+      }
+      // v2 exposes the registry at `ctx.model`; the older `ctx.catalog`
+      // spelling is tolerated so a downgrade does not silently disable
+      // reachability.
+      const result = (await api.model?.list()) ?? (await api.catalog?.model.list())
       const data = (result as { data?: Array<{ providerID?: string; id?: string }> } | undefined)?.data
       if (!Array.isArray(data) || data.length === 0) return
 
@@ -415,6 +526,18 @@ export class LoopEngine {
     if (this.catalogue) cooldown(this.catalogue, key, until)
   }
 
+  /**
+   * Cooldown through both channels: the durable state (survives reloads,
+   * drives the expiry that re-admits a model) and the catalogue row itself
+   * (so ranking sees it immediately). The two used to be written in different
+   * places, which left a model selectable on the ranking path while its
+   * cooldown entry said otherwise.
+   */
+  private putOnCooldown(key: string, until: number): void {
+    this.state.cooldowns[key] = until
+    this.coolDown(key, until)
+  }
+
   /** Restore a model to available. */
   restore(key: string): void {
     if (this.catalogue) markAvailable(this.catalogue, key)
@@ -423,29 +546,6 @@ export class LoopEngine {
   /** Mark a model unavailable with a reason. */
   fail(key: string, reason: string): void {
     if (this.catalogue) markUnavailable(this.catalogue, key, reason)
-  }
-
-  /**
-   * Rebuild the catalogue from the generated data file.
-   *
-   * The data file is produced by `scripts/update-catalogue.ts`, which is a
-   * deliberate CLI step rather than something the running plugin does: it
-   * hits the network for every source and writes a committed artifact, so a
-   * plugin reload must not silently rewrite it. This method reloads whatever
-   * is on disk and re-plans, which is what makes the command useful.
-   */
-  async refreshCatalogue(): Promise<Catalogue | null> {
-    const next = loadCatalogue()
-    if (!next) {
-      this.log.warn("no catalogue on disk; run: npx tsx scripts/update-catalogue.ts")
-      return this.catalogue
-    }
-    const patches = this.availabilityPatches()
-    this.catalogue = next
-    applyAvailability(next, patches)
-    this.log.info(`catalogue reloaded: ${next.models.length} models`)
-    this.emit()
-    return next
   }
 
   /* --------------------------------------------------------------- planning */
@@ -537,7 +637,6 @@ export class LoopEngine {
     // Mirror the plan into state so the TUI can render it.
     this.state.main = plan.main
     this.state.agentModels = plan.agents
-    this.state.rotation = this.rotation
     this.emit()
   }
 
@@ -599,24 +698,16 @@ export class LoopEngine {
    * in-flight request is cancelled, then rotate to a different model: a model
    * that hangs is a property of the model, so the recovery is to change it.
    *
-   * Three bounds make this recovery instead of a spin. The hung model goes on
-   * cooldown so the chain actually moves; rotation only ever picks a model that
-   * has not tried yet, so a small chain is walked rather than cycled; and
-   * rotations are counted against completed turns, so if the budget is spent
-   * the task — not the model — is stuck and the loop stops buying.
+   * Two bounds make this recovery instead of a spin. The hung model goes on
+   * cooldown so the chain actually moves, and rotation only ever picks a model
+   * that has not tried yet, so the chain is walked rather than cycled — it
+   * runs free models first and local last, which is the whole point of
+   * standing up to a run of rate limits. Interrupts are separately capped:
+   * three of them with no completed turn means the *session* is wedged, and
+   * no model swap will fix that.
    */
   private async handleHang(sessionID: string, reason: string): Promise<void> {
-    const loop = this.state.loop
     this.log.warn(`hang detected on ${sessionID}: ${reason}`)
-
-    if (loop.rotations >= this.maxRotations) {
-      this.log.warn(`session ${sessionID} still hung after ${loop.rotations} model swaps; stopping loop`)
-      await this.stop(
-        `${this.maxRotations} model rotations without a completed turn on ${sessionID}; ` +
-          `the task is stuck, not the model`,
-      )
-      return
-    }
 
     if (this.clocks.peek(sessionID)?.exhausted()) {
       this.log.warn(`session ${sessionID} still hung after repeated interrupts; stopping loop`)
@@ -627,7 +718,10 @@ export class LoopEngine {
     const record = this.tracked.get(sessionID)
     const previous = record?.model ? modelKeyOf(record.model) : null
 
-    await this.interrupt(sessionID)
+    // The interrupt is ours; mark it so the turn-end event it produces stands
+    // down instead of advancing.
+    this.lastHangInterruptAt = Date.now()
+    await this.interruptTree(sessionID)
     this.clocks.clocksFor(sessionID).interrupted(Date.now())
 
     // The await above yields the thread, and a halt may have landed in it.
@@ -637,8 +731,7 @@ export class LoopEngine {
     if (!this.ownsLoop() || current.sessionID !== sessionID) return
 
     if (previous) {
-      this.state.cooldowns[previous] = Date.now() + this.hangCooldownMs
-      this.coolDown(previous, Date.now() + this.hangCooldownMs)
+      this.putOnCooldown(previous, Date.now() + this.hangCooldownMs)
     }
 
     const outcome = this.rotate(sessionID, "hang")
@@ -828,11 +921,12 @@ export class LoopEngine {
     // must not be counted as completed work.
     if (ownsThis) this.turnFailed = true
 
-    // A retryable failure on the loop's own model is worth one more attempt on
-    // that same model before we spend a rotation: a dropped connection or a
-    // burst rate limit usually clears in seconds, and rotating loses the turn
-    // anyway. Everything else — a capability miss, an over-full context, an
-    // account with no money — fails the same way twice, so it rotates now.
+    // A retryable failure on the loop's own model is worth one more attempt
+    // on that same model before we spend a rotation: a dropped connection or
+    // an unclassified error usually clears in seconds, and rotating loses the
+    // turn anyway. Everything else — a rate limit, a capability miss, an
+    // over-full context, an account with no money — rotates now, because it
+    // fails the same way twice.
     const failures = key ? (this.retries[key] ?? 0) : 0
     const willRetry = action.retry && ownsThis && key !== null && failures === 0
 
@@ -840,7 +934,7 @@ export class LoopEngine {
     // straight at it, and the cooldown would only take it out of the chain the
     // retry is hoping to succeed on.
     if (key && !willRetry && action.cooldownMs > 0) {
-      this.state.cooldowns[key] = Date.now() + action.cooldownMs
+      this.putOnCooldown(key, Date.now() + action.cooldownMs)
     }
 
     if (action.restrict) {
@@ -854,12 +948,17 @@ export class LoopEngine {
     }
 
     if (this.consecutive(classified)) {
-      this.state.consecutiveErrors += 1
-      if (this.state.consecutiveErrors >= 5) {
-        await this.stop(`too many consecutive errors: ${this.state.consecutiveErrors}`)
-        return action
+      // The budget counts against the loop's own session only: another
+      // session's repeated failures — a user's experiment, a different
+      // project — must not stop a loop they were never part of.
+      if (ownsThis) {
+        this.state.consecutiveErrors += 1
+        if (this.state.consecutiveErrors >= 5) {
+          await this.stop(`too many consecutive errors: ${this.state.consecutiveErrors}`)
+          return action
+        }
       }
-    } else {
+    } else if (ownsThis) {
       this.state.consecutiveErrors = 0
     }
 
@@ -895,7 +994,19 @@ export class LoopEngine {
       if (until <= now) {
         delete this.state.cooldowns[key]
         changed = true
-        if (this.catalogue) markAvailable(this.catalogue, key)
+        if (this.catalogue) {
+          markAvailable(this.catalogue, key)
+          // The catalogue row carries its own cooldown clock; without this
+          // the row would stay excluded by `meets()` long after the sentence
+          // was served — the hang-path cooldown used to leak past its expiry
+          // and lock a model out of every chain forever.
+          clearCooldown(this.catalogue, key)
+        }
+        // The cooldown was the sentence; it is served. Keeping the model in
+        // the tried set would mean a free model that rate-limited once could
+        // never be picked again this episode, so the loop would sit on the
+        // local fallback while the model it actually wanted was available.
+        this.tried.delete(key)
       }
     }
     if (changed) this.emit()
@@ -928,7 +1039,6 @@ export class LoopEngine {
     const record = this.tracked.get(sessionID)
     if (!record) return "not-ours"
     const agent = record.agent
-    const cursorKey = `${agent}:${this.state.mode}`
 
     if (!this.catalogue) return "unavailable"
     const ranked = rankForMode(this.catalogue, this.state.mode, this.taskFor(agent))
@@ -937,19 +1047,18 @@ export class LoopEngine {
       return "unavailable"
     }
 
-    // The model we are leaving has had its try; so has every model this cursor
-    // already passed. Walking from the cursor keeps rank order, so the next
-    // pick is the best model not yet attempted.
-    const cursor = this.rotation[cursorKey] ?? 0
+    // The model we are leaving has had its try. The pick is the best-ranked
+    // model that has not, which is a plain rank-order walk from the top rather
+    // than a cursor: rank order *is* the preference, and a cursor would walk
+    // past a free model that just came off cooldown before reaching it, since
+    // the local tail sits below it in the chain. One try per model is what
+    // bounds the walk — a chain of N gives N turns and then stops, so there is
+    // no rotation cap on top of it.
     if (record.model) this.tried.add(modelKeyOf(record.model))
     let pick: CatalogueModel | null = null
-    let index = cursor
-    for (let step = 1; step <= ranked.length; step++) {
-      const candidate = ranked[(cursor + step) % ranked.length]
-      const candidateKey = `${candidate.providerID}/${candidate.id}`
-      if (this.tried.has(candidateKey)) continue
+    for (const candidate of ranked) {
+      if (this.tried.has(`${candidate.providerID}/${candidate.id}`)) continue
       pick = candidate
-      index = (cursor + step) % ranked.length
       break
     }
     if (!pick) {
@@ -959,7 +1068,6 @@ export class LoopEngine {
       return "exhausted"
     }
 
-    this.rotation[cursorKey] = index
     record.model = slotFrom(pick)
     this.tried.add(modelKeyOf(pick))
     this.state.loop.lastResult = `rotated ${agent} to ${pick.providerID}/${pick.id} (${cause})`
@@ -998,7 +1106,6 @@ export class LoopEngine {
     this.state.mode = mode
     this.state.degraded = false
     this.state.preferredMode = null
-    this.rotation = {}
     this.state.consecutiveErrors = 0
     // A new chain is a new bet, so the episode's try budget starts over.
     this.resetEpisode()
@@ -1018,7 +1125,6 @@ export class LoopEngine {
     this.state.degraded = true
     this.log.warn(`degrading ${this.state.mode} -> ${next}: ${reason}`)
     this.state.mode = next
-    this.rotation = {}
     // A cheaper chain is a different set of models, so the episode's try budget
     // starts over rather than inheriting the previous chain's verdicts.
     this.resetEpisode()
@@ -1123,8 +1229,11 @@ export class LoopEngine {
   async sendPrompt(sessionID: string, text: string): Promise<void> {
     // A prompt starts a turn, so whatever happened to the last one is settled.
     // This is what lets `advance` tell "the turn finished" from "the turn
-    // errored into idleness".
+    // errored into idleness". Arming the turn here also guards against the
+    // pair of turn-end events an ending produces: the first one advances, the
+    // second is a duplicate that must not.
     this.turnFailed = false
+    this.turnArmed = true
     const session = this.ctx as unknown as {
       session: { prompt(input: { sessionID: string; text: string }): Promise<unknown> }
     }
@@ -1210,6 +1319,10 @@ export class LoopEngine {
       this.untrack(sessionID)
       this.track(newSessionID, record?.agent ?? "general")
       this.state.loop.sessionID = newSessionID
+      // The handoff seeds the successor with its own prompt, so its opening
+      // turn is a turn of the loop: arm it here, or the first turn-end event
+      // would be a duplicate ending and the loop would stand down.
+      this.turnArmed = true
       this.state.loop.lastResult = `handed off to ${newSessionID} (summary: ${result.summaryFile})`
       this.log.info(`handed off to ${newSessionID}; summary at ${result.summaryFile}`)
       this.clocks.clocksFor(newSessionID).start(Date.now())
@@ -1330,12 +1443,20 @@ export class LoopEngine {
     this.appliedIntent = bumpIntent(this.state, "halt").seq
 
     if (sessionID) {
-      const clocks = this.clocks.peek(sessionID)
-      if (clocks?.activity.running) await this.interrupt(sessionID)
-      // Forget the clocks, keep the session: a dropped session would make the
-      // next `start` fail with "no session to run the loop on" until the user
-      // happened to talk to it again.
+      // The halt applies to the whole tree, not just the root: subagents of
+      // the loop's session were spawned by it, and a loop that is over must
+      // not leave a fan-out writing into abandoned work. Only live members
+      // are interrupted; the rest only lose their clocks.
+      await this.interruptTree(sessionID)
       this.clocks.forget(sessionID)
+      const tree = await this.sessionTree(sessionID)
+      for (const id of tree) {
+        if (id === sessionID) continue
+        this.untrack(id)
+      }
+      // The loop session itself is kept tracked: a dropped session would make
+      // the next `start` fail with "no session to run the loop on" until the
+      // user happened to talk to it again.
     }
 
     if (wasActive) this.log.info(`loop stopped: ${reason}`)
@@ -1408,10 +1529,11 @@ function describe(error: ClassifiedError): string {
 /**
  * Pull the last assistant turn's text out of a session context response.
  *
- * The response is an array of messages, each carrying a `role` and `parts`.
- * Part shapes vary — text parts, reasoning parts, tool parts — so only text and
- * a `content` string are collected, and the *last* assistant message wins
- * because that is the turn that just finished.
+ * The response is an array of messages, each carrying a `role` (v2 spells it
+ * `type`) and parts under `content` (v2) or `parts` (older shapes). Only text
+ * parts contribute: reasoning parts are not the answer, and a model that
+ * thinks through the completion sentinel must not be read as having emitted
+ * it.
  *
  * Deliberately tolerant of shape: an unexpected structure returns an empty
  * string rather than throwing, and an empty string means "not complete", which
@@ -1432,23 +1554,32 @@ function extractAssistantText(messages: unknown): string {
     const role = record.role ?? record.type
     if (role !== "assistant" && role !== "agent") continue
 
-    const parts = record.parts
-    if (Array.isArray(parts)) {
-      let collected = ""
-      for (const part of parts) {
-        if (!part || typeof part !== "object") continue
-        const p = part as Record<string, unknown>
-        if (typeof p.text === "string") collected += p.text
-        else if (typeof p.content === "string") collected += p.content
-      }
-      if (collected.length > 0) text = collected
-    } else if (typeof record.text === "string") {
-      text = record.text
-    } else if (typeof record.content === "string") {
-      text = record.content
+    const collected = textParts(record.content)
+    if (collected.length === 0) {
+      // Older shape: parts under `parts` instead of `content`.
+      const legacy = textParts(record.parts)
+      if (legacy.length > 0) text = legacy
+    } else {
+      text = collected
     }
+    if (typeof record.text === "string") text = record.text
   }
   return text
+}
+
+/** Concatenate the text parts of a message, skipping reasoning and tool parts. */
+function textParts(value: unknown): string {
+  if (!Array.isArray(value)) return ""
+  let out = ""
+  for (const part of value) {
+    if (!part || typeof part !== "object") continue
+    const p = part as Record<string, unknown>
+    const type = p.type
+    if (type !== undefined && type !== "text") continue
+    if (typeof p.text === "string") out += p.text
+    else if (typeof p.content === "string") out += p.content
+  }
+  return out
 }
 
 function msg(error: unknown): string {

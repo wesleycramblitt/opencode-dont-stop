@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
 
 import { CATALOGUE_FILE } from "./fetch.ts"
+import { FREE_TIERS } from "../data/free-tiers.ts"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const FALLBACK_PATH = join(HERE, "..", "data", "catalogue.json")
@@ -111,12 +112,30 @@ export function fitsLocally(m: CatalogueModel, profile: HardwareProfile = HARDWA
 }
 
 export interface Provenance {
-  metadata: "models.dev" | "ollama" | "local"
+  metadata: "models.dev" | "ollama" | "local" | "alibaba"
   /** The benchmark report a row's scores came from, when it has one. */
   benchmark: string | null
   /** True when `scores` was derived from metadata, not read from a report. */
   estimated: boolean
   estimatedFields: string[]
+}
+
+/**
+ * A declared promotional free allowance on a model.
+ *
+ * Alibaba Model Studio grants a per-model free quota (e.g. 1M tokens within
+ * 90 days) that is not queryable through any API — it lives in the console.
+ * So the tier is *declared data*: curated in `data/free-tiers.ts` by
+ * `provider/model` key, carried onto the row at build time, and re-applied at
+ * load time so a stale catalogue file is corrected. `source` names where the
+ * fact came from so a number can be audited rather than assumed.
+ */
+export interface FreeTier {
+  /** Tokens granted inside the window. */
+  tokens: number
+  /** Window length in days. */
+  windowDays: number
+  source: string
 }
 
 /** One catalogue row: a model, or a variant of one. */
@@ -142,6 +161,12 @@ export interface CatalogueModel {
   benchmarks: Record<string, number | string> | null
   scores: Scores
   provenance: Provenance
+  /**
+   * A declared free allowance, when one is curated for this model. See the
+   * `FreeTier` doc: a quota-backed row is not priced at zero but is a
+   * legitimate member of the `free` sweep while its allowance lasts.
+   */
+  freeTier: FreeTier | null
   /**
    * Parameter counts. `total` governs VRAM, `active` governs capability; see
    * the interface. Both null when the model publishes neither.
@@ -245,6 +270,10 @@ function toModels(rows: Array<Record<string, unknown>>): CatalogueModel[] {
       provenance: provenance(raw.provenance),
       weights: weights(raw.weights),
       cloud: raw.cloud === true,
+      // A persisted row carries its own tier; a stale file is corrected from
+      // the curated table. The table key is `provider/model`, which is the
+      // row's identity — variants are not separately tiered.
+      freeTier: freeTierOf(raw) ?? FREE_TIERS[`${providerID}/${id}`] ?? null,
       reachable: raw.reachable !== false,
       available: true,
       availabilityReason: null,
@@ -347,8 +376,6 @@ export const sorts = {
     if (pa !== pb) return pa - pb
     return b.scores.capability - a.scores.capability
   },
-  /** Most capable first. */
-  capability: (a: CatalogueModel, b: CatalogueModel) => b.scores.capability - a.scores.capability,
   /**
    * Most capable, preferring larger context on a near-tie.
    *
@@ -433,6 +460,13 @@ export function cooldown(cat: Catalogue, key: string, until: number): Catalogue 
   return cat
 }
 
+/** Lift a model's cooldown, making it selectable again. */
+export function clearCooldown(cat: Catalogue, key: string): Catalogue {
+  const model = cat.byKey.get(key)
+  if (model) model.cooldownUntil = 0
+  return cat
+}
+
 /** Apply a set of availability patches, e.g. loaded from the state file. */
 export function applyAvailability(cat: Catalogue, patches: AvailabilityPatch[]): Catalogue {
   for (const patch of patches) {
@@ -457,17 +491,27 @@ export function summarize(m: CatalogueModel): string {
     m.capabilities.reasoning ? "reasoning" : null,
     m.capabilities.toolCall ? "tools" : null,
     isFree(m) ? "free" : null,
+    m.freeTier ? `quota ${formatTokens(m.freeTier.tokens)}` : null,
     m.provenance.estimated ? "estimated" : null,
   ].filter(Boolean)
   const ctx = m.context > 0 ? `${Math.round(m.context / 1000)}k` : "?"
   return `${m.key} · cap ${m.scores.capability} · ctx ${ctx}${flags.length ? ` · ${flags.join(" ")}` : ""}`
 }
 
+/** Compact token counts for display (1M, 100K). */
+function formatTokens(tokens: number): string {
+  if (!Number.isFinite(tokens)) return "?"
+  if (tokens >= 1_000_000) return `${Math.round(tokens / 1_000_000)}M`
+  if (tokens >= 1_000) return `${Math.round(tokens / 1_000)}K`
+  return String(tokens)
+}
+
 /** Catalogue summary for the `probe` command. */
 export function exportSummary(cat: Catalogue, limit = 12): string {
   const usable = cat.models.filter((m) => m.available && !m.provenance.estimated).length
+  const quota = cat.models.filter((m) => m.freeTier !== null).length
   const lines = [
-    `catalogue: ${cat.models.length} models (${usable} verified-available), generated ${cat.generatedAt || "never"}`,
+    `catalogue: ${cat.models.length} models (${usable} verified-available, ${quota} with a declared free tier), generated ${cat.generatedAt || "never"}`,
   ]
   for (const source of cat.sources) {
     lines.push(`  source ${source.id}: ${source.models}`)
@@ -594,11 +638,24 @@ function provenance(value: unknown): Provenance {
   const record = (value ?? {}) as Record<string, unknown>
   const metadata = record.metadata
   return {
-    metadata: metadata === "models.dev" || metadata === "ollama" || metadata === "local" ? metadata : "models.dev",
+    metadata:
+      metadata === "ollama" || metadata === "local" || metadata === "alibaba" ? metadata : "models.dev",
     benchmark: typeof record.benchmark === "string" ? record.benchmark : null,
     estimated: record.estimated === true,
     estimatedFields: Array.isArray(record.estimatedFields) ? (record.estimatedFields as string[]) : [],
   }
+}
+
+/** A persisted free tier, when the row carries one. */
+function freeTierOf(raw: Record<string, unknown>): FreeTier | null {
+  const tier = raw.freeTier
+  if (!tier || typeof tier !== "object") return null
+  const record = tier as Record<string, unknown>
+  const tokens = typeof record.tokens === "number" ? record.tokens : Number(record.tokens)
+  const windowDays = typeof record.windowDays === "number" ? record.windowDays : Number(record.windowDays)
+  const source = typeof record.source === "string" ? record.source : ""
+  if (!Number.isFinite(tokens) || !Number.isFinite(windowDays) || !source) return null
+  return { tokens, windowDays, source }
 }
 
 function benchmarks(value: unknown): Record<string, number | string> | null {
