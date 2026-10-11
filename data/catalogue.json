@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-10-10T23:38:56.542Z",
+  "generatedAt": "2026-10-11T00:03:52.858Z",
   "sources": [
     {
       "id": "models.dev",
@@ -11708,7 +11708,7 @@
       "capabilities": {
         "text": true,
         "image": false,
-        "audio": true,
+        "audio": false,
         "pdf": false,
         "video": false,
         "reasoning": false,
@@ -11730,8 +11730,8 @@
         "reasoning": 3.02,
         "code": 2.99,
         "agentic": 2.68,
-        "general": 3.77,
-        "capability": 2.72
+        "general": 3.43,
+        "capability": 2.69
       },
       "provenance": {
         "metadata": "models.dev",
@@ -11810,7 +11810,7 @@
       "context": 15000,
       "maxOutput": 15000,
       "capabilities": {
-        "text": true,
+        "text": false,
         "image": true,
         "audio": true,
         "pdf": false,
@@ -16478,7 +16478,7 @@
         "cacheRead": 0.03,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "image",
@@ -16491,11 +16491,11 @@
       "canonicalID": "zhipuai/glm-5.3-flash",
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.86,
-        "code": 5.97,
-        "agentic": 7.13,
-        "general": 6.69,
-        "capability": 7
+        "reasoning": 6.45,
+        "code": 5.55,
+        "agentic": 6.72,
+        "general": 6.27,
+        "capability": 6.63
       },
       "provenance": {
         "metadata": "models.dev",
@@ -16538,7 +16538,7 @@
         "cacheRead": 0.1,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -16547,11 +16547,11 @@
       "canonicalID": "nvidia/nemotron-3-ultra-550b-a55b",
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.96,
-        "code": 6.14,
-        "agentic": 6.58,
-        "general": 5.65,
-        "capability": 6.44
+        "reasoning": 7.12,
+        "code": 6.3,
+        "agentic": 6.74,
+        "general": 5.82,
+        "capability": 6.59
       },
       "provenance": {
         "metadata": "models.dev",
@@ -16594,7 +16594,7 @@
         "cacheRead": 0.3,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "image",
@@ -16605,11 +16605,11 @@
       "canonicalID": "moonshotai/kimi-k3",
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.75,
-        "code": 5.85,
-        "agentic": 7.1,
-        "general": 5.87,
-        "capability": 6.84
+        "reasoning": 7.56,
+        "code": 6.66,
+        "agentic": 7.91,
+        "general": 6.68,
+        "capability": 7.57
       },
       "provenance": {
         "metadata": "models.dev",
@@ -16652,7 +16652,7 @@
         "cacheRead": 0.14,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "image",
@@ -16663,11 +16663,11 @@
       "canonicalID": "mistral/mistral-large-4",
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.99,
-        "code": 6.09,
-        "agentic": 7.26,
-        "general": 6.08,
-        "capability": 7.03
+        "reasoning": 7.36,
+        "code": 6.47,
+        "agentic": 7.63,
+        "general": 6.45,
+        "capability": 7.37
       },
       "provenance": {
         "metadata": "models.dev",
@@ -16710,7 +16710,7 @@
         "cacheRead": 0.003,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "image",
@@ -16721,11 +16721,11 @@
       "canonicalID": "deepseek/deepseek-v4.1-flash",
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.72,
-        "code": 5.8,
-        "agentic": 7.06,
-        "general": 5.81,
-        "capability": 6.81
+        "reasoning": 6.36,
+        "code": 5.44,
+        "agentic": 6.7,
+        "general": 5.45,
+        "capability": 6.48
       },
       "provenance": {
         "metadata": "models.dev",
@@ -16768,7 +16768,7 @@
         "cacheRead": 0,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -16777,11 +16777,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.32,
-        "code": 5.46,
-        "agentic": 6.11,
-        "general": 4.95,
-        "capability": 5.76
+        "reasoning": 4.62,
+        "code": 3.76,
+        "agentic": 4.41,
+        "general": 3.25,
+        "capability": 4.23
       },
       "provenance": {
         "metadata": "models.dev",
@@ -16824,7 +16824,7 @@
         "cacheRead": 0.16,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "image",
@@ -16834,11 +16834,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.33,
-        "code": 5.46,
-        "agentic": 6.15,
-        "general": 5.53,
-        "capability": 5.98
+        "reasoning": 6.67,
+        "code": 5.8,
+        "agentic": 6.49,
+        "general": 5.86,
+        "capability": 6.28
       },
       "provenance": {
         "metadata": "models.dev",
@@ -16881,7 +16881,7 @@
         "cacheRead": 0,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "image",
@@ -16891,11 +16891,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.48,
-        "code": 5.63,
-        "agentic": 6.22,
-        "general": 5.65,
-        "capability": 6.09
+        "reasoning": 6.75,
+        "code": 5.9,
+        "agentic": 6.49,
+        "general": 5.92,
+        "capability": 6.33
       },
       "provenance": {
         "metadata": "models.dev",
@@ -16938,7 +16938,7 @@
         "cacheRead": 0.035,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -16947,11 +16947,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.88,
-        "code": 6.11,
-        "agentic": 6.38,
-        "general": 5.64,
-        "capability": 6.02
+        "reasoning": 6.26,
+        "code": 5.48,
+        "agentic": 5.75,
+        "general": 5.01,
+        "capability": 5.46
       },
       "provenance": {
         "metadata": "models.dev",
@@ -16994,7 +16994,7 @@
         "cacheRead": 0.014,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -17003,11 +17003,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.88,
-        "code": 6.11,
-        "agentic": 6.38,
-        "general": 5.64,
-        "capability": 6.02
+        "reasoning": 6.52,
+        "code": 5.74,
+        "agentic": 6.02,
+        "general": 5.27,
+        "capability": 5.7
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17050,7 +17050,7 @@
         "cacheRead": 0,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -17059,11 +17059,11 @@
       "canonicalID": "nvidia/nemotron-3-nano-30b-a3b",
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.07,
-        "code": 5.15,
-        "agentic": 6.09,
-        "general": 5.02,
-        "capability": 6.11
+        "reasoning": 5.37,
+        "code": 4.45,
+        "agentic": 5.39,
+        "general": 4.32,
+        "capability": 5.48
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17106,7 +17106,7 @@
         "cacheRead": 0,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "image",
@@ -17116,11 +17116,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.24,
-        "code": 5.37,
-        "agentic": 6.07,
-        "general": 5.45,
-        "capability": 5.9
+        "reasoning": 4.54,
+        "code": 3.67,
+        "agentic": 4.37,
+        "general": 3.75,
+        "capability": 4.37
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17163,7 +17163,7 @@
         "cacheRead": 0,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "image",
@@ -17219,7 +17219,7 @@
         "cacheRead": 0.06,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -17228,11 +17228,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.38,
-        "code": 5.52,
-        "agentic": 6.16,
-        "general": 5.23,
-        "capability": 5.81
+        "reasoning": 6.28,
+        "code": 5.42,
+        "agentic": 6.05,
+        "general": 5.12,
+        "capability": 5.72
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17275,7 +17275,7 @@
         "cacheRead": 0.022,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -17285,11 +17285,11 @@
       "canonicalID": "deepseek/deepseek-v4-pro-0813",
       "benchmarks": null,
       "scores": {
-        "reasoning": 7.18,
-        "code": 6.32,
-        "agentic": 7.38,
-        "general": 5.86,
-        "capability": 7.15
+        "reasoning": 7.28,
+        "code": 6.42,
+        "agentic": 7.49,
+        "general": 5.96,
+        "capability": 7.24
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17332,7 +17332,7 @@
         "cacheRead": 0.12,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "image",
@@ -17343,11 +17343,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.58,
-        "code": 5.71,
-        "agentic": 6.36,
-        "general": 5.85,
-        "capability": 6.54
+        "reasoning": 6.73,
+        "code": 5.86,
+        "agentic": 6.51,
+        "general": 6,
+        "capability": 6.68
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17390,7 +17390,7 @@
         "cacheRead": 0.007,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -17400,11 +17400,11 @@
       "canonicalID": "deepseek/deepseek-v4-flash-0731",
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.66,
-        "code": 5.74,
-        "agentic": 7.02,
-        "general": 5.41,
-        "capability": 6.72
+        "reasoning": 6.35,
+        "code": 5.44,
+        "agentic": 6.71,
+        "general": 5.11,
+        "capability": 6.45
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17447,7 +17447,7 @@
         "cacheRead": 0.05,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "image",
@@ -17457,11 +17457,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.6,
-        "code": 5.76,
-        "agentic": 6.31,
-        "general": 5.53,
-        "capability": 6.16
+        "reasoning": 6.12,
+        "code": 5.27,
+        "agentic": 5.82,
+        "general": 5.05,
+        "capability": 5.73
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17504,7 +17504,7 @@
         "cacheRead": 0.26,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -17514,11 +17514,11 @@
       "canonicalID": "zhipuai/glm-5.2",
       "benchmarks": null,
       "scores": {
-        "reasoning": 7.01,
-        "code": 6.15,
-        "agentic": 7.23,
-        "general": 5.75,
-        "capability": 7.01
+        "reasoning": 7.41,
+        "code": 6.54,
+        "agentic": 7.62,
+        "general": 6.15,
+        "capability": 7.36
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17561,7 +17561,7 @@
         "cacheRead": 0.2,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -17570,11 +17570,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.74,
-        "code": 5.91,
-        "agentic": 6.37,
-        "general": 5.53,
-        "capability": 6.1
+        "reasoning": 7.02,
+        "code": 6.19,
+        "agentic": 6.65,
+        "general": 5.81,
+        "capability": 6.36
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17617,7 +17617,7 @@
         "cacheRead": 0.022,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -17626,11 +17626,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 7.05,
-        "code": 6.2,
-        "agentic": 6.77,
-        "general": 5.75,
-        "capability": 6.89
+        "reasoning": 7.15,
+        "code": 6.3,
+        "agentic": 6.87,
+        "general": 5.85,
+        "capability": 6.98
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17673,7 +17673,7 @@
         "cacheRead": 0.26,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -17683,11 +17683,11 @@
       "canonicalID": "zhipuai/glm-5.3",
       "benchmarks": null,
       "scores": {
-        "reasoning": 7.12,
-        "code": 6.24,
-        "agentic": 7.32,
-        "general": 5.84,
-        "capability": 7.09
+        "reasoning": 7.51,
+        "code": 6.64,
+        "agentic": 7.71,
+        "general": 6.23,
+        "capability": 7.45
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17730,7 +17730,7 @@
         "cacheRead": 0.19,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "image",
@@ -17741,11 +17741,11 @@
       "canonicalID": "moonshotai/kimi-k2.7-code",
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.39,
-        "code": 5.52,
-        "agentic": 6.71,
-        "general": 5.36,
-        "capability": 6.16
+        "reasoning": 6.73,
+        "code": 5.85,
+        "agentic": 7.05,
+        "general": 5.69,
+        "capability": 6.46
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17788,7 +17788,7 @@
         "cacheRead": 0.015,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -17797,11 +17797,11 @@
       "canonicalID": "nvidia/nemotron-3-super-120b-a12b",
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.43,
-        "code": 5.58,
-        "agentic": 6.2,
-        "general": 5.27,
-        "capability": 6.02
+        "reasoning": 6,
+        "code": 5.14,
+        "agentic": 5.76,
+        "general": 4.84,
+        "capability": 5.62
       },
       "provenance": {
         "metadata": "models.dev",
@@ -17844,7 +17844,7 @@
         "cacheRead": 0.007,
         "cacheWrite": 0
       },
-      "local": true,
+      "local": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -17853,11 +17853,11 @@
       "canonicalID": null,
       "benchmarks": null,
       "scores": {
-        "reasoning": 6.54,
-        "code": 5.63,
-        "agentic": 6.42,
-        "general": 5.39,
-        "capability": 6.48
+        "reasoning": 6.24,
+        "code": 5.33,
+        "agentic": 6.11,
+        "general": 5.09,
+        "capability": 6.21
       },
       "provenance": {
         "metadata": "models.dev",
@@ -22217,7 +22217,7 @@
       "capabilities": {
         "text": true,
         "image": true,
-        "audio": true,
+        "audio": false,
         "pdf": false,
         "video": false,
         "reasoning": false,
@@ -22239,8 +22239,8 @@
         "reasoning": 3.64,
         "code": 3.63,
         "agentic": 3.26,
-        "general": 4.58,
-        "capability": 4.26
+        "general": 4.24,
+        "capability": 4.22
       },
       "provenance": {
         "metadata": "models.dev",
@@ -22269,7 +22269,7 @@
       "capabilities": {
         "text": true,
         "image": false,
-        "audio": true,
+        "audio": false,
         "pdf": false,
         "video": false,
         "reasoning": true,
@@ -22286,7 +22286,6 @@
       "local": false,
       "capabilityTags": [
         "text",
-        "audio",
         "reasoning"
       ],
       "canonicalID": "google/gemini-3.1-flash-tts-preview",
@@ -22295,8 +22294,8 @@
         "reasoning": 7.05,
         "code": 6.17,
         "agentic": 5.14,
-        "general": 6.08,
-        "capability": 5.44
+        "general": 5.74,
+        "capability": 5.4
       },
       "provenance": {
         "metadata": "models.dev",
@@ -22669,7 +22668,7 @@
       "capabilities": {
         "text": true,
         "image": false,
-        "audio": true,
+        "audio": false,
         "pdf": false,
         "video": false,
         "reasoning": false,
@@ -22691,8 +22690,8 @@
         "reasoning": 5.53,
         "code": 5.58,
         "agentic": 5.13,
-        "general": 6.01,
-        "capability": 4.94
+        "general": 5.67,
+        "capability": 4.9
       },
       "provenance": {
         "metadata": "models.dev",
@@ -22840,7 +22839,7 @@
       "capabilities": {
         "text": true,
         "image": true,
-        "audio": true,
+        "audio": false,
         "pdf": false,
         "video": false,
         "reasoning": false,
@@ -22862,8 +22861,8 @@
         "reasoning": 3.39,
         "code": 3.34,
         "agentic": 3.08,
-        "general": 4.4,
-        "capability": 4.05
+        "general": 4.06,
+        "capability": 4.02
       },
       "provenance": {
         "metadata": "models.dev",
@@ -23255,7 +23254,7 @@
       "capabilities": {
         "text": true,
         "image": false,
-        "audio": true,
+        "audio": false,
         "pdf": false,
         "video": false,
         "reasoning": false,
@@ -23277,8 +23276,8 @@
         "reasoning": 4.77,
         "code": 4.76,
         "agentic": 4.51,
-        "general": 5.4,
-        "capability": 4.3
+        "general": 5.06,
+        "capability": 4.26
       },
       "provenance": {
         "metadata": "models.dev",
@@ -23830,7 +23829,7 @@
       "context": 16384,
       "maxOutput": 32768,
       "capabilities": {
-        "text": true,
+        "text": false,
         "image": false,
         "audio": true,
         "pdf": false,
@@ -27647,7 +27646,7 @@
       "context": 53248,
       "maxOutput": 4096,
       "capabilities": {
-        "text": true,
+        "text": false,
         "image": false,
         "audio": true,
         "pdf": false,

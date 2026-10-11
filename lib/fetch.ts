@@ -123,6 +123,8 @@ interface RawRow {
   rank?: number
   /** Declared parameter count, e.g. "24B". */
   parameterSize?: string
+  /** Set when this row describes a variant rather than the base model. */
+  variant?: string
 }
 
 /** Flatten models.dev into raw rows for the requested providers. */
@@ -149,9 +151,14 @@ function rowsFromModelsDev(payload: unknown): RawRow[] {
         context: num(model.limit?.context),
         maxOutput: num(model.limit?.output),
         capabilities: {
-          text: input.includes("text") || output.includes("text"),
+          // `text` means the model accepts text *input*, which is what makes
+          // it usable as a chat or agent model. An ASR model takes audio and
+          // emits text; a TTS model takes text and emits audio. Neither can
+          // drive a coding agent, and OR-ing input with output would mark
+          // both as text-capable and let them into every pool.
+          text: input.includes("text"),
           image: model.attachment === true || input.includes("image"),
-          audio: input.includes("audio") || output.includes("audio"),
+          audio: input.includes("audio"),
           pdf: input.includes("pdf"),
           video: input.includes("video"),
           reasoning: model.reasoning === true,
@@ -166,7 +173,11 @@ function rowsFromModelsDev(payload: unknown): RawRow[] {
           cacheWrite: num(model.cost?.cache_write),
         },
         canonicalID: model.canonical_model_id ?? null,
-        local: providerID === "ollama-cloud",
+        // `ollama` (the scrape) and the local daemon are local. `ollama-cloud`
+        // is a *remote paid* API that happens to be hosted by Ollama, so it
+        // must not claim locality: local mode would otherwise select a paid
+        // cloud model over the model actually installed on this machine.
+        local: false,
         source: "models.dev",
       })
     }
@@ -401,6 +412,9 @@ export interface CatalogueRow {
   /** Popularity rank among local ollama models, when known. */
   ollamaRank?: number
   parameterSize?: string
+  variant?: string
+  /** Capability tag list for display, e.g. ["image", "toolCall"]. */
+  capabilityTags?: string[]
   canonicalID: string | null
   benchmarks: Benchmarks | null
   /** Strength scores 0-10. From benchmarks when available, else derived. */

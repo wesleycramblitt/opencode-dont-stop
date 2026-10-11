@@ -60,7 +60,7 @@ export default {
     const persist = () => writeState(state)
 
     const engine = new LoopEngine(
-      context as unknown as Parameters<typeof LoopEngine.prototype.constructor>[0],
+      context as unknown as ConstructorParameters<typeof LoopEngine>[0],
       state,
       log,
       {
@@ -319,16 +319,16 @@ export function runCommand(raw: string, env: CommandEnv): string {
     return `${agent}: ${slot.providerID}/${slot.id}`
   }
 
-  if (verb === "update-model-catalogue" || verb === "update-catalogue") {
+  if (verb === "update-model-catalogue" || verb === "update-catalogue" || verb === "catalogue-update") {
     void engine
-      .discover()
+      .refreshCatalogue()
       .then(() => {
         persist()
         return engine.refresh(true)
       })
       .then(persist)
-      .catch((error) => log.error(`catalogue update failed: ${messageOf(error)}`))
-    return "model catalogue refresh started"
+      .catch((error: unknown) => log.error(`catalogue update failed: ${messageOf(error)}`))
+    return "model catalogue refresh started; it writes data/catalogue.json"
   }
 
   if (verb === "track") {
@@ -405,7 +405,7 @@ function messageOf(error: unknown): string {
 /* -------------------------------------------------------------------- types */
 
 interface AgentEditor {
-  list(): readonly Array<{ id: string; model?: unknown }>
+  list(): Array<{ id: string; model?: unknown }>
   update(id: string, update: (agent: { model?: unknown }) => void): void
 }
 

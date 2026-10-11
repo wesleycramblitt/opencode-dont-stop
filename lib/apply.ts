@@ -30,16 +30,16 @@ export interface ModelPlan {
   /** Per-agent defaults for new sessions and subagents. */
   agents: Record<string, ModelSlot>
   /** Sessions whose pinned model should be switched, and to what. */
-  sessions: Array<{ sessionID: string; model: ModelSlot }>
+  sessions: ReadonlyArray<{ sessionID: string; model: ModelSlot }>
   /** Human-readable reasoning, for status output. */
-  notes: string[]
+  notes: ReadonlyArray<string>
 }
 
 /** The subset of the plugin context this module touches. */
 export interface ApplyContext {
   agent: {
     transform(fn: (editor: {
-      list(): readonly Array<{ id: string; model?: unknown }>
+      list(): Array<{ id: string; model?: unknown }>
       update(id: string, update: (agent: { model?: unknown }) => void): void
     }) => void): Promise<unknown>
     reload(): Promise<unknown>
@@ -52,11 +52,11 @@ export interface ApplyContext {
 
 export interface ApplyResult {
   /** Agents whose definition was rewritten. */
-  agentsUpdated: string[]
+  agentsUpdated: ReadonlyArray<string>
   /** Sessions whose pinned model was switched. */
-  sessionsSwitched: string[]
+  sessionsSwitched: ReadonlyArray<string>
   /** Sessions that failed to switch, with reasons. */
-  failures: Array<{ sessionID: string; reason: string }>
+  failures: ReadonlyArray<{ sessionID: string; reason: string }>
 }
 
 /**
@@ -116,7 +116,7 @@ export async function applySessionModels(
   sessions: Array<{ sessionID: string; model: ModelSlot }>,
   log?: Logger,
 ): Promise<ApplyResult> {
-  const failures: ApplyResult["failures"] = []
+  const failures: Array<{ sessionID: string; reason: string }> = []
   const sessionsSwitched: string[] = []
 
   for (const entry of sessions) {

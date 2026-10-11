@@ -49,14 +49,79 @@ different things from the same catalogue:
 
 ## Catalogue
 
-One row per model, one row per variant where a variant changes capability or
-price. Columns include context, max output, capability flags (text, image,
-audio, pdf, video, reasoning, tool calling, structured, embedding), pricing,
-four strength scores, availability, status, and a `deprecated` column.
+The catalogue is a **data table**, not an algorithm. Rows are fetched from real
+sources and persisted to `data/catalogue.json`, which is loaded read-only at
+runtime — so the catalogue is reproducible, reviewable in a diff, and needs no
+network access at plugin load time.
 
-`estimated: true` marks any row whose scores were derived rather than read, and
-records which fields and how confident the estimate is. A strategy can prefer
-confirmed data and degrade to estimates only when it must.
+### Sources
+
+| Source | What it provides |
+| --- | --- |
+| **models.dev** `/api.json` | The authoritative registry: capabilities, modalities, limits, pricing, knowledge cutoff, release date, and the `canonical_model_id` linking every provider alias to one identity |
+| **ollama.com** search | The top 100 locally-runnable models by popularity, with context windows, parameter sizes and capability tags |
+| **local ollama** `/api/tags` | What is actually installed on this machine |
+| **`data/benchmarks.ts`** | Curated, cited benchmark scores keyed by canonical id |
+
+`ollama.com/search` is client-rendered and caps the server HTML at 20 models,
+so a plain `fetch` cannot see the rest. `scripts/scrape-ollama.ts` drives a real
+browser to collect the full list; the catalogue update reads the file it writes,
+so the normal path stays pure network I/O.
+
+### Updating
+
+```
+npx tsx scripts/update-catalogue.ts             # rewrite data/catalogue.json
+npx tsx scripts/update-catalogue.ts --table     # also print the ranked table
+npx tsx scripts/update-catalogue.ts --dry-run   # report only
+npx tsx scripts/scrape-ollama.ts --limit 100    # refresh the ollama popularity list
+```
+
+The `update-model-catalogue` command reloads the generated file and re-plans.
+Rebuilding the file is a deliberate CLI step, not something a plugin reload
+does: it is slow, network-bound, and produces a committed artifact.
+
+### Provenance
+
+Two rules keep a derived ranking honest:
+
+1. **`verified`** is true only when a column came from a source. Anything
+   derived is stored with `provenance.estimated: true` and the derived fields
+   listed, so a ranking made on a guess is distinguishable from one made on a
+   report.
+2. **Score floors bind only verified rows.** An estimated score is a prior
+   derived from price and metadata, so excluding on it would remove most of the
+   catalogue over a guess. Capability and context floors bind everywhere:
+   those are facts.
+
+### Scoring
+
+Reported benchmarks are calibrated onto the 0-10 scale through a curve
+(`calibrateBenchmark`), not by dividing by ten. Benchmark values cluster in
+60-90%, so a linear `/10` maps the useful range into 6-9 and leaves real reports
+scoring *below* metadata estimates that span 2-10 — the inversion would make a
+published report lose to a guess. An axis with no reported column falls back to
+the derived value *for that axis*, so a missing benchmark is a gap rather than a
+zero.
+
+Derived axes are weighted sums of continuous sourced signals:
+
+| Axis | Dominant signals |
+| --- | --- |
+| code | price / parameter count, recency, family generation, tier tokens |
+| reasoning | price / parameter count, reasoning flag, recency |
+| agentic | tool calling, structured output, parameter count |
+| general | knowledge cutoff, modality breadth, recency |
+
+**Price** is the vendor's own statement of tier and dominates remote rows;
+**parameter count** is the equivalent statement for a local model and dominates
+there, since a 120B MoE is not in the same class as a 4B dense one. **Context is
+deliberately a minor term** — it measures capacity, not ability, and weighting it
+heavily is what ranks a 24B model above a frontier one.
+
+Known limitation: benchmarks differ in difficulty. SWE-bench 80% is far harder
+than MATH-500 98%, and the calibration does not correct for that. It is a
+documented uniform approximation, not a claim the evals are equivalent.
 
 ## Clocks
 
@@ -131,3 +196,15 @@ Both halves communicate only through the state file, which the server writes
 atomically and the terminal watches by mtime. Either half can restart without
 losing the other's view, and a change made headlessly shows up in the next
 terminal.
+
+## Development
+
+```
+npx tsx scripts/update-catalogue.ts   # regenerate the catalogue
+./node_modules/.bin/tsc --noEmit -p . # typecheck (excludes tui.tsx)
+```
+
+`tui.tsx` is excluded from the local typecheck because it imports
+`@opencode/plugin/tui` and `@opentui/solid`, which the opencode server provides
+at runtime but which are not installable standalone. `opencode-voice` takes the
+same approach.

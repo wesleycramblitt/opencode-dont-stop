@@ -64,6 +64,8 @@ export interface CatalogueModel {
   key: string
   providerID: string
   id: string
+  /** Set when this row describes a variant rather than the base model. */
+  variant?: string
   name: string
   description: string
   family: string
@@ -179,6 +181,8 @@ function toModels(rows: Array<Record<string, unknown>>): CatalogueModel[] {
 
 /** Requirements a task or agent places on a model. */
 export interface Requirements {
+  /** Requires text input, i.e. the model can be prompted with text. */
+  text?: boolean
   vision?: boolean
   audio?: boolean
   pdf?: boolean
@@ -188,8 +192,10 @@ export interface Requirements {
   reasoning?: boolean
   minContext?: number
   minReasoning?: number
-  minCode?: boolean
-  minAgentic?: boolean
+  /** Minimum code strength, 0-10. */
+  minCode?: number
+  /** Minimum agentic strength, 0-10. */
+  minAgentic?: number
   allowLocal?: boolean
   allowUnverified?: boolean
   allowDeprecated?: boolean
@@ -206,11 +212,24 @@ export interface Requirements {
  * belongs in the comparators (`sorts.verifiedFirst`), where it adjusts ranking
  * without removing candidates.
  */
+/**
+ * Does this model satisfy every stated requirement?
+ *
+ * Score floors bind only rows whose scores come from a report. For an
+ * estimated row the score is a prior derived from price and metadata, so
+ * excluding on it would remove most of the catalogue over a guess — a local
+ * 30B model is not disqualified from local mode because its derived code score
+ * missed a bar set for verified models. Capability and context floors do bind
+ * everywhere: those are facts, not estimates.
+ */
 export function meets(m: CatalogueModel, req: Requirements): boolean {
   if (!m.available) return false
   if (m.cooldownUntil > Date.now()) return false
   if (m.provenance.estimated && req.allowUnverified === false) return false
   if (req.allowLocal === false && m.local) return false
+  // Text input is a hard floor for anything that drives an agent: a model that
+  // cannot be prompted with text cannot do the work, whatever else it does.
+  if (req.text === true && !m.capabilities.text) return false
   if (req.vision === true && !m.capabilities.image) return false
   if (req.audio === true && !m.capabilities.audio) return false
   if (req.pdf === true && !m.capabilities.pdf) return false
@@ -219,7 +238,11 @@ export function meets(m: CatalogueModel, req: Requirements): boolean {
   if (req.structured === true && !m.capabilities.structured) return false
   if (req.reasoning === true && !m.capabilities.reasoning) return false
   if (req.minContext !== undefined && m.context < req.minContext) return false
-  if (req.minReasoning !== undefined && m.scores.reasoning < req.minReasoning) return false
+  if (!m.provenance.estimated) {
+    if (req.minReasoning !== undefined && m.scores.reasoning < req.minReasoning) return false
+    if (req.minCode !== undefined && m.scores.code < req.minCode) return false
+    if (req.minAgentic !== undefined && m.scores.agentic < req.minAgentic) return false
+  }
   if (req.providers && !req.providers.includes(m.providerID)) return false
   if (req.exclude?.includes(m.key)) return false
   return true
@@ -246,10 +269,17 @@ export const sorts = {
   },
   /** Most capable first. */
   capability: (a: CatalogueModel, b: CatalogueModel) => b.scores.capability - a.scores.capability,
-  /** Most capable, preferring larger context on a near-tie. */
+  /**
+   * Most capable, preferring larger context on a near-tie.
+   *
+   * The tie window is tight on purpose. A wide window (say ±0.5) collapses a
+   * whole tier of models into "equal" and hands the ordering to context, which
+   * is then equal too — leaving the ranking arbitrary. Context should only
+   * separate models that are genuinely indistinguishable on capability.
+   */
   capabilityContext: (a: CatalogueModel, b: CatalogueModel) => {
     const gap = b.scores.capability - a.scores.capability
-    if (Math.abs(gap) > 0.5) return gap
+    if (Math.abs(gap) > 0.05) return gap
     return b.context - a.context
   },
   /** Local first, then capability — used when GPU budget matters. */

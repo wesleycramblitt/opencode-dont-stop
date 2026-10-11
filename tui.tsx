@@ -17,7 +17,7 @@ import { homedir } from "node:os"
 import { Plugin } from "@opencode/plugin/tui"
 import type { JSX } from "@opentui/solid"
 
-import { MODES, readState, type Mode, type PluginState } from "./lib/state.ts"
+import { MODES, readState, writeState, type Mode, type PluginState } from "./lib/state.ts"
 import { describeMode } from "./lib/modes.ts"
 
 const statePath = join(homedir(), ".config", "opencode", "dont-stop-state.json")

@@ -12,15 +12,26 @@
  */
 
 import {
-  filter,
+  applyAvailability,
+  loadCatalogue,
   markAvailable,
   markUnavailable,
-  sorts,
+  cooldown,
+  filter,
   sortBy,
+  sorts,
+  exportSummary,
+  type AvailabilityPatch,
   type Catalogue,
   type Requirements,
 } from "./catalogue.ts"
-import { profileFor, rankForMode, type AgentKind, type TaskProfile } from "./modes.ts"
+import {
+  AGENT_KINDS,
+  profileFor,
+  rankForMode,
+  type AgentKind,
+  type TaskProfile,
+} from "./modes.ts"
 import { actionFor, classify, type ClassifiedError, type ErrorAction } from "./errors.ts"
 import { ClockSet, DEFAULT_CLOCKS, lifecycleOf, progressKindOf, type ClockOptions } from "./clocks.ts"
 import { applyAgentDefaults, applySessionModels, sameSlot, slotFrom, type ApplyContext, type ModelPlan } from "./apply.ts"
@@ -35,19 +46,6 @@ export interface TrackedSession {
   model: ModelSlot | null
   /** The agent the session is running as. */
   agent: string
-}
-
-/** How the engine discovers models. Injected so it can be faked or swapped. */
-export interface DiscoverySource {
-  /** Rows from the server's model registry. */
-  registry(): Promise<Array<{ providerID: string; model: unknown }>>
-  /** Rows from local providers such as ollama. */
-  local(providerID: string): Promise<Array<{ id: string; name?: string; capabilities?: string[]; context?: number; parameterSize?: string }>>
-}
-
-export interface EngineContext extends ApplyContext {
-  model: { list(): Promise<{ data?: unknown }> | { data?: unknown } }
-  event: { subscribe(input: { signal: AbortSignal }): AsyncIterable<{ type: string; properties?: Record<string, unknown> }> }
 }
 
 export interface EngineOptions {
@@ -68,7 +66,7 @@ export class LoopEngine {
   private abort = new AbortController()
 
   constructor(
-    private readonly ctx: EngineContext,
+    private readonly ctx: ApplyContext,
     private readonly state: PluginState,
     private readonly log: Logger,
     private readonly options: EngineOptions = {},
@@ -153,52 +151,95 @@ export class LoopEngine {
   /* ------------------------------------------------------------ discovery */
 
   /**
-   * Discover models from the registry and local providers, then index them.
-   * Existing rows keep their availability so a probe failure during a refresh
-   * does not erase a known-good model.
+   * Discover models by loading the generated catalogue.
+   *
+   * The catalogue is built by `scripts/update-catalogue.ts`, which queries
+   * models.dev, the curated benchmark table, the scraped ollama popularity
+   * list, and the local ollama daemon, then writes `data/catalogue.json`.
+   * That is a CLI step on purpose: it is slow, network-bound, and produces a
+   * committed artifact, so a plugin reload must not silently rewrite it.
+   *
+   * Availability is *runtime* state and is layered back on after the load, so
+   * a reload does not forget which models were rate limited.
    */
-  async discover(source?: DiscoverySource): Promise<Catalogue> {
-    const rows: Catalogue["models"] = []
+  async discover(): Promise<Catalogue | null> {
+    const patches = this.availabilityPatches()
     const previous = this.catalogue
-    const src = source ?? defaultSource(this.ctx)
-
-    try {
-      const registry = await src.registry()
-      for (const entry of registry) {
-        const model = entry.model as Parameters<typeof import("./catalogue.ts").fromRegistry>[1]
-        const row = (await import("./catalogue.ts")).fromRegistry(entry.providerID, model)
-        const existing = previous?.byKey.get(row.key)
-        if (existing) row.availability = existing.availability
-        rows.push(row)
+    const next = loadCatalogue()
+    if (!next) {
+      if (!previous) {
+        this.log.warn("no catalogue on disk; run: npx tsx scripts/update-catalogue.ts")
       }
-    } catch (error) {
-      this.log.warn(`registry discovery failed: ${msg(error)}`)
+      return previous
     }
-
-    try {
-      const local = await src.local("ollama")
-      for (const entry of local) {
-        const row = (await import("./catalogue.ts")).fromLocal("ollama", entry.id, entry)
-        const existing = previous?.byKey.get(row.key)
-        if (existing) row.availability = existing.availability
-        rows.push(row)
-      }
-    } catch (error) {
-      this.log.quiet("info", `local discovery unavailable: ${msg(error)}`)
-    }
-
-    this.catalogue = (await import("./catalogue.ts")).index(rows)
-    this.log.info(`discovered ${this.catalogue.models.length} models`)
+    this.catalogue = next
+    applyAvailability(next, patches)
+    this.log.info(`catalogue loaded: ${next.models.length} models from ${next.sources.length} sources`)
     this.emit()
-    return this.catalogue
+    return next
+  }
+
+  /** Capture current availability so a reload can restore it. */
+  private availabilityPatches(): AvailabilityPatch[] {
+    if (!this.catalogue) return []
+    const patches: AvailabilityPatch[] = []
+    for (const model of this.catalogue.models) {
+      if (!model.available || model.cooldownUntil > Date.now()) {
+        patches.push({ key: model.key, available: false, reason: model.availabilityReason ?? "unavailable" })
+      }
+    }
+    return patches
+  }
+
+  /** Put a model on cooldown until `until` (epoch ms). */
+  coolDown(key: string, until: number): void {
+    if (this.catalogue) cooldown(this.catalogue, key, until)
+  }
+
+  /** Restore a model to available. */
+  restore(key: string): void {
+    if (this.catalogue) markAvailable(this.catalogue, key)
+  }
+
+  /** Mark a model unavailable with a reason. */
+  fail(key: string, reason: string): void {
+    if (this.catalogue) markUnavailable(this.catalogue, key, reason)
+  }
+
+  /**
+   * Rebuild the catalogue from the generated data file.
+   *
+   * The data file is produced by `scripts/update-catalogue.ts`, which is a
+   * deliberate CLI step rather than something the running plugin does: it
+   * hits the network for every source and writes a committed artifact, so a
+   * plugin reload must not silently rewrite it. This method reloads whatever
+   * is on disk and re-plans, which is what makes the command useful.
+   */
+  async refreshCatalogue(): Promise<Catalogue | null> {
+    const next = loadCatalogue()
+    if (!next) {
+      this.log.warn("no catalogue on disk; run: npx tsx scripts/update-catalogue.ts")
+      return this.catalogue
+    }
+    const patches = this.availabilityPatches()
+    this.catalogue = next
+    applyAvailability(next, patches)
+    this.log.info(`catalogue reloaded: ${next.models.length} models`)
+    this.emit()
+    return next
   }
 
   /* --------------------------------------------------------------- planning */
 
-  /** The task profile for an agent, given any active restriction. */
-  private taskFor(agent: string, vision = false): TaskProfile {
+  /** The task profile for an agent kind, honouring any active restriction. */
+  private taskFor(agent: string): TaskProfile {
     const kind = agentKind(agent)
-    return profileFor(kind, { vision })
+    const wanted = visionWanted(kind)
+    const restricted = this.restrictions[agent]
+    // A restriction on vision overrides the kind's default: a session that
+    // already failed on vision must not request it again.
+    if (restricted && restricted.vision === false) return { ...profileFor(kind), vision: false }
+    return profileFor(kind, wanted ? { vision: true } : {})
   }
 
   /** Build the full plan for the current mode and catalogue. */
@@ -210,36 +251,29 @@ export class LoopEngine {
     }
 
     const mode = this.state.mode
-    for (const agent of this.knownAgents()) {
-      const restriction = this.restrictions[agent]
-      const base = visionRequired(this.state, agent)
-      const vision = restriction?.vision !== undefined ? restriction.vision : base
-      const task = this.taskFor(agent, vision)
+    for (const kind of AGENT_KINDS) {
+      const task = this.taskFor(kind)
       const ranked = rankForMode(this.catalogue, mode, task)
       if (ranked.length === 0) {
-        notes.push(`${agent}: no model satisfies ${mode} requirements`)
+        notes.push(`${kind}: no model satisfies ${mode} requirements`)
         continue
       }
       const slot = slotFrom(ranked[0])
-      agents[agent] = slot
-      notes.push(`${agent}: ${slot.providerID}/${slot.id} (cap ${ranked[0].capability})`)
+      agents[kind] = slot
+      notes.push(`${kind}: ${slot.providerID}/${slot.id} (cap ${ranked[0].scores.capability})`)
     }
 
-    const main = agents["__main__"] ?? Object.values(agents)[0] ?? null
+    const main = agents["general"] ?? Object.values(agents)[0] ?? null
     if (main) agents["__main__"] = main
 
-    const sessions = [...this.tracked.keys()].map((sessionID) => ({
-      sessionID,
-      model: agents[this.tracked.get(sessionID)?.agent ?? "general"] ?? main,
-    })).filter((entry): entry is { sessionID: string; model: ModelSlot } => entry.model !== null)
+    const sessions = [...this.tracked.keys()]
+      .map((sessionID) => ({
+        sessionID,
+        model: agents[this.tracked.get(sessionID)?.agent ?? "general"] ?? main,
+      }))
+      .filter((entry): entry is { sessionID: string; model: ModelSlot } => entry.model !== null)
 
     return { main, agents, sessions, notes }
-  }
-
-  private knownAgents(): string[] {
-    const set = new Set<string>(["__main__", "general"])
-    for (const record of this.tracked.values()) set.add(record.agent)
-    return [...set]
   }
 
   /* ---------------------------------------------------------------- applying */
@@ -428,8 +462,7 @@ export class LoopEngine {
     this.rotation[cursorKey] = cursor
 
     if (!this.catalogue) return
-    const vision = visionRequired(this.state, agent)
-    const ranked = rankForMode(this.catalogue, this.state.mode, this.taskFor(agent, vision))
+    const ranked = rankForMode(this.catalogue, this.state.mode, this.taskFor(agent))
     if (ranked.length === 0) {
       this.log.warn(`no model left in the ${this.state.mode} chain for ${agent}`)
       return
@@ -550,10 +583,16 @@ export class LoopEngine {
 
 /* ------------------------------------------------------------------ helpers */
 
-function visionRequired(state: PluginState, _agent: string): boolean {
-  // A restricted session that lost vision must not request it again.
-  const restriction = state.mode === "local" ? undefined : undefined
-  return restriction === undefined ? false : false
+/**
+ * Whether an agent kind wants a vision-capable model by default.
+ *
+ * Architects and explorers read diagrams, screenshots and rendered output, so
+ * they ask for vision and the mode must find a vision model. Build and review
+ * work on text, and asking for vision there would exclude strong text-only
+ * models for no benefit.
+ */
+function visionWanted(kind: AgentKind): boolean {
+  return kind === "architect" || kind === "explore"
 }
 
 function agentKind(agent: string): AgentKind {
@@ -573,9 +612,9 @@ function agentKind(agent: string): AgentKind {
  */
 function degradeChainOf(mode: Mode): Mode[] {
   if (mode === "stop") return ["stop"]
-  const order: Record<string, number> = { power: 3, cheap: 2, free: 1, local: 0 }
-  const current = order[mode] ?? 1
-  const cheaper = Object.keys(order).filter((m) => order[m] < current && order[m] > 0)
+  const order: Record<Mode, number> = { power: 3, cheap: 2, free: 1, local: 0, stop: -1 }
+  const current = order[mode]
+  const cheaper = (Object.keys(order) as Mode[]).filter((m) => order[m] < current && order[m] > 0)
   if (cheaper.length === 0) return [mode]
   return [mode, cheaper.reduce((best, m) => (order[m] < order[best] ? m : best))]
 }
@@ -592,23 +631,6 @@ function describe(error: ClassifiedError): string {
 
 function msg(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
-}
-
-/** The default discovery source, reading from the plugin context. */
-function defaultSource(ctx: EngineContext): DiscoverySource {
-  return {
-    async registry() {
-      const result = await ctx.model.list()
-      const data = (result as { data?: unknown }).data as
-        | Array<{ providerID: string; id: string }>
-        | undefined
-      if (!Array.isArray(data)) return []
-      return data.map((m) => ({ providerID: m.providerID, model: m }))
-    },
-    async local() {
-      return []
-    },
-  }
 }
 
 export { appendLog }

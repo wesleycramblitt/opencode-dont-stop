@@ -36,7 +36,7 @@ export type AgentKind = "architect" | "build" | "review" | "general" | "explore"
 export interface TaskProfile {
   kind: AgentKind
   /** True when the task involves reading images, screenshots or diagrams. */
-  vision: boolean
+  vision?: boolean
   /** Minimum context in tokens worth spending on this task. */
   minContext: number
   /** Weight 0-1 on code strength vs general strength for this task. */
@@ -48,12 +48,19 @@ export interface TaskProfile {
 /** Capability requirements derived from a task profile. */
 export function requirementsFor(task: TaskProfile): Requirements {
   return {
+    // Every mode drives an agent, so text input is a hard floor. This is what
+    // keeps ASR/TTS/embedding models out of every pool regardless of price or
+    // context: they do not accept a text prompt at all.
+    text: true,
     vision: task.vision || undefined,
     minContext: task.minContext,
     minCode: task.planning ? undefined : Math.round(3 + task.codeWeight * 5),
     allowLocal: undefined,
   }
 }
+
+// `Requirements.minCode` is a numeric strength floor; the task profile's
+// `codeWeight` is mapped onto it there.
 
 /**
  * Per-agent baseline profiles. These are defaults; a caller can override any
@@ -128,55 +135,74 @@ function rankFree(candidates: CatalogueModel[], task: TaskProfile): CatalogueMod
 }
 
 /**
- * Cheap mode: cheapest first, but capability-gated. A row only enters the
- * chain if it can actually do the task — the cheapest *vision* model when
- * vision is required, the cheapest *tool-calling* model when tools are needed.
- * Among rows that qualify, price decides and capability breaks ties.
+ * Cheap mode: cheapest *paid* remote model that can actually do the task.
  *
- * The chain has a deliberate shape: the three cheapest rows that qualify, then
- * the three most capable rows that qualify. The head saves money on the easy
- * case; the tail gives the loop somewhere to go when a cheap model turns out
- * to be too weak, without having to leave the mode. Rows that cannot do the
- * task are excluded up front, so "cheapest" never buys a model that then fails
- * on capability.
+ * The spec is explicit that cheap is not free: it spends a little to get past
+ * what the free tier offers, and degrades to free only when funds run out. So
+ * a free row is the tail of the chain, not its head — leading with free would
+ * make this mode a duplicate of free mode and leave the degradation nowhere
+ * to go.
+ *
+ * A row only enters the chain if it can do the task: the cheapest *vision*
+ * model when vision is required, the cheapest *tool-calling* model when tools
+ * are needed. Among rows that qualify, price decides and capability breaks
+ * ties.
+ *
+ * Shape: three cheapest paid rows, then three most capable paid rows, then the
+ * free rows and local fallbacks. The head minimises spend; the paid tail gives
+ * the loop somewhere to go when a cheap model is too weak, without leaving the
+ * mode; the free tail is the degradation target.
  */
 function rankCheap(candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
   const qualified = candidates.filter((m) => meetsTask(m, task))
-  if (qualified.length === 0) return sortBy(candidates, sorts.cheapest)
+  const pool = qualified.length > 0 ? qualified : candidates
 
-  // A free row is the cheapest possible outcome and belongs at the head, which
-  // is also the degradation target for this mode.
-  const byPrice = sortBy(qualified, sorts.cheapest)
-  const cheapest = byPrice.slice(0, 3)
-  const capable = sortBy(qualified, sorts.capability).slice(0, 3)
-  return dedupe([...cheapest, ...capable])
+  const paid = pool.filter((m) => !isFree(m))
+  const free = pool.filter(isFree)
+
+  const byPrice = sortBy(paid, sorts.cheapest)
+  const cheapestPaid = byPrice.slice(0, 3)
+  const capablePaid = sortBy(paid, sorts.capability).slice(0, 3)
+
+  // Free remote rows first among the free tail (they are the free sweep), then
+  // local models as the last resort.
+  const freeRemote = sortBy(free.filter((m) => !m.local), sorts.capabilityContext)
+  const freeLocal = sortBy(free.filter((m) => m.local), sorts.capabilityContext)
+
+  return dedupe([
+    ...cheapestPaid,
+    ...capablePaid,
+    ...freeRemote,
+    ...freeLocal,
+  ])
 }
 
 /**
  * Local mode: best local model for the task, mindful of GPU budget.
  *
- * Local rows are ranked by capability among those that fit the task; a
- * remote row only appears when no local row can serve the task at all, so the
- * mode stays honest about being local. Ranking prefers larger parameter counts
- * implicitly through the derived scores, and verified rows when both exist.
+ * Local rows are ranked by capability among those that fit the task's *facts*
+ * — context and capability columns, which are real — rather than its derived
+ * score floors, which are priors. A local row below a derived bar is still the
+ * best available local option and must not be discarded for it.
+ *
+ * A remote row appears only when there is no local model at all, so the mode
+ * stays honest about being local: falling back to a paid API because every
+ * local row is merely "too weak" would make the mode a silent lie.
  */
 function rankLocal(cat: Catalogue, candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
-  const local = sortBy(
-    candidates.filter((m) => m.local && meetsTask(m, task)),
-    sorts.capabilityContext,
-  )
-  if (local.length > 0) return local
+  const localFacts = (m: CatalogueModel) => m.local && m.available && (m.context <= 0 || m.context >= task.minContext)
 
-  // No local row can carry the task: relax the capability bar before going
-  // remote, so a partially-fitting local row still beats a paid API call.
-  const loose = sortBy(
-    candidates.filter((m) => m.local),
-    sorts.capabilityContext,
-  )
+  const fitting = sortBy(candidates.filter(localFacts), sorts.capabilityContext)
+  if (fitting.length > 0) return fitting
+
+  // Relax the context bar: a partially-fitting local row still beats a paid
+  // API call, and the mode promised local.
+  const loose = sortBy(candidates.filter((m) => m.local && m.available), sorts.capabilityContext)
   if (loose.length > 0) return loose
 
-  // Nothing local at all: allow remote rather than fail the task.
-  return sortBy(candidates.filter((m) => meetsTask(m, task)), sorts.capabilityContext)
+  // Nothing local is installed at all: allow remote rather than fail the task.
+  const remote = candidates.filter((m) => meetsTask(m, task))
+  return sortBy(remote.length > 0 ? remote : candidates, sorts.capabilityContext)
 }
 
 /**
@@ -232,11 +258,12 @@ function dedupe(models: CatalogueModel[]): CatalogueModel[] {
  * degradation the spec asks for is cheap -> free on low funds, so free sits
  * directly above cheap and the chain ends there.
  */
-const MODE_ORDER: Record<Exclude<Mode, "stop">, number> = {
+const MODE_ORDER: Record<Mode, number> = {
   power: 3,
   cheap: 2,
   free: 1,
   local: 0,
+  stop: -1,
 }
 
 /**
@@ -267,7 +294,7 @@ export function degrade(mode: Mode): Mode {
 export function degradationChain(mode: Mode): Mode[] {
   if (mode === "stop") return ["stop"]
   const chain: Mode[] = [mode]
-  let current = mode
+  let current: Mode = mode
   for (let i = 0; i < 4; i++) {
     const next = degrade(current)
     if (next === current || chain.includes(next)) break
@@ -317,3 +344,12 @@ export {
   type CatalogueModel,
   type Requirements,
 }
+
+/** Every agent kind the engine plans for, in a stable order. */
+export const AGENT_KINDS: ReadonlyArray<AgentKind> = [
+  "architect",
+  "build",
+  "review",
+  "explore",
+  "general",
+]

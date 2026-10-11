@@ -6,6 +6,10 @@
   "description": "Self-sustaining agent loop with deterministic model selection.",
   "exports": {
     ".": "./index.ts",
-    "./tui": "./tui.ts"
+    "./tui": "./tui.tsx"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
   }
 }
