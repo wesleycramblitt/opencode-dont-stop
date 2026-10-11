@@ -174,9 +174,45 @@ export class LoopEngine {
     }
     this.catalogue = next
     applyAvailability(next, patches)
+    await this.applyReachability()
     this.log.info(`catalogue loaded: ${next.models.length} models from ${next.sources.length} sources`)
     this.emit()
     return next
+  }
+
+  /**
+   * Mark which models the running OpenCode can actually route to.
+   *
+   * The committed catalogue carries the fetch-time view, which can be stale:
+   * credentials change, providers are added and removed. The engine has an
+   * authenticated context, so it re-derives reachability on every load rather
+   * than trusting the file. Without this, a mode would cheerfully select a
+   * model whose provider has no key — `alibaba/qwen3.7-flash` is the cheapest
+   * text+tool model in models.dev and simply cannot be used here.
+   *
+   * A failure to list models leaves reachability untouched rather than
+   * clearing it, so a transient API error cannot empty every mode.
+   */
+  private async applyReachability(): Promise<void> {
+    if (!this.catalogue) return
+    try {
+      const result = await (this.ctx as unknown as { catalog?: { model: { list(): Promise<{ data?: unknown }> } } }).catalog?.model.list()
+      const data = (result as { data?: Array<{ providerID?: string; id?: string }> } | undefined)?.data
+      if (!Array.isArray(data) || data.length === 0) return
+
+      const usable = new Set(data.map((m) => `${m.providerID ?? ""}/${m.id ?? ""}`))
+      let reachable = 0
+      let unroutable = 0
+      for (const model of this.catalogue.models) {
+        model.reachable = usable.has(`${model.providerID}/${model.id}`)
+        if (model.reachable) reachable++
+        else unroutable++
+      }
+      this.log.info(`reachability: ${reachable} routable, ${unroutable} not routable from this install`)
+      this.emit()
+    } catch (error) {
+      this.log.quiet("info", `reachability check unavailable: ${msg(error)}`)
+    }
   }
 
   /** Capture current availability so a reload can restore it. */

@@ -56,13 +56,21 @@ const verified = document.models.filter((m) => !m.provenance.estimated)
 const deprecated = document.models.filter((m) => m.provenance.estimated === false && m.benchmarks === null)
 
 console.log(`[catalogue] ${document.models.length} models in ${Date.now() - started}ms`)
+for (const source of document.sources) {
+  const unreachable = source.id === "opencode-registry" && source.models === 0
+  console.log(`  ${source.id}: ${source.models}${unreachable ? "  (server unreachable; everything left routable)" : ""}`)
+}
 for (const [source, count] of [...bySource].sort((a, b) => b[1] - a[1])) {
-  console.log(`  ${source}: ${count}`)
+  console.log(`  metadata ${source}: ${count}`)
 }
 console.log(`[catalogue] ${verified.length} with curated benchmarks, ${deprecated.length} verified but unbenchmarked`)
+console.log(`[catalogue] ${document.models.filter((m) => m.weights.total !== null).length} with parsed weights, ${document.models.filter((m) => m.weights.moe).length} MoE`)
+const routable = document.models.filter((m) => m.reachable !== false)
+console.log(`[catalogue] ${routable.length} routable from this install, ${document.models.length - routable.length} not`)
 
 const providers = [...new Set(document.models.map((m) => m.providerID))].sort()
 console.log(`[catalogue] providers: ${providers.join(", ")}`)
+console.log(`[catalogue] routable providers: ${[...new Set(routable.map((m) => m.providerID))].sort().join(", ")}`)
 
 if (options.table) {
   console.log("")

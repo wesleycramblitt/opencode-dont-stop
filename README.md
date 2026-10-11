@@ -208,3 +208,61 @@ npx tsx scripts/update-catalogue.ts   # regenerate the catalogue
 `@opencode/plugin/tui` and `@opentui/solid`, which the opencode server provides
 at runtime but which are not installable standalone. `opencode-voice` takes the
 same approach.
+
+## Reachability
+
+models.dev catalogs 226 providers, but an install can reach only the ones it
+holds credentials for. Ranking over the whole catalogue therefore selects models
+that cannot be used: `alibaba/qwen3.7-flash` is the cheapest text+tool model in
+models.dev and is unroutable without an Alibaba key.
+
+Two checks, in layers:
+
+1. **At fetch time** — `reachableModels()` shells out to `opencode api get
+   /api/model`, which carries the credentials (a plain HTTP fetch to the
+   server's port returns 401). Unroutable rows are persisted with
+   `reachable: false`.
+2. **At load time** — the engine re-derives it from `ctx.catalog.model.list()`,
+   because the committed file goes stale when credentials change. A failure to
+   list leaves reachability untouched rather than clearing it, so a transient
+   API error cannot empty every mode.
+
+`meets()` rejects `reachable === false`, so no mode can select one.
+
+To make more models reachable, add the provider: `opencode auth login`, or add
+its credentials to `~/.local/share/opencode/auth.json`.
+
+## Local means runnable here
+
+`local` is not "listed on ollama.com". A model is a local candidate only when:
+
+- the ollama daemon **has it pulled** (`/api/tags`), and
+- it is **not tagged `cloud`** — ollama.com tags remotely-hosted models
+  `cloud`, and those are rented compute, and
+- its **total parameter count fits the GPU** at the default pull quantization.
+
+Sizing uses *total* parameters because that is what must be resident:
+`nemotron-3.5-lightning` is 30B total with 3B active, so it needs ~20.5GB of a
+4090's ~21GB usable budget despite behaving like a 3B model. Capability, by
+contrast, is derived from *active* parameters — conflating the two is what makes
+a small-effective MoE model look like a frontier one.
+
+Models whose weights are unpublished are excluded from local mode rather than
+assumed to fit. An unknown may or may not load, and promising it is how a user
+ends up with an out-of-memory error mid-loop.
+
+Adjust the target card with `HARDWARE_4090` in `lib/catalogue.ts`.
+
+## Parameter weights
+
+`weights` is stored as total and active, separately, because they answer
+different questions. Parsed from three sources, most authoritative first:
+
+1. the **pull tag** on an installed model — `ollama pull qwen3-vl:30b` names
+   its size, and it outranks any scraped description
+2. the **description** — "an open 30B MoE model with 3B active parameters",
+   "activates 52B of 1.05T total parameters", "a 421M decision model"
+3. the **tag row** — `tools thinking 0.8b 4b 81K`, taking the largest size
+
+`M` units are honoured (421M is 0.421B). `weights.source` records which fired,
+so an unexplained size can be traced.

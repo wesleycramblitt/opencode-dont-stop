@@ -20,6 +20,7 @@
  * not require network access at plugin load time.
  */
 
+import { execFileSync } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -121,10 +122,41 @@ interface RawRow {
   source: "models.dev" | "ollama" | "local"
   /** Popularity position among local models, when known. */
   rank?: number
-  /** Declared parameter count, e.g. "24B". */
-  parameterSize?: string
+  /**
+   * Parameter counts, split because they answer different questions.
+   *
+   * `total` is what must be held in memory, so it governs VRAM feasibility.
+   * `active` is what runs per token, so it governs effective capability. For a
+   * dense model the two are equal; for a mixture-of-experts model they differ
+   * by an order of magnitude — nemotron-3.5-lightning is 30B total with 3B
+   * active — and conflating them makes both estimates wrong.
+   */
+  weights?: Weights
+  /** True when the provider hosts this model remotely rather than locally. */
+  cloud?: boolean
   /** Set when this row describes a variant rather than the base model. */
   variant?: string
+  /** Scratch: the running server cannot route to this row. */
+  unroutable?: boolean
+}
+
+/** Parameter counts in billions, with provenance. */
+export interface Weights {
+  /** Total parameters loaded into memory, in billions. */
+  total: number | null
+  /** Parameters active per forward pass, in billions. */
+  active: number | null
+  /** True when total and active differ, i.e. a mixture-of-experts model. */
+  moe: boolean
+  /** Where the numbers came from. */
+  source: "tag" | "description" | "description-active" | "registry" | "unknown"
+}
+
+export const UNKNOWN_WEIGHTS: Weights = {
+  total: null,
+  active: null,
+  moe: false,
+  source: "unknown",
 }
 
 /** Flatten models.dev into raw rows for the requested providers. */
@@ -178,6 +210,10 @@ function rowsFromModelsDev(payload: unknown): RawRow[] {
         // must not claim locality: local mode would otherwise select a paid
         // cloud model over the model actually installed on this machine.
         local: false,
+        // models.dev publishes capabilities and limits but no parameter
+        // counts, so weights stay unknown rather than guessed.
+        weights: UNKNOWN_WEIGHTS,
+        cloud: true,
         source: "models.dev",
       })
     }
@@ -237,7 +273,40 @@ function tagsFromSearchItem(item: string): { context: number; parameterSize?: st
   }
 }
 
-/** The default capability set for a locally-hosted model, before enrichment. */
+
+/**
+ * Which (providerID, modelID) pairs the running OpenCode can route to.
+ *
+ * Queried through the `opencode api` CLI rather than HTTP because the server
+ * requires authentication: a plain fetch to its port returns 401, and the CLI
+ * already carries the credentials. The server picks an ephemeral port per run,
+ * so discovery is the CLI's job too.
+ *
+ * Returns null when the server cannot be reached, which means "unknown" rather
+ * than "unreachable" — a fetch run away from a live server must not mark
+ * everything unroutable and empty every mode.
+ */
+export function reachableModels(): Set<string> | null {
+  try {
+    // Imported rather than `require`d: this module is ESM, and `require` is
+    // undefined there — using it silently returns null and quietly marks the
+    // whole catalogue unreachable-checked.
+    const stdout = execFileSync("opencode", ["api", "get", "/api/model"], {
+      encoding: "utf8",
+      timeout: 15000,
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+    const payload = JSON.parse(stdout) as { data?: Array<{ providerID?: string; id?: string }> }
+    if (!Array.isArray(payload.data)) return null
+    const keys = new Set<string>()
+    for (const model of payload.data) {
+      if (model.providerID && model.id) keys.add(`${model.providerID}/${model.id}`)
+    }
+    return keys.size > 0 ? keys : null
+  } catch {
+    return null
+  }
+}
 function defaultCapabilities(): Record<string, boolean> {
   return {
     text: true,
@@ -250,6 +319,94 @@ function defaultCapabilities(): Record<string, boolean> {
     structured: false,
     embedding: false,
   }
+}
+
+/**
+ * Parse parameter counts out of prose and tag rows.
+ *
+ * A tag row reads `tools thinking 0.8b 4b 81K`; a description reads "an open
+ * 30B MoE model with 3B active parameters", "activates 52B of 1.05T total
+ * parameters", or "30B parameters, licensed under Apache 2.0". Vendors put the
+ * MoE split in either order and name the total in several ways, so the shapes
+ * are matched explicitly rather than by one guess at a generic pattern.
+ *
+ * Reliability order, most to least:
+ *
+ * 1. an explicit **active** figure — the vendor stating what runs per token
+ * 2. an explicit **total** figure — "X parameters", "X total", "of X T total"
+ * 3. the tag row's size, which usually reports the total
+ *
+ * `M` units are honoured (421M is 0.421B), and a B/T figure with no stated
+ * total is treated as the total rather than dropped, because most dense models
+ * report only one number and it is the total.
+ */
+export function parseWeights(text: string, tags: string[] = []): Weights {
+  const hay = `${text} ${tags.join(" ")}`
+
+  /** Convert "1.05T" / "52B" / "421M" into billions. */
+  const billions = (value: string, unit: string): number | null => {
+    const n = Number.parseFloat(value)
+    if (!Number.isFinite(n)) return null
+    switch (unit.toUpperCase()) {
+      case "T":
+        return n * 1000
+      case "B":
+        return n
+      case "M":
+        return n / 1000
+      default:
+        return null
+    }
+  }
+
+  const first = (pattern: RegExp): number | null => {
+    const m = pattern.exec(hay)
+    return m ? billions(m[1], m[2]) : null
+  }
+
+  // Active: "activates 52B", "with 3B active parameters", "3B activated".
+  const active =
+    first(/(?:activates?|activates|with|has)\s+(\d+(?:\.\d+)?)\s*([BTM])\b/i) ??
+    first(/(\d+(?:\.\d+)?)\s*([BTM])\s+(?:parameters?\s+)?(?:activated|active)/i)
+
+  // Total: "1.05T total parameters", "52B total parameters", "30B parameters",
+  // "128B weights", or a size stated just before "model"/"MoE".
+  const total =
+    first(/(\d+(?:\.\d+)?)\s*([BTM])\s+(?:total\s+)?(?:parameters|weights)/i) ??
+    first(/of\s+(\d+(?:\.\d+)?)\s*([BTM])\s+total/i) ??
+    // A size stated immediately before a noun that means "the model": "an open
+    // 30B MoE model", "a 4B decision model", "a 421M decision model", "a 30B
+    // mixture-of-experts model". The lookahead keeps this from matching a
+    // price or a benchmark figure that happens to sit near the word "model".
+    first(/(\d+(?:\.\d+)?)\s*([BTM])\b(?=[^.]{0,40}?\b(?:mixture[- ]of[- ]experts|MoE|model)\b)/i)
+
+  if (active !== null || total !== null) {
+    // An MoE model reports both. When only the active figure was stated, the
+    // total is at least the active count, and MoE status is unknown rather
+    // than false — a dense-looking figure here would understate VRAM.
+    const statedTotal = total ?? active
+    const statedActive = active ?? total
+    const moe = total !== null && active !== null && Math.abs(total - active) > 0.001
+    return {
+      total: statedTotal,
+      active: statedActive,
+      moe,
+      source: active !== null && total !== null ? "description-active" : "description",
+    }
+  }
+
+  // Fall back to the tag row's largest B-suffixed number.
+  const sized = tags
+    .map((t) => /^(\d+(?:\.\d+)?)([bBmM])$/.exec(t))
+    .filter((m): m is RegExpExecArray => m !== null)
+    .map((m) => billions(m[1], m[2])!)
+    .filter((n) => Number.isFinite(n) && n > 0)
+  if (sized.length > 0) {
+    const value = Math.max(...sized)
+    return { total: value, active: value, moe: false, source: "tag" }
+  }
+
+  return UNKNOWN_WEIGHTS
 }
 
 /**
@@ -318,7 +475,11 @@ async function rowsFromOllamaSearch(options: FetchOptions): Promise<RawRow[]> {
       local: true,
       source: "ollama",
       rank: position + 1,
-      parameterSize: entry.parameterSize,
+      weights: parseWeights(entry.description ?? "", entry.parameterSize ? [entry.parameterSize] : []),
+      // ollama.com tags a model `cloud` when it runs on Ollama's servers
+      // rather than on the user's machine. That is the difference between a
+      // local model and a rented one, and it must survive into the catalogue.
+      cloud: (entry.capabilities ?? []).includes("cloud"),
     }))
   }
 
@@ -413,6 +574,15 @@ export interface CatalogueRow {
   ollamaRank?: number
   parameterSize?: string
   variant?: string
+  /** Parameter counts, split into total (VRAM) and active (capability). */
+  weights: Weights
+  /** True when a provider hosts this remotely rather than on this machine. */
+  cloud: boolean
+  /**
+   * Whether the running OpenCode can route to this provider. `false` means it
+   * cannot, so no mode may select it. See `applyReachability`.
+   */
+  reachable: boolean
   /** Capability tag list for display, e.g. ["image", "toolCall"]. */
   capabilityTags?: string[]
   canonicalID: string | null
@@ -615,6 +785,82 @@ function normalizeParams(parameterSize?: string): number {
   return normalize(billions, PARAMS_BAND)
 }
 
+/**
+ * A local model's capability signal, 0-1.
+ *
+ * Uses the *active* parameter count, not the total: an MoE model runs only its
+ * active experts per token, so a 30B-total/3B-active model behaves like a 3B
+ * model, not a 30B one. The total governs memory, which is `fitsLocally`'s
+ * job, and conflating the two is what makes a 3B-effective model look like a
+ * frontier model.
+ *
+ * A row with unknown weights returns null so the caller can fall back rather
+ * than assume the midpoint and rank an unknown model above a known small one.
+ */
+function normalizeActive(weights: Weights | undefined): number | null {
+  const active = weights?.active
+  if (active === null || active === undefined || !Number.isFinite(active)) return null
+  return normalize(active, PARAMS_BAND)
+}
+
+/* ------------------------------------------------------- hardware feasibility */
+
+/**
+ * Bytes per parameter at each common quantization, in GB per billion of
+ * parameters. Ollama's default is Q4_K_M, which is what a pulled model uses
+ * unless it was pulled with an explicit `:q8_` suffix.
+ */
+const QUANT_BYTES_PER_PARAM = {
+  q4: 0.6,
+  q5: 0.75,
+  q8: 1.05,
+  f16: 2.0,
+} as const
+
+export type Quant = keyof typeof QUANT_BYTES_PER_PARAM
+
+/** A card to size models against. */
+export interface HardwareProfile {
+  name: string
+  /** Total VRAM in GB. */
+  vramGB: number
+  /** Quantization a `pull` will fetch by default. */
+  quant: Quant
+}
+
+/** An RTX 4090. The common case for a local-first setup. */
+export const HARDWARE_4090: HardwareProfile = { name: "rtx-4090", vramGB: 24, quant: "q4" }
+
+/**
+ * VRAM fallback used when a profile is not supplied: enough for the small end,
+ * small enough to exclude anything genuinely large.
+ */
+const DEFAULT_RESERVE_GB = 2.5
+
+/**
+ * Estimated VRAM in GB to run a model: weights at the profile's quantization,
+ * plus a reserve for the KV cache, activations and CUDA overhead.
+ *
+ * The reserve is a flat estimate rather than a per-token cache model. It is
+ * deliberately conservative: an underestimate here is what makes "local" mode
+ * propose a model that will not load, which is worse than being slightly
+ * pessimistic about a model that would have fit.
+ */
+export function estimateVRAM(weights: Weights | undefined, profile: HardwareProfile = HARDWARE_4090): number | null {
+  const total = weights?.total
+  if (total === null || total === undefined || !Number.isFinite(total)) return null
+  const bytesPerParam = QUANT_BYTES_PER_PARAM[profile.quant]
+  return total * bytesPerParam + DEFAULT_RESERVE_GB
+}
+
+/** Does this model fit in the profile's VRAM? Null when the weights are unknown. */
+export function fitsLocally(weights: Weights | undefined, profile: HardwareProfile = HARDWARE_4090): boolean | null {
+  const vram = estimateVRAM(weights, profile)
+  if (vram === null) return null
+  // Leave a margin for the desktop compositor and anything else holding VRAM.
+  return vram <= profile.vramGB * 0.88
+}
+
 // Tier tokens in a model id or name are a vendor's own ranking of its lineup.
 // These are the tokens vendors actually use, strongest to weakest.
 const TIER_UP: Array<[RegExp, number]> = [
@@ -671,15 +917,19 @@ function generationSignal(family: string, id: string): number {
 export function scoresFromMetadata(row: RawRow): { reasoning: number; code: number; agentic: number; general: number } {
   const local = row.local
   const price = normalizePrice(row.pricing.input + row.pricing.output)
-  const params = normalizeParams(row.parameterSize)
+  // Active params for capability. Null when unknown, in which case the tier
+  // signal is dropped rather than assumed, so an unmeasured local model is not
+  // credited with a mid-sized one's capability.
+  const active = normalizeActive(row.weights)
   const recency = normalizeRecency(row.releaseDate)
   const context = normalizeContext(row.context)
   const tier = tierSignal(row.id, row.name)
   const generation = generationSignal(row.family, row.id)
   const tierTerm = (tier + 1) * 0.5 // -1..1 -> 0..1
 
-  // Remote: price is the tier statement. Local: parameter count is.
-  const tierStrength = (local ? params : price) * 0.4
+  // Remote: price is the vendor's tier statement. Local: active parameters are.
+  // An unknown-weights local model gets 0 tier signal rather than a guess.
+  const tierStrength = (local ? (active ?? 0) : price) * 0.4
 
   const reasoningSignal =
     tierStrength +
@@ -782,7 +1032,9 @@ export function toRow(raw: RawRow, ollamaRank?: number): CatalogueRow {
     pricing: raw.pricing,
     local: raw.local,
     ...(ollamaRank !== undefined ? { ollamaRank } : {}),
-    parameterSize: raw.parameterSize,
+    weights: raw.weights ?? UNKNOWN_WEIGHTS,
+    cloud: raw.cloud ?? !raw.local,
+    reachable: true,
     capabilityTags: raw.capabilities.toolCall || raw.capabilities.reasoning ? capabilityTagList(raw.capabilities) : [],
     canonicalID: raw.canonicalID,
     benchmarks,
@@ -831,35 +1083,69 @@ export async function fetchCatalogue(options: FetchOptions = {}): Promise<Catalo
   if (installed.size > 0) {
     sourceStats.push({ id: "ollama-local", url: OLLAMA_TAGS_URL, models: installed.size })
     for (const [name, info] of installed) {
-      const existing = raw.find((r) => r.id === name && r.source === "ollama")
-      if (existing) {
-        existing.context = info.context || existing.context
-        continue
-      }
+      // `qwen3.8:latest` and `qwen3.8` are the same model with a tag appended,
+      // so a popularity row matched on the base name supplies weights, context
+      // and capability tags that the daemon does not report.
+      const base = name.split(":")[0]
+      const scraped = raw.find((r) => r.id === name && r.source === "ollama")
+        ?? raw.find((r) => r.id === base && r.source === "ollama")
+
+      // A tag on the installed name is a first-class statement of size:
+      // `ollama pull qwen3-vl:30b` names its parameter count. It outranks a
+      // scraped description when both exist.
+      const tagWeights = parseWeights("", [name.split(":")[1] ?? ""])
+
       raw.push({
         providerID: "ollama",
         id: name,
         name,
-        description: "",
-        family: "",
-        releaseDate: "",
-        knowledge: "",
+        description: scraped?.description ?? "",
+        family: scraped?.family ?? "",
+        releaseDate: scraped?.releaseDate ?? "",
+        knowledge: scraped?.knowledge ?? "",
         openWeights: true,
-        context: info.context,
-        maxOutput: 0,
-        capabilities: { text: true, image: false, audio: false, pdf: false, video: false, reasoning: false, toolCall: false, structured: false, embedding: false },
+        context: info.context || scraped?.context || 0,
+        maxOutput: scraped?.maxOutput ?? 0,
+        capabilities: scraped?.capabilities ?? defaultCapabilities(),
         pricing: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        canonicalID: null,
+        canonicalID: scraped?.canonicalID ?? null,
         local: true,
+        // The daemon lists only models it has actually pulled, so anything
+        // here runs on this machine whatever ollama.com says about a cloud
+        // option. A cloud tag on the popularity row must not demote an
+        // installed model.
+        cloud: false,
+        weights: tagWeights.total !== null ? tagWeights : scraped?.weights ?? UNKNOWN_WEIGHTS,
         source: "local",
       })
     }
+  }
+
+  // Reachability: a row is usable only if the running server can route to it.
+  // The set is empty-safe — an unreachable server leaves everything reachable
+  // rather than empting the catalogue, and the plugin re-checks at load.
+  const reachable = reachableModels()
+  if (reachable) {
+    let unroutable = 0
+    for (const row of raw) {
+      if (!reachable.has(`${row.providerID}/${row.id}`)) {
+        row.unroutable = true
+        unroutable++
+      }
+    }
+    sourceStats.push({ id: "opencode-registry", url: "server", models: reachable.size })
+    if (unroutable > 0) {
+      sourceStats.push({ id: "unroutable", url: "-", models: unroutable })
+    }
+  } else {
+    sourceStats.push({ id: "opencode-registry", url: "server (unreachable)", models: 0 })
   }
 
   const seen = new Set<string>()
   const models: CatalogueRow[] = []
   for (const row of raw) {
     const candidate = toRow(row, row.rank ?? ranks.get(row.id))
+    if (row.unroutable) candidate.reachable = false
     if (seen.has(candidate.key)) continue
     seen.add(candidate.key)
     models.push(candidate)

@@ -50,6 +50,66 @@ export interface Scores {
   capability: number
 }
 
+/**
+ * Parameter counts, split because they answer different questions.
+ *
+ * `total` is what must be held in memory and so governs VRAM feasibility.
+ * `active` is what runs per forward pass and so governs effective capability.
+ * For a dense model they are equal; for a mixture-of-experts model they differ
+ * by an order of magnitude, and conflating them makes both estimates wrong.
+ */
+export interface Weights {
+  total: number | null
+  active: number | null
+  moe: boolean
+  source: "tag" | "description" | "description-active" | "registry" | "unknown"
+}
+
+/** A card to size local models against. */
+export interface HardwareProfile {
+  name: string
+  /** Total VRAM in GB. */
+  vramGB: number
+  /** Quantization a `pull` fetches by default. */
+  quant: "q4" | "q5" | "q8" | "f16"
+}
+
+/** An RTX 4090, the common local-first card. */
+export const HARDWARE_4090: HardwareProfile = { name: "rtx-4090", vramGB: 24, quant: "q4" }
+
+const QUANT_BYTES_PER_PARAM: Record<HardwareProfile["quant"], number> = {
+  q4: 0.6,
+  q5: 0.75,
+  q8: 1.05,
+  f16: 2.0,
+}
+
+/** Reserve for the KV cache, activations and CUDA overhead, in GB. */
+const VRAM_RESERVE_GB = 2.5
+
+/**
+ * Estimated VRAM in GB to run a model, or null when its weights are unknown.
+ * Unknown is distinct from small: a model whose size is not published may not
+ * fit, and local mode must not assume it does.
+ */
+export function estimateVRAM(m: CatalogueModel, profile: HardwareProfile = HARDWARE_4090): number | null {
+  const total = m.weights.total
+  if (total === null || !Number.isFinite(total)) return null
+  return round1(total * QUANT_BYTES_PER_PARAM[profile.quant] + VRAM_RESERVE_GB)
+}
+
+/**
+ * Does this model fit in the profile's VRAM? Null when the weights are unknown.
+ *
+ * The 0.88 margin leaves room for the desktop compositor and anything else
+ * holding VRAM — a card with 24GB rarely offers 24GB to a single process.
+ */
+export function fitsLocally(m: CatalogueModel, profile: HardwareProfile = HARDWARE_4090): boolean | null {
+  const vram = estimateVRAM(m, profile)
+  if (vram === null) return null
+  return vram <= profile.vramGB * 0.88
+}
+
 export interface Provenance {
   metadata: "models.dev" | "ollama" | "local"
   /** The benchmark report a row's scores came from, when it has one. */
@@ -82,6 +142,20 @@ export interface CatalogueModel {
   benchmarks: Record<string, number | string> | null
   scores: Scores
   provenance: Provenance
+  /**
+   * Parameter counts. `total` governs VRAM, `active` governs capability; see
+   * the interface. Both null when the model publishes neither.
+   */
+  weights: Weights
+  /** True when a provider hosts this remotely rather than on this machine. */
+  cloud: boolean
+  /**
+   * Whether the running OpenCode can route to this provider. False means it
+   * cannot — no credential is held — so no mode may select it however well it
+   * ranks. Reachability is re-derived by the engine at load from the live
+   * server, so the committed file only carries the fetch-time view.
+   */
+  reachable: boolean
   /** Availability is runtime state, not catalogue data: set by the engine. */
   available: boolean
   availabilityReason: string | null
@@ -169,6 +243,9 @@ function toModels(rows: Array<Record<string, unknown>>): CatalogueModel[] {
       benchmarks: benchmarks(raw.benchmarks),
       scores: scores(raw.scores),
       provenance: provenance(raw.provenance),
+      weights: weights(raw.weights),
+      cloud: raw.cloud === true,
+      reachable: raw.reachable !== false,
       available: true,
       availabilityReason: null,
       cooldownUntil: 0,
@@ -224,6 +301,9 @@ export interface Requirements {
  */
 export function meets(m: CatalogueModel, req: Requirements): boolean {
   if (!m.available) return false
+  // An unroutable row is not a candidate for any mode: the running OpenCode
+  // holds no credential for its provider, so selecting it would fail on use.
+  if (m.reachable === false) return false
   if (m.cooldownUntil > Date.now()) return false
   if (m.provenance.estimated && req.allowUnverified === false) return false
   if (req.allowLocal === false && m.local) return false
@@ -453,6 +533,26 @@ export function index(models: CatalogueModel[], meta: { version: number; generat
 }
 
 /* ------------------------------------------------------------------ helpers */
+
+function weights(value: unknown): Weights {
+  const record = (value ?? {}) as Record<string, unknown>
+  const total = record.total
+  const active = record.active
+  const source = record.source
+  return {
+    total: typeof total === "number" ? total : null,
+    active: typeof active === "number" ? active : null,
+    moe: record.moe === true,
+    source:
+      source === "tag" || source === "description" || source === "description-active" || source === "registry"
+        ? source
+        : "unknown",
+  }
+}
+
+function round1(n: number): number {
+  return Math.round(n * 10) / 10
+}
 
 function capabilities(value: unknown): Capabilities {
   const record = (value ?? {}) as Record<string, unknown>

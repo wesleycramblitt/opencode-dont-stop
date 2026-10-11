@@ -20,11 +20,14 @@
 import {
   blendedPrice,
   filter,
+  fitsLocally,
   isFree,
   sortBy,
   sorts,
   type Catalogue,
   type CatalogueModel,
+  HARDWARE_4090,
+  type HardwareProfile,
   type Requirements,
 } from "./catalogue.ts"
 import type { Mode } from "./state.ts"
@@ -91,7 +94,12 @@ export function profileFor(kind: AgentKind, overrides: Partial<TaskProfile> = {}
 }
 
 /** Rank rows for one task under one mode. Pure and deterministic. */
-export function rankForMode(cat: Catalogue, mode: Mode, task: TaskProfile): CatalogueModel[] {
+export function rankForMode(
+  cat: Catalogue,
+  mode: Mode,
+  task: TaskProfile,
+  hardware: HardwareProfile = HARDWARE_4090,
+): CatalogueModel[] {
   // `stop` is not a real mode: it selects nothing so the loop can halt.
   if (mode === "stop") return []
   const req = requirementsFor(task)
@@ -104,7 +112,7 @@ export function rankForMode(cat: Catalogue, mode: Mode, task: TaskProfile): Cata
     case "cheap":
       return rankCheap(candidates, task)
     case "local":
-      return rankLocal(cat, candidates, task)
+      return rankLocal(cat, candidates, task, hardware)
     case "power":
       return rankPower(candidates, task)
   }
@@ -178,31 +186,40 @@ function rankCheap(candidates: CatalogueModel[], task: TaskProfile): CatalogueMo
 }
 
 /**
- * Local mode: best local model for the task, mindful of GPU budget.
+ * Local mode: best model that actually runs on this machine.
  *
- * Local rows are ranked by capability among those that fit the task's *facts*
- * — context and capability columns, which are real — rather than its derived
- * score floors, which are priors. A local row below a derived bar is still the
- * best available local option and must not be discarded for it.
+ * "Local" means runnable here, not merely listed on ollama.com. Two filters
+ * separate them:
  *
- * A remote row appears only when there is no local model at all, so the mode
- * stays honest about being local: falling back to a paid API because every
- * local row is merely "too weak" would make the mode a silent lie.
+ * 1. **Not cloud-hosted.** ollama.com tags a model `cloud` when it runs on
+ *    Ollama's servers; those are rented compute and must not appear here.
+ * 2. **Fits the GPU.** A model whose *total* parameter count exceeds what the
+ *    card can hold will not load, so it is not a candidate no matter how well
+ *    it scores. Sizing uses total parameters because that is what must be
+ *    resident, at the default pull quantization.
+ *
+ * Models whose weights are unpublished are excluded rather than assumed to
+ * fit: an unknown may or may not load, and local mode promising it is how a
+ * user ends up with an out-of-memory error mid-loop.
  */
-function rankLocal(cat: Catalogue, candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
-  const localFacts = (m: CatalogueModel) => m.local && m.available && (m.context <= 0 || m.context >= task.minContext)
+function rankLocal(cat: Catalogue, candidates: CatalogueModel[], task: TaskProfile, hardware: HardwareProfile): CatalogueModel[] {
+  const fits = (m: CatalogueModel) =>
+    m.local && !m.cloud && (m.context <= 0 || m.context >= task.minContext) && fitsLocally(m, hardware) === true
 
-  const fitting = sortBy(candidates.filter(localFacts), sorts.capabilityContext)
+  const fitting = sortBy(candidates.filter(fits), sorts.capabilityContext)
   if (fitting.length > 0) return fitting
 
-  // Relax the context bar: a partially-fitting local row still beats a paid
-  // API call, and the mode promised local.
-  const loose = sortBy(candidates.filter((m) => m.local && m.available), sorts.capabilityContext)
+  // Relax the context bar before anything else: a partially-fitting local row
+  // still beats going remote, and the mode promised local.
+  const loose = sortBy(
+    candidates.filter((m) => m.local && !m.cloud && fitsLocally(m, hardware) === true),
+    sorts.capabilityContext,
+  )
   if (loose.length > 0) return loose
 
-  // Nothing local is installed at all: allow remote rather than fail the task.
-  const remote = candidates.filter((m) => meetsTask(m, task))
-  return sortBy(remote.length > 0 ? remote : candidates, sorts.capabilityContext)
+  // Nothing local is installed that fits. Reporting that plainly is more useful
+  // than silently substituting a paid API for a mode whose whole point is local.
+  return []
 }
 
 /**
@@ -334,8 +351,7 @@ export function describeMode(mode: Mode): string {
   }
 }
 
-export {
-  blendedPrice,
+export { HARDWARE_4090, blendedPrice,
   filter,
   isFree,
   sortBy,
