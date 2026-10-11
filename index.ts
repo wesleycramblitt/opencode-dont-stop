@@ -115,7 +115,20 @@ export default {
               status: props?.error?.status,
               type: props?.error?.type,
             })
-          } else if (event.type === "session.idle" && state.loop.status === "active") {
+          } else if (event.type === "session.idle") {
+            // The session finished a turn. When a loop is running this is the
+            // point where it continues rather than ends; with no loop running
+            // it is just a counter bump for the status display.
+            if (state.loop.status === "active") {
+              const sid = (event.properties?.info as { id?: string } | undefined)?.id
+                ?? (event.properties?.sessionID as string | undefined)
+                ?? state.loop.sessionID
+              if (sid !== null && sid === state.loop.sessionID) {
+                await engine.advance(sid)
+                persist()
+                continue
+              }
+            }
             engine.completeIteration()
             persist()
           }

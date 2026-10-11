@@ -54,7 +54,43 @@ export interface EngineOptions {
   onStateChange?: (state: PluginState) => void
   /** Session ids to track, for tests. */
   seedSessions?: string[]
+  /** Hard cap on iterations, so a loop cannot run forever. */
+  maxIterations?: number
+  /** Token the model emits to declare the task finished. */
+  completionSentinel?: string
 }
+
+/**
+ * How many iterations a loop may run before it stops itself.
+ *
+ * A bound, not a target: the loop's real stopping condition is the completion
+ * sentinel, and this exists so a model that never emits it cannot run forever.
+ */
+export const DEFAULT_MAX_ITERATIONS = 100
+
+/**
+ * The completion sentinel.
+ *
+ * The loop cannot know on its own whether a task is finished — that is a
+ * judgement about the work, and the only entity with the context is the model
+ * doing it. So the loop asks: the prompt instructs the model to emit this exact
+ * token when, and only when, the task is genuinely complete. Reading for it is
+ * deterministic and needs no extra model call, which a "is it done?" probe
+ * would.
+ */
+export const COMPLETION_SENTINEL = "<loop-complete/>"
+
+/** Instruction appended to every loop prompt so the model knows the protocol. */
+export const SENTINEL_INSTRUCTION =
+  `\n\nWhen the task above is fully complete, reply with exactly ${COMPLETION_SENTINEL} ` +
+  `and nothing else. Do not emit it while work remains.`
+
+/**
+ * Sent to advance a loop that has not finished. Deliberately short: the session
+ * already holds the full task context, and a long standing instruction tends to
+ * make the model restart rather than continue.
+ */
+export const CONTINUE_PROMPT = "Continue. If the task is now fully complete, reply with only " + COMPLETION_SENTINEL
 
 export class LoopEngine {
   private catalogue: Catalogue | null = null
@@ -65,6 +101,11 @@ export class LoopEngine {
   private running = false
   private abort = new AbortController()
 
+  private readonly maxIterations: number
+  private readonly sentinel: string
+  /** Guards against sending two prompts for one idle event. */
+  private advancing = false
+
   constructor(
     private readonly ctx: ApplyContext,
     private readonly state: PluginState,
@@ -72,6 +113,8 @@ export class LoopEngine {
     private readonly options: EngineOptions = {},
   ) {
     this.clocks = new ClockSet(options.clocks ?? DEFAULT_CLOCKS, log)
+    this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS
+    this.sentinel = options.completionSentinel ?? COMPLETION_SENTINEL
     for (const id of options.seedSessions ?? []) {
       this.track(id)
     }
@@ -367,11 +410,13 @@ export class LoopEngine {
     const verdicts = this.clocks.evaluate(Date.now())
     for (const { sessionID, verdict, exhausted } of verdicts) {
       if (verdict.action === "idle") {
+        // A non-loop session going idle is simply untracked. The loop session
+        // is *not* stopped here: idle between turns is the loop's normal state,
+        // and the idle event handler (`advance`) is what decides whether the
+        // work is finished. Stopping on idle would end the loop on its first
+        // turn.
+        if (sessionID === this.state.loop.sessionID) continue
         this.log.info(`session ${sessionID} idle: ${verdict.reason}`)
-        if (sessionID === this.state.loop.sessionID) {
-          this.stop("loop session went idle")
-          return
-        }
         this.untrack(sessionID)
         continue
       }
@@ -545,6 +590,107 @@ export class LoopEngine {
     await this.refresh(true)
   }
 
+  /* -------------------------------------------------------- loop the driver */
+
+  /**
+   * Advance the loop after its session goes idle.
+   *
+   * This is the piece that makes the loop a loop. When the session finishes a
+   * turn it goes idle; rather than treating that as the end, the loop decides:
+   *
+   * 1. Count the completed iteration.
+   * 2. Read the last assistant turn and look for the completion sentinel. Its
+   *    presence means the model judged the work finished, which stops the loop.
+   * 3. Stop if the iteration budget or the error budget is spent.
+   * 4. Otherwise **re-plan** — re-rank the catalogue, sweep for a model that
+   *    has become available or a better one for the task, and switch the
+   *    session if the answer changed. This is the "continually evaluate on each
+   *    turn" contract, and it runs before the prompt so the next turn is already
+   *    on the current best model.
+   * 5. Send the next prompt, which makes the session busy again and re-arms the
+   *    hang clock.
+   *
+   * `advancing` guards the re-entrancy: an idle event can arrive while a prompt
+   * is in flight, and two prompts for one turn would double the work and
+   * desynchronise the counters.
+   */
+  async advance(sessionID: string): Promise<void> {
+    if (this.advancing) return
+    if (this.state.loop.status !== "active") return
+    if (this.state.loop.sessionID !== sessionID) return
+
+    this.advancing = true
+    try {
+      this.state.loop.iterations += 1
+      const iteration = this.state.loop.iterations
+      this.state.loop.lastResult = `iteration ${iteration} complete`
+      this.emit()
+
+      if (iteration >= this.maxIterations) {
+        this.stop(`iteration budget reached (${iteration})`)
+        return
+      }
+
+      const lastText = await this.lastAssistantText(sessionID)
+      if (lastText.includes(this.sentinel)) {
+        this.stop(`task complete after ${iteration} iterations`)
+        return
+      }
+
+      if (this.state.consecutiveErrors >= 5) {
+        this.stop(`stopping after ${this.state.consecutiveErrors} consecutive errors`)
+        return
+      }
+
+      // Re-plan before continuing, so the next turn runs on the current best
+      // model rather than whatever happened to be selected earlier.
+      await this.refresh(false)
+
+      await this.sendPrompt(sessionID, CONTINUE_PROMPT)
+      this.clocks.clocksFor(sessionID).start(Date.now())
+      this.state.loop.lastResult = `iteration ${iteration} done; continuing`
+      this.log.info(`loop iteration ${iteration} complete; continuing`)
+      this.emit()
+    } catch (error) {
+      this.log.error(`advance failed on ${sessionID}: ${msg(error)}`)
+      this.state.consecutiveErrors += 1
+      if (this.state.consecutiveErrors >= 5) {
+        this.stop(`stopping after ${this.state.consecutiveErrors} consecutive loop errors`)
+      }
+      this.emit()
+    } finally {
+      this.advancing = false
+    }
+  }
+
+  /** Send one prompt to a session. */
+  async sendPrompt(sessionID: string, text: string): Promise<void> {
+    const session = this.ctx as unknown as {
+      session: { prompt(input: { sessionID: string; text: string }): Promise<unknown> }
+    }
+    await session.session.prompt({ sessionID, text })
+  }
+
+  /**
+   * Read the session's messages and return the last assistant turn's text.
+   *
+   * Returns an empty string on any failure: a model that cannot be read is
+   * treated as "not complete" rather than "complete", so the loop keeps going
+   * and stops on its budget instead of halting on a read error.
+   */
+  private async lastAssistantText(sessionID: string): Promise<string> {
+    try {
+      const api = this.ctx as unknown as {
+        session: { context(input: { sessionID: string }): Promise<unknown> }
+      }
+      const messages = (await api.session.context({ sessionID })) as unknown
+      return extractAssistantText(messages)
+    } catch (error) {
+      this.log.quiet("info", `could not read messages for ${sessionID}: ${msg(error)}`)
+      return ""
+    }
+  }
+
   /* -------------------------------------------------------- loop lifecycle */
 
   async start(sessionID: string, prompt: string): Promise<void> {
@@ -557,10 +703,25 @@ export class LoopEngine {
       startedAt: Date.now(),
       lastResult: null,
     }
+    this.state.consecutiveErrors = 0
     this.running = true
     this.clocks.clocksFor(sessionID).start(Date.now())
-    this.log.info(`loop started on ${sessionID}: ${prompt}`)
+    this.log.info(`loop started on ${sessionID}: ${prompt.slice(0, 80)}`)
+
+    // Plan first so the opening turn already runs on the right model.
     await this.refresh(true)
+
+    // Then send the opening prompt. The sentinel instruction is appended so the
+    // model knows how to declare the task finished; without it the loop could
+    // only ever stop on its budget.
+    try {
+      await this.sendPrompt(sessionID, `${prompt}${SENTINEL_INSTRUCTION}`)
+      this.clocks.clocksFor(sessionID).start(Date.now())
+    } catch (error) {
+      this.log.error(`could not send the opening prompt: ${msg(error)}`)
+      this.stop(`failed to send the opening prompt: ${msg(error)}`)
+      return
+    }
     this.emit()
   }
 
@@ -665,8 +826,58 @@ function describe(error: ClassifiedError): string {
   return error.message || error.kind
 }
 
+/**
+ * Pull the last assistant turn's text out of a session context response.
+ *
+ * The response is an array of messages, each carrying a `role` and `parts`.
+ * Part shapes vary — text parts, reasoning parts, tool parts — so only text and
+ * a `content` string are collected, and the *last* assistant message wins
+ * because that is the turn that just finished.
+ *
+ * Deliberately tolerant of shape: an unexpected structure returns an empty
+ * string rather than throwing, and an empty string means "not complete", which
+ * keeps the loop running to its budget instead of stopping on a parse failure.
+ */
+function extractAssistantText(messages: unknown): string {
+  if (!Array.isArray(messages)) {
+    // Some APIs wrap the array in `{ data: [...] }`.
+    const wrapped = messages as { data?: unknown } | null
+    if (wrapped && Array.isArray(wrapped.data)) return extractAssistantText(wrapped.data)
+    return ""
+  }
+
+  let text = ""
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue
+    const record = message as Record<string, unknown>
+    const role = record.role ?? record.type
+    if (role !== "assistant" && role !== "agent") continue
+
+    const parts = record.parts
+    if (Array.isArray(parts)) {
+      let collected = ""
+      for (const part of parts) {
+        if (!part || typeof part !== "object") continue
+        const p = part as Record<string, unknown>
+        if (typeof p.text === "string") collected += p.text
+        else if (typeof p.content === "string") collected += p.content
+      }
+      if (collected.length > 0) text = collected
+    } else if (typeof record.text === "string") {
+      text = record.text
+    } else if (typeof record.content === "string") {
+      text = record.content
+    }
+  }
+  return text
+}
+
 function msg(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function truncate(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max - 1)}...`
 }
 
 export { appendLog }

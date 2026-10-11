@@ -197,6 +197,51 @@ atomically and the terminal watches by mtime. Either half can restart without
 losing the other's view, and a change made headlessly shows up in the next
 terminal.
 
+## The loop
+
+`dont-stop-set start <prompt>` arms a loop on a session. It is driven by the
+session's own idle events, not by a timer: a turn finishes, the session goes
+idle, and `advance()` decides what happens next.
+
+```
+start                      -> plan, switch model, send opening prompt
+session.idle               -> advance()
+  count the iteration
+  read the last assistant turn
+  if completion sentinel   -> stop("task complete after N iterations")
+  if iteration budget spent -> stop("iteration budget reached")
+  if error budget spent     -> stop("stopping after N consecutive errors")
+  otherwise:
+    re-plan                 -> re-rank, sweep for a better/available model, switch
+    send the continue prompt -> session goes busy, hang clock re-arms
+```
+
+### Completion
+
+The loop cannot know on its own whether a task is finished — that is a judgement
+about the work, and only the entity doing it has the context. So the loop asks:
+every prompt is appended with an instruction to reply with exactly
+`<loop-complete/>` when, and only when, the task is genuinely done. Reading for
+it is deterministic and costs no extra model call, which an "is it done?" probe
+would.
+
+Two safety bounds stop a loop whose model never emits the sentinel:
+`maxIterations` (default 100) and the consecutive-error budget (5). A read
+failure is treated as *not complete*, so a broken message read runs the loop to
+its budget rather than halting it.
+
+### Re-planning between turns
+
+The re-plan before each continue prompt is what makes "continually evaluate on
+each turn" true. It re-ranks the catalogue under the current mode and switches
+the session if the answer changed — so a free model that becomes available is
+picked up on the next turn, and a model that was cooling down is retried once
+its cooldown expires.
+
+Idle between turns is the loop's normal state, not its end: the heartbeat stops
+killing the loop session on idle, and only untracks sessions that are not the
+loop's.
+
 ## Development
 
 ```
