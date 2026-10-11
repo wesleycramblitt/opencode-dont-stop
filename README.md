@@ -345,3 +345,20 @@ different questions. Parsed from three sources, most authoritative first:
 
 `M` units are honoured (421M is 0.421B). `weights.source` records which fired,
 so an unexplained size can be traced.
+
+## Terminal entrypoint
+
+`tui.tsx` is a separate entrypoint from `index.ts` (see `package.json` `exports`).
+It owns the footer status, the mode-cycling keymap, and the transition toasts.
+
+Two things about it are load-bearing and easy to get wrong:
+
+- **`keymap.layer` must be registered from inside a slot render, not from
+  `setup`.** It reads the keymap through a reactive context, so calling it
+  directly fails with `Keymap.Provider is missing` — the provider the read
+  resolves against does not exist yet. An `app` slot renders inside that tree,
+  so registration is deferred to its render and torn down with the slot.
+- **The layer needs an explicit `mode`.** Omitting it defaults to `base`; the
+  commands here are global, so the layer is registered as `mode: "global"`.
+
+`opencode-voice` follows the same pattern and is the reference implementation.

@@ -102,35 +102,57 @@ export default {
     // lib/modes.ts so repeated presses walk free -> cheap -> local -> power.
     const modeOrder: Mode[] = MODES.filter((m) => m !== "stop") as Mode[]
 
-    const disposeKeymap = ctx.keymap.layer({
-      commands: [
-        {
-          id: "dont-stop.cycle-mode",
-          title: "dont-stop: cycle mode",
-          description: "Cycle free, cheap, local, power",
-          group: "dont-stop",
-          suggested: true,
-          slash: { name: "dont-stop-toggle", arguments: true },
-          run: () => {
-            const state = read()
-            const index = modeOrder.indexOf(state.mode)
-            const next = modeOrder[(index + 1) % modeOrder.length]
-            writeMode(next)
-            toast(ctx, "info", "dont-stop", `mode: ${next} — ${describeMode(next)}`)
-          },
+    /**
+     * Register the keymap layer.
+     *
+     * `keymap.layer` reads the keymap through a reactive context, so it can
+     * only be called from inside the component tree — calling it from `setup`
+     * fails with "Keymap.Provider is missing", because the provider the read
+     * resolves against has not been established yet. An `app` slot renders
+     * inside that tree, so registration is deferred to its render function and
+     * torn down with the slot.
+     */
+    const commands = [
+      {
+        id: "dont-stop.cycle-mode",
+        title: "dont-stop: cycle mode",
+        description: "Cycle free, cheap, local, power",
+        group: "dont-stop",
+        suggested: true,
+        slash: { name: "dont-stop-toggle", arguments: true },
+        run: () => {
+          const state = read()
+          const index = modeOrder.indexOf(state.mode)
+          const next = modeOrder[(index + 1) % modeOrder.length]
+          writeMode(next)
+          toast(ctx, "info", "dont-stop", `mode: ${next} — ${describeMode(next)}`)
         },
-        {
-          id: "dont-stop.stop-loop",
-          title: "dont-stop: stop loop",
-          description: "Stop the running loop",
-          group: "dont-stop",
-          slash: { name: "dont-stop-halt", arguments: true },
-          run: () => {
-            writeLoop("stopped")
-            toast(ctx, "warning", "dont-stop", "loop stopped")
-          },
+      },
+      {
+        id: "dont-stop.stop-loop",
+        title: "dont-stop: stop loop",
+        description: "Stop the running loop",
+        group: "dont-stop",
+        slash: { name: "dont-stop-halt", arguments: true },
+        run: () => {
+          writeLoop("stopped")
+          toast(ctx, "warning", "dont-stop", "loop stopped")
         },
-      ],
+      },
+    ]
+
+    let disposeKeymap: (() => void) | undefined
+    const disposeKeymapSlot = ctx.ui.slot({
+      append: "app",
+      render: () => {
+        disposeKeymap = ctx.keymap.layer(() => ({
+          mode: "global",
+          priority: 10,
+          commands,
+          bindings: [],
+        }))
+        return null
+      },
     })
 
     /**
@@ -164,8 +186,11 @@ export default {
     return () => {
       clearInterval(timer)
       clearInterval(announceInterval)
+      // The layer is torn down with the slot that registered it, so unregister
+      // that too rather than calling a disposer that may never have run.
+      disposeKeymap?.()
+      if (typeof disposeKeymapSlot === "function") disposeKeymapSlot()
       disposeFooter()
-      disposeKeymap()
     }
   },
 }
