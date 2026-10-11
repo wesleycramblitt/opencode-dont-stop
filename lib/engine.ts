@@ -17,10 +17,11 @@
  *   Advancing, interrupting and rotating happen only there, so a second
  *   opencode process — or a fresh one after a restart — never adopts a loop
  *   it did not start, and an orphaned loop is halted rather than inherited.
- * - **A budget per failure, not per recovery.** Rotations are counted against
- *   completed turns, not against time: three rotations without a single
- *   finished turn means the task is stuck, not the model, and the loop stops
- *   instead of walking the chain forever.
+ * - **A budget per failure, not per recovery.** Every model gets one try per
+ *   episode — rotation moves to a model that has not been attempted since the
+ *   last completed turn, so a chain of ten is walked and then stops instead of
+ *   being cycled. Rotations are also counted against completed turns, so a
+ *   wide chain cannot buy an unbounded number of losing bets either.
  */
 
 import {
@@ -35,6 +36,7 @@ import {
   exportSummary,
   type AvailabilityPatch,
   type Catalogue,
+  type CatalogueModel,
   type Requirements,
 } from "./catalogue.ts"
 import {
@@ -87,7 +89,10 @@ export interface EngineOptions {
   instanceID?: string
   /** Rotations allowed without a completed turn. */
   maxRotations?: number
-  /** Delay between cancelling a hung turn and prompting again. */
+  /**
+   * Delay before re-driving the loop: after cancelling a hung turn, and
+   * before a second attempt on a model that just failed.
+   */
   redriveDelayMs?: number
   /** How long a model that hung stays out of the chain. */
   hangCooldownMs?: number
@@ -103,23 +108,26 @@ export const DEFAULT_MAX_ITERATIONS = 100
 
 /**
  * Rotations the loop may buy without a single completed turn before it gives
- * up.
+ * up — an absolute cap on top of the one-try-per-model rule.
  *
- * This is the bound that replaces "rotate forever". A rotation is a bet that
- * the *model* is the problem; three consecutive losing bets with no finished
- * turn in between is the evidence that it is not. Cheap enough that a genuine
- * model flake is still worked around, small enough that a stuck task stops.
+ * Rotation already refuses to revisit a model within an episode, so a chain of
+ * N gives at most N turns before it stops by itself. This cap exists for wide
+ * chains: it bounds how many *distinct* losing bets are worth making before
+ * concluding that the task, not the model, is stuck.
  */
-export const DEFAULT_MAX_ROTATIONS = 3
+export const DEFAULT_MAX_ROTATIONS = 10
 
 /**
- * How long to wait after cancelling a hung turn before prompting again.
+ * How long to wait before re-driving the loop — after cancelling a hung turn,
+ * or before a second attempt on a model that just failed.
  *
- * An aborted request does not emit the idle event the loop is normally driven
- * by, so without this the loop would sit silently forever after its first
- * hang — which is exactly what it did. The delay gives the host time to
- * settle the abort; if a real turn starts in the meantime, the redrive stands
- * down and the normal idle path takes over.
+ * Two situations, one delay, because both are "wait a moment and try again on
+ * this session" and neither wants to be tuned without the other. The hang case
+ * is the one that would otherwise be fatal: an aborted request never emits the
+ * idle event the loop is normally driven by, so without this the loop would
+ * sit silently forever after its first hang — which is exactly what it did.
+ * The delay gives the host time to settle the abort; if a real turn starts in
+ * the meantime, the redrive stands down and the normal idle path takes over.
  */
 export const DEFAULT_REDRIVE_DELAY_MS = 20_000
 
@@ -153,12 +161,44 @@ export const SENTINEL_INSTRUCTION =
  */
 export const CONTINUE_PROMPT = "Continue. If the task is now fully complete, reply with only " + COMPLETION_SENTINEL
 
+/**
+ * What a rotation attempt did.
+ *
+ * `"moved"` is the only success. `"exhausted"` and `"unavailable"` mean the
+ * chain has nothing left and the caller should stop the loop; `"not-ours"`
+ * means the session is not the loop's own and the caller should do nothing at
+ * all — which is why this is not a boolean, since those three failures want
+ * three different reactions.
+ */
+export type RotationOutcome = "moved" | "exhausted" | "unavailable" | "not-ours"
+
 export class LoopEngine {
   private catalogue: Catalogue | null = null
   private readonly tracked = new Map<string, TrackedSession>()
   private readonly clocks: ClockSet
   private rotation: Record<string, number> = {}
   private restrictions: Record<string, Requirements> = {}
+  /**
+   * Models that have already had a try since the last completed turn, keyed
+   * `provider/model`. Rotation only moves to an *untried* model, so a chain of
+   * ten gives ten tries and then stops instead of cycling through the same few
+   * forever. Unreachable and cooling-down models never enter this set: they are
+   * filtered out of the chain before rotation sees them, so they cost nothing.
+   */
+  private tried = new Set<string>()
+  /**
+   * Failures per model this episode, keyed `provider/model`. One is a flake
+   * worth a second attempt on the same model; two means rotate. Cleared with
+   * the episode.
+   */
+  private retries: Record<string, number> = {}
+  /**
+   * Whether the turn that just ended died of an error rather than completing.
+   * Cleared when a prompt is sent, so `advance` can tell a finished turn from
+   * an error that merely idled the session — only the former starts a fresh
+   * try budget, or a failing model would get an unlimited number of retries.
+   */
+  private turnFailed = false
 
   /**
    * This process's identity. Written into the state file as the loop's owner,
@@ -559,10 +599,11 @@ export class LoopEngine {
    * in-flight request is cancelled, then rotate to a different model: a model
    * that hangs is a property of the model, so the recovery is to change it.
    *
-   * Two bounds make this recovery instead of a spin. The hung model goes on
-   * cooldown so the chain actually moves rather than cycling back to it, and
-   * rotations are counted against completed turns: if the budget is spent, the
-   * task — not the model — is stuck and the loop stops buying.
+   * Three bounds make this recovery instead of a spin. The hung model goes on
+   * cooldown so the chain actually moves; rotation only ever picks a model that
+   * has not tried yet, so a small chain is walked rather than cycled; and
+   * rotations are counted against completed turns, so if the budget is spent
+   * the task — not the model — is stuck and the loop stops buying.
    */
   private async handleHang(sessionID: string, reason: string): Promise<void> {
     const loop = this.state.loop
@@ -584,7 +625,7 @@ export class LoopEngine {
     }
 
     const record = this.tracked.get(sessionID)
-    const previous = record?.model ? `${record.model.providerID}/${record.model.id}` : null
+    const previous = record?.model ? modelKeyOf(record.model) : null
 
     await this.interrupt(sessionID)
     this.clocks.clocksFor(sessionID).interrupted(Date.now())
@@ -600,7 +641,16 @@ export class LoopEngine {
       this.coolDown(previous, Date.now() + this.hangCooldownMs)
     }
 
-    this.rotate(sessionID, "hang")
+    const outcome = this.rotate(sessionID, "hang")
+    if (outcome !== "moved") {
+      // `"not-ours"` cannot happen — the loop was just checked — but if it
+      // ever does, stopping somebody else's loop would be worse than saying
+      // nothing.
+      if (outcome === "not-ours") return
+      this.log.warn(`no untried model left for ${sessionID}; stopping loop`)
+      await this.stop(this.exhaustedReason("a hang", outcome))
+      return
+    }
     current.rotations += 1
 
     // An aborted request never emits the idle event the loop is driven by, so
@@ -616,16 +666,21 @@ export class LoopEngine {
    *
    * Deliberately conservative: it fires once, at the deadline, and only while
    * the session is genuinely idle — if anything started a turn in the
-   * meantime, the normal idle path owns it and this does nothing.
+   * meantime, the normal idle path owns it and this does nothing. The
+   * deadline is *kept* rather than consumed in that case, so a re-drive
+   * scheduled behind a slow turn is not thrown away.
    */
   private async maybeRedrive(): Promise<void> {
     const at = this.redriveAt
     if (at === null || Date.now() < at) return
-    this.redriveAt = null
 
     const sessionID = this.state.loop.sessionID
-    if (!sessionID || !this.ownsLoop()) return
+    if (!sessionID || !this.ownsLoop()) {
+      this.redriveAt = null
+      return
+    }
     if (this.clocks.peek(sessionID)?.activity.running) return
+    this.redriveAt = null
 
     try {
       this.log.info(`re-driving ${sessionID} after a cancelled turn`)
@@ -764,12 +819,28 @@ export class LoopEngine {
     if (classified.kind === "interrupted") this.log.quiet("info", line)
     else this.log.warn(line)
 
-    if (action.cooldownMs > 0 && input.sessionID) {
-      const record = this.tracked.get(input.sessionID)
-      const key = record?.model ? `${record.model.providerID}/${record.model.id}` : null
-      if (key) {
-        this.state.cooldowns[key] = Date.now() + action.cooldownMs
-      }
+    const ownsThis = this.ownsLoop() && input.sessionID !== undefined &&
+      this.state.loop.sessionID === input.sessionID
+    const record = input.sessionID ? this.tracked.get(input.sessionID) : undefined
+    const key = record?.model ? modelKeyOf(record.model) : null
+
+    // The loop's turn just died: however the session ends up idling, that turn
+    // must not be counted as completed work.
+    if (ownsThis) this.turnFailed = true
+
+    // A retryable failure on the loop's own model is worth one more attempt on
+    // that same model before we spend a rotation: a dropped connection or a
+    // burst rate limit usually clears in seconds, and rotating loses the turn
+    // anyway. Everything else — a capability miss, an over-full context, an
+    // account with no money — fails the same way twice, so it rotates now.
+    const failures = key ? (this.retries[key] ?? 0) : 0
+    const willRetry = action.retry && ownsThis && key !== null && failures === 0
+
+    // A retried model must not be cooled down: the next attempt is aimed
+    // straight at it, and the cooldown would only take it out of the chain the
+    // retry is hoping to succeed on.
+    if (key && !willRetry && action.cooldownMs > 0) {
+      this.state.cooldowns[key] = Date.now() + action.cooldownMs
     }
 
     if (action.restrict) {
@@ -792,8 +863,21 @@ export class LoopEngine {
       this.state.consecutiveErrors = 0
     }
 
-    if (action.resweep && input.sessionID) {
-      this.rotate(input.sessionID, classified.kind)
+    if (willRetry && key) {
+      this.retries[key] = failures + 1
+      this.log.info(`retrying ${key} once after ${classified.kind} before rotating`)
+      // Nothing has changed on the session, so nothing will prompt it: the
+      // re-drive is what turns "retry" into an actual second attempt.
+      this.redriveAt = Date.now() + this.redriveDelayMs
+    } else if (action.resweep && input.sessionID && ownsThis) {
+      const outcome = this.rotate(input.sessionID, classified.kind)
+      // `"not-ours"` is a rotation that was never ours to make, and quietly
+      // does nothing — it is the one outcome that is not the loop running out
+      // of models, so it must not read as a reason to stop.
+      if (outcome !== "moved" && outcome !== "not-ours") {
+        await this.stop(this.exhaustedReason(classified.kind, outcome))
+        return action
+      }
     }
 
     this.emit()
@@ -820,37 +904,89 @@ export class LoopEngine {
   /* ------------------------------------------------------------- rotation */
 
   /**
-   * Move a session to the next model in its mode's chain. `cause` is logged
-   * and recorded so a rotation is always explicable after the fact.
+   * Move a session to the next model in its mode's chain that has not yet had
+   * a try since the last completed turn.
+   *
+   * The point is one try per model rather than cycling. The old form advanced a
+   * cursor and took whatever it landed on, so with three usable models a stuck
+   * task rotated through the same three forever — the exact loop this plugin
+   * exists to break. Now the models already tried are skipped, and a chain
+   * with nothing left to offer says so, which is the caller's signal to stop.
+   *
+   * The outcome is a string rather than a boolean because two of the four ways
+   * to move nothing mean opposite things: `"not-ours"` is a caller bug (or an
+   * error on a session the loop does not own) and must be ignored, while
+   * `"exhausted"` and `"unavailable"` are the loop running out of models and
+   * are the caller's signal to stop it.
    */
-  rotate(sessionID: string, cause: string): void {
+  rotate(sessionID: string, cause: string): RotationOutcome {
     // Only the loop's owner moves a session's model. Rotation from an error on
     // some other session — or from another instance watching the same file —
     // is this plugin reaching into work it was not asked to manage.
-    if (!this.ownsLoop() || this.state.loop.sessionID !== sessionID) return
+    if (!this.ownsLoop() || this.state.loop.sessionID !== sessionID) return "not-ours"
 
     const record = this.tracked.get(sessionID)
-    if (!record) return
+    if (!record) return "not-ours"
     const agent = record.agent
     const cursorKey = `${agent}:${this.state.mode}`
-    const cursor = (this.rotation[cursorKey] ?? 0) + 1
-    this.rotation[cursorKey] = cursor
 
-    if (!this.catalogue) return
+    if (!this.catalogue) return "unavailable"
     const ranked = rankForMode(this.catalogue, this.state.mode, this.taskFor(agent))
     if (ranked.length === 0) {
       this.log.warn(`no model left in the ${this.state.mode} chain for ${agent}`)
-      return
+      return "unavailable"
     }
-    const next = ranked[cursor % ranked.length]
-    record.model = slotFrom(next)
-    this.state.loop.lastResult = `rotated ${agent} to ${next.providerID}/${next.id} (${cause})`
+
+    // The model we are leaving has had its try; so has every model this cursor
+    // already passed. Walking from the cursor keeps rank order, so the next
+    // pick is the best model not yet attempted.
+    const cursor = this.rotation[cursorKey] ?? 0
+    if (record.model) this.tried.add(modelKeyOf(record.model))
+    let pick: CatalogueModel | null = null
+    let index = cursor
+    for (let step = 1; step <= ranked.length; step++) {
+      const candidate = ranked[(cursor + step) % ranked.length]
+      const candidateKey = `${candidate.providerID}/${candidate.id}`
+      if (this.tried.has(candidateKey)) continue
+      pick = candidate
+      index = (cursor + step) % ranked.length
+      break
+    }
+    if (!pick) {
+      this.state.loop.lastResult =
+        `every model in the ${this.state.mode} chain for ${agent} has had its try (${ranked.length} models)`
+      this.log.warn(this.state.loop.lastResult)
+      return "exhausted"
+    }
+
+    this.rotation[cursorKey] = index
+    record.model = slotFrom(pick)
+    this.tried.add(modelKeyOf(pick))
+    this.state.loop.lastResult = `rotated ${agent} to ${pick.providerID}/${pick.id} (${cause})`
     this.log.info(this.state.loop.lastResult)
 
     void applySessionModels(
       this.ctx as unknown as ApplyContext,
       [{ sessionID, model: record.model }],
       this.log,
+    )
+    return "moved"
+  }
+
+  /**
+   * Why a rotation found nothing to move to, for the stop reason.
+   *
+   * The two situations that end a loop the same way want different advice:
+   * every model having been tried is the task proving it cannot be finished by
+   * any of them, while an empty chain is a configuration problem.
+   */
+  private exhaustedReason(cause: string, outcome: RotationOutcome): string {
+    if (outcome === "unavailable") {
+      return `no model available in the ${this.state.mode} chain for this task`
+    }
+    return (
+      `every model in the ${this.state.mode} chain has had its try since the last ` +
+      `completed turn, after ${cause}; the task is stuck, not the model`
     )
   }
 
@@ -864,8 +1000,8 @@ export class LoopEngine {
     this.state.preferredMode = null
     this.rotation = {}
     this.state.consecutiveErrors = 0
-    // A new chain is a new bet, so the episode's rotation budget starts over.
-    this.state.loop.rotations = 0
+    // A new chain is a new bet, so the episode's try budget starts over.
+    this.resetEpisode()
     this.log.info(`mode set to ${mode}`)
     await this.refresh(true)
   }
@@ -883,7 +1019,9 @@ export class LoopEngine {
     this.log.warn(`degrading ${this.state.mode} -> ${next}: ${reason}`)
     this.state.mode = next
     this.rotation = {}
-    this.state.loop.rotations = 0
+    // A cheaper chain is a different set of models, so the episode's try budget
+    // starts over rather than inheriting the previous chain's verdicts.
+    this.resetEpisode()
     await this.refresh(true)
   }
 
@@ -923,8 +1061,11 @@ export class LoopEngine {
     try {
       this.state.loop.iterations += 1
       // Finished work is the evidence that the model was not the problem, so
-      // the rotation budget starts over.
-      this.state.loop.rotations = 0
+      // the episode's try budget starts over. A turn that merely *errored* into
+      // idleness does not count as finished — otherwise a failing model would
+      // clear its own failure count every time it gave up, and earn an
+      // unlimited number of retries.
+      if (!this.turnFailed) this.resetEpisode()
       const iteration = this.state.loop.iterations
       this.state.loop.lastResult = `iteration ${iteration} complete`
       this.emit()
@@ -980,10 +1121,27 @@ export class LoopEngine {
 
   /** Send one prompt to a session. */
   async sendPrompt(sessionID: string, text: string): Promise<void> {
+    // A prompt starts a turn, so whatever happened to the last one is settled.
+    // This is what lets `advance` tell "the turn finished" from "the turn
+    // errored into idleness".
+    this.turnFailed = false
     const session = this.ctx as unknown as {
       session: { prompt(input: { sessionID: string; text: string }): Promise<unknown> }
     }
     await session.session.prompt({ sessionID, text })
+  }
+
+  /**
+   * Start a fresh episode: forget which models have had their try and how many
+   * times each has failed.
+   *
+   * Called when a turn completes — progress is what earns the models another
+   * chance — and when the chain itself changes, since a new chain is a new bet.
+   */
+  private resetEpisode(): void {
+    this.tried.clear()
+    this.retries = {}
+    this.state.loop.rotations = 0
   }
 
   /**
@@ -1117,6 +1275,7 @@ export class LoopEngine {
     }
     this.state.consecutiveErrors = 0
     this.redriveAt = null
+    this.resetEpisode()
     // Announce ownership in the control plane, so every other instance reads
     // this loop as somebody else's and leaves it alone.
     this.appliedIntent = bumpIntent(this.state, "start").seq
@@ -1162,6 +1321,8 @@ export class LoopEngine {
     loop.ownerBeatAt = 0
     loop.rotations = 0
     this.redriveAt = null
+    // The episode's try budget belongs to a loop that is over.
+    this.resetEpisode()
 
     // Announce the halt on the control plane: bumping the sequence is what
     // lets this survive a status write that raced it, and tells every other
@@ -1199,6 +1360,15 @@ export class LoopEngine {
  */
 function visionWanted(kind: AgentKind): boolean {
   return kind === "architect" || kind === "explore"
+}
+
+/**
+ * The `provider/model` identity used for cooldowns, tried-sets and retry
+ * counts. One function because the same string is built in four places and a
+ * typo in any of them silently splits one model's bookkeeping into two.
+ */
+function modelKeyOf(model: { providerID: string; id: string }): string {
+  return `${model.providerID}/${model.id}`
 }
 
 function agentKind(agent: string): AgentKind {

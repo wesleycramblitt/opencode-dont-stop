@@ -47,6 +47,13 @@ export interface ErrorAction {
   restrict: null | "no-vision" | "no-tools" | "text-only"
   /** Stop the loop outright. */
   stop: boolean
+  /**
+   * The *same* model could plausibly succeed on a second attempt, so the loop
+   * retries it once before rotating. False for failures that are facts about
+   * the model — a capability miss, an exceeded context, a deleted model —
+   * where a second attempt would only cost time.
+   */
+  retry: boolean
   /** Short explanation for status output. */
   reason: string
 }
@@ -149,6 +156,7 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
         degrade: false,
         restrict: null,
         stop: false,
+        retry: false,
         reason: "request interrupted; not a model failure",
       }
 
@@ -159,6 +167,8 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
         degrade: true,
         restrict: null,
         stop: false,
+        // The account is out of money: a second attempt fails the same way.
+        retry: false,
         reason: "insufficient funds; degrading to a cheaper mode",
       }
 
@@ -170,6 +180,9 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
         degrade: false,
         restrict: null,
         stop: false,
+        // Rate limits are usually short windows: one more attempt is cheaper
+        // than handing the turn to another model.
+        retry: true,
         reason: "rate limited; rotating to the next model",
       }
 
@@ -183,6 +196,7 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
         degrade: false,
         restrict: restrictionFor(error.message),
         stop: false,
+        retry: false,
         reason: "model lacks a required capability; restricting the pool",
       }
 
@@ -193,6 +207,7 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
         degrade: false,
         restrict: null,
         stop: false,
+        retry: false,
         reason: "context exceeded; rotating to a larger-context model",
       }
 
@@ -204,6 +219,7 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
         degrade: false,
         restrict: null,
         stop: false,
+        retry: false,
         reason: "model not found; rotating past it",
       }
 
@@ -216,16 +232,19 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
         degrade: true,
         restrict: null,
         stop: false,
+        retry: false,
         reason: "authorization failed; rotating to another provider",
       }
 
     case "network":
       return {
         cooldownMs: 15 * 1000,
-        resweep: false,
+        resweep: true,
         degrade: false,
         restrict: null,
         stop: false,
+        // A dropped connection is the most transient thing there is.
+        retry: true,
         reason: "network error; will retry shortly",
       }
 
@@ -237,6 +256,8 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
         degrade: false,
         restrict: null,
         stop: false,
+        // Unclassified is a guess; one attempt turns a guess into evidence.
+        retry: true,
         reason: "unclassified error; rotating",
       }
   }

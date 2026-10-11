@@ -149,10 +149,15 @@ it are where the old design spun:
 - The loop **re-drives itself** 20s later, because the abort removed the idle
   event the loop is normally driven by — without that, one hang silently ended
   the loop's progress while leaving it "active".
-- Rotations are budgeted at 3 **per completed turn**. Three models in a row
-  with no finished turn between them means the task, not the model, is stuck,
-  and the loop stops rather than walking the chain forever.
-- After three interrupts with nothing finished, the loop stops escalating.
+- **Every model gets one try per turn.** Rotation moves to a model that has not
+  been attempted since the last completed turn, so a chain of ten is walked once
+  and then stops instead of cycling through the same three forever. Models that
+  are unreachable or cooling down are filtered out before this point, so they
+  never consume a try.
+- Rotations are additionally budgeted at 10 **per completed turn**, so a wide
+  chain cannot buy an unbounded number of losing bets either.
+- When the chain is spent, or three interrupts have gone by with nothing
+  finished, the loop stops escalating and says which of the two it was.
 
 Hang recovery only ever touches the session the loop is driving. Any other
 session — including the user's own — is never interrupted or re-modelled by
@@ -160,19 +165,23 @@ this plugin.
 
 ## Errors
 
-Classification is regex + HTTP status, applied before any recovery path:
+Classification is regex + HTTP status, applied before any recovery path. The
+`retry` column is one retry **per model per turn**: a failure that could plausibly
+clear on its own gets a second attempt on the same model before a rotation is
+spent on it, and a second failure rotates. Everything that is a fact about the
+model rotates at once, because a second attempt would only cost time.
 
-| Kind | Trigger | Action |
-| --- | --- | --- |
-| `interrupted` | our own interrupt, a user escape, a cancelled request | nothing: not a failure, no cooldown, no rotation |
-| `funds` | insufficient balance / quota | cooldown 1h, degrade to a cheaper mode |
-| `rate` | 429, rate limit, throttling | cooldown 1m, rotate, re-sweep |
-| `capability` | model lacks a required capability | cooldown 5m, restrict the pool |
-| `context` | context window exceeded | rotate to a larger-context model |
-| `notfound` | model gone or deprecated | cooldown 24h, rotate past |
-| `auth` | 401/403, bad key | cooldown 15m, rotate to another provider |
-| `network` | timeout, reset, DNS | cooldown 15s, retry |
-| `other` | unclassified | cooldown 30s, counts toward the 5-error stop budget |
+| Kind | Trigger | Retry | Action |
+| --- | --- | --- | --- |
+| `interrupted` | our own interrupt, a user escape, a cancelled request | — | nothing: not a failure, no cooldown, no rotation |
+| `funds` | insufficient balance / quota | no | cooldown 1h, degrade to a cheaper mode |
+| `rate` | 429, rate limit, throttling | yes | cooldown 1m, rotate, re-sweep |
+| `capability` | model lacks a required capability | no | cooldown 5m, restrict the pool |
+| `context` | context window exceeded | no | rotate to a larger-context model |
+| `notfound` | model gone or deprecated | no | cooldown 24h, rotate past |
+| `auth` | 401/403, bad key | no | cooldown 15m, rotate to another provider |
+| `network` | timeout, reset, DNS | yes | cooldown 15s, retry |
+| `other` | unclassified | yes | cooldown 30s, counts toward the 5-error stop budget |
 
 `interrupted` leads the pattern list on purpose. The loop's own hang recovery
 produces exactly this error — "tool interrupted" — and scoring it as an
@@ -236,7 +245,9 @@ idle, and `advance()` decides what happens next.
 ```
 start                      -> plan, switch model, send opening prompt
 session.idle               -> advance()  (only in the owning instance)
-  count the iteration, clear the rotation budget
+  count the iteration
+  if the turn completed    -> reset the try budget (models tried, failures)
+  if the turn merely errored into idleness, the budget survives it
   read the last assistant turn
   if completion sentinel   -> stop("task complete after N iterations")
   if iteration budget spent -> stop("iteration budget reached")
@@ -284,7 +295,8 @@ would.
 
 Three safety bounds stop a loop whose model never emits the sentinel:
 `maxIterations` (default 100), the consecutive-error budget (5), and the
-rotation budget (3 model swaps without a completed turn). A read failure is
+rotation budget — one try per model, capped at 10 model swaps without a
+completed turn. A read failure is
 treated as *not complete*, so a broken message read runs the loop to its
 budget rather than halting it.
 
