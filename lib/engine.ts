@@ -34,6 +34,15 @@ import {
 } from "./modes.ts"
 import { actionFor, classify, type ClassifiedError, type ErrorAction } from "./errors.ts"
 import { ClockSet, DEFAULT_CLOCKS, lifecycleOf, progressKindOf, type ClockOptions } from "./clocks.ts"
+import {
+  DEFAULT_HANDOFF_THRESHOLD,
+  handoff,
+  measureContext,
+  shouldHandoff,
+  transcriptFrom,
+  type HandoffContext,
+} from "./handoff.ts"
+import { handoffDirectory } from "./state.ts"
 import { applyAgentDefaults, applySessionModels, sameSlot, slotFrom, type ApplyContext, type ModelPlan } from "./apply.ts"
 import type { Logger } from "./log.ts"
 import { appendLog, type Mode, type ModelSlot, type PluginState } from "./state.ts"
@@ -58,6 +67,10 @@ export interface EngineOptions {
   maxIterations?: number
   /** Token the model emits to declare the task finished. */
   completionSentinel?: string
+  /** Fraction of the context window at which to start a fresh session. */
+  handoffThreshold?: number
+  /** Where handoff summaries are written. */
+  handoffDirectory?: string
 }
 
 /**
@@ -103,6 +116,8 @@ export class LoopEngine {
 
   private readonly maxIterations: number
   private readonly sentinel: string
+  private readonly handoffThreshold: number
+  private readonly handoffDirectory: string
   /** Guards against sending two prompts for one idle event. */
   private advancing = false
 
@@ -115,6 +130,8 @@ export class LoopEngine {
     this.clocks = new ClockSet(options.clocks ?? DEFAULT_CLOCKS, log)
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS
     this.sentinel = options.completionSentinel ?? COMPLETION_SENTINEL
+    this.handoffThreshold = options.handoffThreshold ?? DEFAULT_HANDOFF_THRESHOLD
+    this.handoffDirectory = options.handoffDirectory ?? handoffDirectory()
     for (const id of options.seedSessions ?? []) {
       this.track(id)
     }
@@ -642,13 +659,25 @@ export class LoopEngine {
         return
       }
 
+      // Hand off before continuing when the context window is spent. This is
+      // deliberately after the completion check and before the next prompt: a
+      // handoff mid-turn would destroy the work in flight, and doing it at all
+      // is only safe once the session has been idle long enough to know no
+      // subagent is still writing into it.
+      const handoff = await this.checkHandoff(sessionID)
+      if (handoff === "handed-off") return
+
       // Re-plan before continuing, so the next turn runs on the current best
       // model rather than whatever happened to be selected earlier.
       await this.refresh(false)
 
       await this.sendPrompt(sessionID, CONTINUE_PROMPT)
       this.clocks.clocksFor(sessionID).start(Date.now())
-      this.state.loop.lastResult = `iteration ${iteration} done; continuing`
+      // A deferred handoff is worth surfacing: the loop is continuing on a
+      // window that is already past its threshold, and the reason (usually a
+      // live subagent) is the thing a user would want to know.
+      const deferred = handoff === "deferred" ? ` (handoff deferred: ${this.state.loop.lastResult ?? "unknown"})` : ""
+      this.state.loop.lastResult = `iteration ${iteration} done; continuing${deferred}`
       this.log.info(`loop iteration ${iteration} complete; continuing`)
       this.emit()
     } catch (error) {
@@ -689,6 +718,91 @@ export class LoopEngine {
       this.log.quiet("info", `could not read messages for ${sessionID}: ${msg(error)}`)
       return ""
     }
+  }
+
+  /**
+   * Hand off to a fresh session when this one has spent enough of its context.
+   *
+   * Returns "handed-off" when the loop now runs on a new session, "deferred"
+   * when a handoff was wanted but unsafe (a subagent is still live, or the
+   * summary could not be written), and "not-needed" when the window still has
+   * room. A deferral is not an error: the caller continues in the current
+   * session and the next turn tries again, which is why a busy subagent merely
+   * delays the handoff rather than losing it.
+   */
+  private async checkHandoff(sessionID: string): Promise<"handed-off" | "deferred" | "not-needed"> {
+    const limit = this.contextLimitFor(sessionID)
+    if (limit <= 0) return "not-needed"
+
+    const used = await this.contextUsed(sessionID)
+    if (used <= 0) return "not-needed"
+    if (!shouldHandoff(used, limit, this.handoffThreshold)) return "not-needed"
+
+    this.log.info(`context ${used}/${limit} (${Math.round((used / limit) * 100)}%); handing off`)
+
+    try {
+      const messages = await this.readMessages(sessionID)
+      const { turns, files } = transcriptFrom(messages)
+      const record = this.tracked.get(sessionID)
+
+      const result = await handoff(this.ctx as unknown as HandoffContext, {
+        sessionID,
+        task: this.state.loop.prompt,
+        iterations: this.state.loop.iterations,
+        reason: `Context reached ${Math.round((used / limit) * 100)}% of a ${limit}-token window.`,
+        transcript: turns,
+        files,
+      }, { directory: this.handoffDirectory, agent: record?.agent })
+
+      if (!result.handed) {
+        this.state.loop.lastResult = result.deferred ?? "unknown"
+        this.log.warn(`handoff deferred: ${result.deferred ?? "unknown"}`)
+        this.emit()
+        return "deferred"
+      }
+
+      // The successor session carries the loop forward; the old one is done.
+      const newSessionID = result.newSessionID!
+      this.untrack(sessionID)
+      this.track(newSessionID, record?.agent ?? "general")
+      this.state.loop.sessionID = newSessionID
+      this.state.loop.lastResult = `handed off to ${newSessionID} (summary: ${result.summaryFile})`
+      this.log.info(`handed off to ${newSessionID}; summary at ${result.summaryFile}`)
+      this.clocks.clocksFor(newSessionID).start(Date.now())
+      this.emit()
+      return "handed-off"
+    } catch (error) {
+      this.log.warn(`handoff failed: ${msg(error)}`)
+      this.state.loop.lastResult = `handoff failed: ${msg(error)}`
+      this.emit()
+      return "deferred"
+    }
+  }
+
+  /** The context window of the session's current model, or 0 when unknown. */
+  private contextLimitFor(sessionID: string): number {
+    const slot = this.tracked.get(sessionID)?.model
+    if (!slot || !this.catalogue) return 0
+    const row = this.catalogue.byKey.get(`${slot.providerID}/${slot.id}`)
+      ?? this.catalogue.byKey.get(`${slot.providerID}/${slot.id}#${slot.variant ?? ""}`)
+    return row?.context ?? 0
+  }
+
+  /** Tokens of context the session has consumed. */
+  private async contextUsed(sessionID: string): Promise<number> {
+    try {
+      const messages = await this.readMessages(sessionID)
+      return measureContext(messages)
+    } catch {
+      return 0
+    }
+  }
+
+  private async readMessages(sessionID: string): Promise<unknown> {
+    const api = this.ctx as unknown as {
+      session: { context(input: { sessionID: string }): Promise<unknown> }
+    }
+    return api.session.context({ sessionID })
   }
 
   /* -------------------------------------------------------- loop lifecycle */

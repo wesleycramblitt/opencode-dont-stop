@@ -63,6 +63,11 @@ export interface PluginState {
   updated: number
 }
 
+/** Where handoff summaries are written, beside the state file. */
+export function handoffDirectory(): string {
+  return join(homedir(), ".config", "opencode", "dont-stop", "handoffs")
+}
+
 export function statePath(): string {
   return join(homedir(), ".config", "opencode", "dont-stop-state.json")
 }

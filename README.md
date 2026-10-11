@@ -242,6 +242,40 @@ Idle between turns is the loop's normal state, not its end: the heartbeat stops
 killing the loop session on idle, and only untracks sessions that are not the
 loop's.
 
+## Context handoff
+
+Replaces a compaction plugin. When a session has consumed enough of its model's
+context window, the loop closes it and starts a fresh session seeded from a
+written summary, so work continues instead of erroring out mid-prompt.
+
+Three properties make it safe where a compaction plugin was not:
+
+1. **Between turns, never during one.** The only entry point is the completion
+   path — after the task is judged finished, before the next prompt. A handoff
+   mid-turn would destroy the work in flight.
+2. **It refuses while subagents are live.** A subagent is a child session;
+   handing the parent off under one orphans the child's context and leaves it
+   writing into a session that no longer exists. The walk is transitive —
+   grandchildren count — and a deferral delays the handoff rather than losing
+   it; the next turn retries.
+3. **The threshold is the model's own window.** A 128k model and a 1M model do
+   not hand off at the same token count, so the fraction (default 0.5) is
+   applied to the context size of the model actually in use.
+
+Context usage is read from the last assistant message's reported `tokens.input`
+plus cache reads — the prompt size the provider actually measured. It is never
+estimated from text length, which would be wrong by a factor of several.
+
+The summary is written *before* the new session is created, so a write failure
+leaves the original session untouched and the loop continues in place. The new
+session is seeded with a pointer to the file rather than its contents, because
+the point is to start with a small window.
+
+The summary is deterministic rather than model-written: the task verbatim, the
+recent turns verbatim, older turns condensed to one line each, and the files
+touched (read from tool-call parts). A model-written summary would be better
+prose and would have a failure mode that loses the session.
+
 ## Development
 
 ```
