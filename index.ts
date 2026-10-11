@@ -116,21 +116,19 @@ export default {
               type: props?.error?.type,
             })
           } else if (event.type === "session.idle") {
-            // The session finished a turn. When a loop is running this is the
-            // point where it continues rather than ends; with no loop running
-            // it is just a counter bump for the status display.
-            if (state.loop.status === "active") {
-              const sid = (event.properties?.info as { id?: string } | undefined)?.id
-                ?? (event.properties?.sessionID as string | undefined)
-                ?? state.loop.sessionID
-              if (sid !== null && sid === state.loop.sessionID) {
-                await engine.advance(sid)
-                persist()
-                continue
-              }
+            // The session finished a turn. When this is the loop's own session
+            // this is the point where it continues rather than ends.
+            // `advance` counts the iteration itself, and it ignores anything
+            // that is not the loop it owns — a subagent going idle, or an idle
+            // event in an instance that is not driving the loop, must not
+            // touch the counter.
+            const sid = (event.properties?.info as { id?: string } | undefined)?.id
+              ?? (event.properties?.sessionID as string | undefined)
+              ?? state.loop.sessionID
+            if (sid !== null && sid === state.loop.sessionID) {
+              await engine.advance(sid)
+              persist()
             }
-            engine.completeIteration()
-            persist()
           }
         }
       } catch (error) {
@@ -142,9 +140,11 @@ export default {
 
     /* ------------------------------------------------------- state file watch */
 
-    // The TUI writes this file to request a mode change or a loop. Only the
+    // The TUI writes this file to request a mode change or a halt. Only the
     // fields it can legitimately initiate are reconciled; the engine's own
-    // writes already describe the engine and are ignored.
+    // writes already describe the engine and are ignored. Loop control rides
+    // on the sequenced intent rather than the status fields, so a request
+    // cannot be lost to a status write that happened to land after it.
     let settle: ReturnType<typeof setTimeout> | undefined
     const watcher = watch(dirname(statePath()), (_event, filename) => {
       if (filename && basename(filename) !== basename(statePath())) return
@@ -164,52 +164,20 @@ export default {
         persist()
       }
 
-      const loop = incoming.loop
-      if (loop?.status === "active" && state.loop.status !== "active") {
-        const sessionID = loop.sessionID ?? newestTracked()
-        const prompt = loop.prompt || resolvePrompt(loop)
-        if (sessionID && prompt) {
-          await engine.start(sessionID, prompt)
-          persist()
-        } else {
-          log.warn("cannot start the loop: no session or no prompt")
-        }
-      } else if (loop?.status === "stopped" && state.loop.status === "active") {
-        await engine.stop(loop.lastResult ?? "stopped from the state file")
-        persist()
-      }
-    }
-
-    /** A prompt may arrive as text or as a `--prompt-file` reference. */
-    function resolvePrompt(loop: { prompt?: string }): string {
-      const prompt = loop.prompt ?? ""
-      const match = /^\s*--prompt-file[=\s]+(.+)$/m.exec(prompt)
-      if (match) {
-        try {
-          return readPromptFile(match[1].trim())
-        } catch (error) {
-          log.error(messageOf(error))
-          return ""
-        }
-      }
-      return prompt
-    }
-
-    function newestTracked(): string | null {
-      let newest: string | null = null
-      let at = 0
-      for (const record of engine.trackedSessions()) {
-        if (record.lastSeen > at) {
-          at = record.lastSeen
-          newest = record.sessionID
-        }
-      }
-      return newest
+      // Loop control no longer comes from the status fields — those are the
+      // engine's report and were being overwritten by whichever writer ran
+      // last, which is how a halt could be lost within a heartbeat. It comes
+      // from the intent, which is merged by sequence number and therefore
+      // survives the race.
+      await engine.applyIntent()
+      persist()
     }
 
     /* ------------------------------------------------------------- startup */
 
-    log.info(`dont-stop starting in ${state.mode} mode (${describeMode(state.mode)})`)
+    log.info(
+      `dont-stop starting in ${state.mode} mode (${describeMode(state.mode)}) as instance ${engine.instanceID}`,
+    )
 
     // Agents from agents/*.md are not in the registry when a transform first
     // registers, so replay the transform once they have loaded.
@@ -227,6 +195,10 @@ export default {
 
     void engine
       .discover()
+      // A loop left active in the state file belongs to an instance that is
+      // gone. It is halted here rather than resumed: a loop is a live
+      // conversation in another process, and this one never started it.
+      .then(() => engine.reapOrphanedLoop())
       .then(() => engine.refresh(true))
       .catch((error) => log.warn(`startup discovery failed: ${messageOf(error)}`))
 
@@ -313,7 +285,7 @@ export function runCommand(raw: string, env: CommandEnv): string {
 
   if (verb === "stop") {
     void engine.stop(rest.join(" ").trim() || "stopped by command").then(persist)
-    return "loop stopped"
+    return "halting the loop: its in-flight turn is cancelled and every instance stops driving it"
   }
 
   if (verb === "probe" || verb === "discover") {
@@ -361,9 +333,15 @@ function formatStatus(state: PluginState, engine: LoopEngine): string {
   const lines = [
     `dont-stop — mode ${state.mode}${state.degraded ? ` (degraded from ${state.preferredMode})` : ""}`,
     `  ${describeMode(state.mode)}`,
-    `  loop: ${state.loop.status}${state.loop.sessionID ? ` on ${state.loop.sessionID}` : ""}`,
+    `  loop: ${state.loop.status}${state.loop.sessionID ? ` on ${state.loop.sessionID}` : ""}${state.loop.owner ? ` (owner ${state.loop.owner})` : ""}`,
     `  iterations: ${state.loop.iterations}`,
   ]
+  if (state.loop.rotations > 0) {
+    lines.push(`  rotations without a completed turn: ${state.loop.rotations}`)
+  }
+  if (state.intent && state.intent.action !== "none") {
+    lines.push(`  intent: ${state.intent.action} #${state.intent.seq}`)
+  }
   if (state.loop.prompt) lines.push(`  prompt: ${truncate(state.loop.prompt, 60)}`)
   if (state.loop.lastResult) lines.push(`  last: ${state.loop.lastResult}`)
   if (state.main) lines.push(`  main model: ${state.main.providerID}/${state.main.id}`)

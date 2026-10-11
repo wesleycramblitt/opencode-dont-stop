@@ -135,8 +135,8 @@ export default {
         group: "dont-stop",
         slash: { name: "dont-stop-halt", arguments: true },
         run: () => {
-          writeLoop("stopped")
-          toast(ctx, "warning", "dont-stop", "loop stopped")
+          requestHalt()
+          toast(ctx, "warning", "dont-stop", "halt requested")
         },
       },
     ]
@@ -173,9 +173,20 @@ export default {
       for (const listener of listeners) listener()
     }
 
-    function writeLoop(status: "active" | "stopped"): void {
+    /**
+     * Ask the loop to stop.
+     *
+     * The terminal does not own the loop's status: the engine reports it and
+     * rewrites the whole file on every heartbeat, so writing `loop.status`
+     * directly was a request that could be — and was — overwritten before it
+     * was read. An intent is the opposite shape. It carries a sequence number,
+     * every writer merges intents by that number instead of last-write-wins,
+     * and the engine applies a halt it has not already acted on. The request
+     * therefore outlives the race that used to swallow it.
+     */
+    function requestHalt(): void {
       const state = readState()
-      state.loop.status = status
+      state.intent = { seq: state.intent.seq + 1, action: "halt", at: Date.now() }
       state.updated = Date.now()
       writeState(state)
       snapshot = state
@@ -217,16 +228,27 @@ function DontStopFooter(props: FooterProps): JSX.Element {
 
   const iterations = loop.iterations
   const degraded = state.degraded ? "!" : ""
+  // A halt is a request, not an event: the status keeps reading "active" until
+  // the owning instance applies it, so the pending request is what the footer
+  // shows in the meantime — otherwise a halt looks like it did nothing.
+  const halting =
+    loop.status === "active" &&
+    state.intent.action === "halt" &&
+    state.intent.at > (loop.startedAt ?? 0)
 
   return (
     <box flexDirection="row" gap={1}>
       <text fg="magenta">◍</text>
       <text fg="cyan">{mode}{degraded}</text>
       {loop.status === "active" ? (
-        <>
-          <text fg="green">⟳ {iterations}</text>
-          {state.main ? <text fg="gray">{state.main.providerID}/{state.main.id}</text> : null}
-        </>
+        halting ? (
+          <text fg="yellow">halting…</text>
+        ) : (
+          <>
+            <text fg="green">⟳ {iterations}</text>
+            {state.main ? <text fg="gray">{state.main.providerID}/{state.main.id}</text> : null}
+          </>
+        )
       ) : (
         <text fg="gray">idle</text>
       )}

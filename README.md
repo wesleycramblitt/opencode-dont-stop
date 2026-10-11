@@ -138,8 +138,25 @@ Three clocks, failing differently:
   is running and totally silent does.
 
 That distinction is the point: the hang clock catches the stuck request, not
-the long one. After three interrupts without recovery it stops escalating
-rather than destroying work.
+the long one. Interrupting is only the first step, though, and the steps after
+it are where the old design spun:
+
+- The interrupt **disarms the clock**. An aborted request never emits the
+  completion event that would have disarmed it, so a clock that kept claiming
+  a request was in flight re-fired every 3 minutes forever.
+- The hung model goes on a 10-minute cooldown, so the chain actually moves
+  instead of cycling back to the model that just hung.
+- The loop **re-drives itself** 20s later, because the abort removed the idle
+  event the loop is normally driven by — without that, one hang silently ended
+  the loop's progress while leaving it "active".
+- Rotations are budgeted at 3 **per completed turn**. Three models in a row
+  with no finished turn between them means the task, not the model, is stuck,
+  and the loop stops rather than walking the chain forever.
+- After three interrupts with nothing finished, the loop stops escalating.
+
+Hang recovery only ever touches the session the loop is driving. Any other
+session — including the user's own — is never interrupted or re-modelled by
+this plugin.
 
 ## Errors
 
@@ -147,6 +164,7 @@ Classification is regex + HTTP status, applied before any recovery path:
 
 | Kind | Trigger | Action |
 | --- | --- | --- |
+| `interrupted` | our own interrupt, a user escape, a cancelled request | nothing: not a failure, no cooldown, no rotation |
 | `funds` | insufficient balance / quota | cooldown 1h, degrade to a cheaper mode |
 | `rate` | 429, rate limit, throttling | cooldown 1m, rotate, re-sweep |
 | `capability` | model lacks a required capability | cooldown 5m, restrict the pool |
@@ -155,6 +173,12 @@ Classification is regex + HTTP status, applied before any recovery path:
 | `auth` | 401/403, bad key | cooldown 15m, rotate to another provider |
 | `network` | timeout, reset, DNS | cooldown 15s, retry |
 | `other` | unclassified | cooldown 30s, counts toward the 5-error stop budget |
+
+`interrupted` leads the pattern list on purpose. The loop's own hang recovery
+produces exactly this error — "tool interrupted" — and scoring it as an
+unclassified failure is what sent recovery into a spin: one interrupt bought a
+rotation, the rotation got interrupted, and the loop paid for its own
+recovery.
 
 A capability error pins the session to a pool that avoids the missing
 capability (`no-vision`, `no-tools`, `text-only`) rather than merely cooling the
@@ -197,6 +221,12 @@ atomically and the terminal watches by mtime. Either half can restart without
 losing the other's view, and a change made headlessly shows up in the next
 terminal.
 
+The file carries two kinds of field and they are not written the same way.
+Everything the engine reports is a *status*: last-write-wins, because any
+writer's copy is as good as another's. The `intent` is a *control message*:
+it carries a sequence number and writers merge it by that number, so an
+instruction survives the race with the status writes around it.
+
 ## The loop
 
 `dont-stop-set start <prompt>` arms a loop on a session. It is driven by the
@@ -205,8 +235,8 @@ idle, and `advance()` decides what happens next.
 
 ```
 start                      -> plan, switch model, send opening prompt
-session.idle               -> advance()
-  count the iteration
+session.idle               -> advance()  (only in the owning instance)
+  count the iteration, clear the rotation budget
   read the last assistant turn
   if completion sentinel   -> stop("task complete after N iterations")
   if iteration budget spent -> stop("iteration budget reached")
@@ -215,6 +245,33 @@ session.idle               -> advance()
     re-plan                 -> re-rank, sweep for a better/available model, switch
     send the continue prompt -> session goes busy, hang clock re-arms
 ```
+
+### Ownership and halting
+
+Several opencode processes can be open at once, and each loads this plugin.
+So a loop records the **instance** that started it and only that instance
+advances, interrupts or rotates it. Everywhere else the loop is reported, not
+driven — which is why opening a new opencode no longer resumes a loop that was
+running somewhere else.
+
+Two mechanisms enforce it:
+
+- **Owner heartbeat.** The owning instance stamps `loop.ownerBeatAt` every
+  beat. Three missed beats means the owner is gone, and an orphaned loop is
+  halted on the spot rather than inherited: a loop is a conversation with
+  requests in flight in another process, and it cannot be resumed by whoever
+  reads the file next.
+- **Intent, not status.** Halting goes through `state.intent`, a control
+  message carrying a sequence number. Every writer merges intents by that
+  number, so a halt survives a heartbeat rewriting the rest of the file — the
+  lost update that used to make `/dont-stop-halt` announce a stop that never
+  took. The heartbeat also re-reads the intent, so the worst case for "stop
+  now" is one 30s beat even when the file watcher loses the race.
+
+`stop()` always cancels the in-flight turn and drops the session's clocks,
+even when the status already reads "stopped": that cleanup is what actually
+ends the interrupt-and-rotate cycle, and skipping it (as it once did) left the
+behaviour running behind a status that said otherwise.
 
 ### Completion
 
@@ -225,10 +282,11 @@ every prompt is appended with an instruction to reply with exactly
 it is deterministic and costs no extra model call, which an "is it done?" probe
 would.
 
-Two safety bounds stop a loop whose model never emits the sentinel:
-`maxIterations` (default 100) and the consecutive-error budget (5). A read
-failure is treated as *not complete*, so a broken message read runs the loop to
-its budget rather than halting it.
+Three safety bounds stop a loop whose model never emits the sentinel:
+`maxIterations` (default 100), the consecutive-error budget (5), and the
+rotation budget (3 model swaps without a completed turn). A read failure is
+treated as *not complete*, so a broken message read runs the loop to its
+budget rather than halting it.
 
 ### Re-planning between turns
 
@@ -351,7 +409,7 @@ so an unexplained size can be traced.
 `tui.tsx` is a separate entrypoint from `index.ts` (see `package.json` `exports`).
 It owns the footer status, the mode-cycling keymap, and the transition toasts.
 
-Two things about it are load-bearing and easy to get wrong:
+Three things about it are load-bearing and easy to get wrong:
 
 - **`keymap.layer` must be registered from inside a slot render, not from
   `setup`.** It reads the keymap through a reactive context, so calling it
@@ -360,5 +418,10 @@ Two things about it are load-bearing and easy to get wrong:
   so registration is deferred to its render and torn down with the slot.
 - **The layer needs an explicit `mode`.** Omitting it defaults to `base`; the
   commands here are global, so the layer is registered as `mode: "global"`.
+- **`dont-stop-halt` writes an intent, not a status.** The engine rewrites the
+  loop's status on every heartbeat, so a terminal that wrote
+  `loop.status = "stopped"` was racing a writer that could not see it. The
+  footer shows `halting…` while the request is pending, because the status
+  legitimately still reads `active` until the owning instance applies it.
 
 `opencode-voice` follows the same pattern and is the reference implementation.

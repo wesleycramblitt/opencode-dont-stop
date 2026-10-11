@@ -109,15 +109,31 @@ export class SessionClocks {
     this.activity.lastSeen = now
   }
 
-  /** The session finished its request. */
+  /**
+   * The session finished its request.
+   *
+   * A completed turn is proof the model recovered, so the hang budget resets
+   * here. `hangs` therefore counts *consecutive* hangs with nothing finished
+   * between them, which is the only number worth stopping a loop over.
+   */
   finish(now: number): void {
     this.activity.running = false
+    this.activity.hangs = 0
     this.activity.lastSeen = now
   }
 
-  /** A hang interrupt was delivered. */
+  /**
+   * A hang interrupt was delivered.
+   *
+   * The request is *cancelled*, so the clock stops claiming one is running:
+   * leaving `running` true is what turned a single stuck turn into a hang
+   * every `hangMs` forever — no completion event ever arrives for a request
+   * that was aborted, so the clock never disarmed and re-fired on its own
+   * stale belief. A later `start()` re-arms it when a real turn begins.
+   */
   interrupted(now: number): void {
     this.activity.hangs += 1
+    this.activity.running = false
     this.activity.lastProgress = now
     this.activity.lastSeen = now
   }
@@ -191,6 +207,11 @@ export class ClockSet {
   /** Drop a session's clocks when it goes away. */
   forget(sessionID: string): void {
     this.sessions.delete(sessionID)
+  }
+
+  /** A session's clocks, without creating them. */
+  peek(sessionID: string): SessionClocks | undefined {
+    return this.sessions.get(sessionID)
   }
 
   get size(): number {

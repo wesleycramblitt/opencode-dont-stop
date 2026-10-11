@@ -15,6 +15,7 @@ import type { Catalogue } from "./catalogue.ts"
 import type { Mode } from "./state.ts"
 
 export type ErrorKind =
+  | "interrupted"
   | "funds"
   | "rate"
   | "capability"
@@ -60,8 +61,14 @@ interface Pattern {
  * Ordered most-specific first: the first match wins, so a message that says
  * both "rate limit" and "insufficient funds" is judged by whichever pattern
  * appears earlier here.
+ *
+ * `interrupted` leads: a cancelled request is the loop's own doing (or the
+ * user's), and scoring it as a failure is what used to send recovery into a
+ * spin — the interrupt that unstuck a turn came back as an "unclassified
+ * error" and bought another rotation.
  */
 const PATTERNS: Pattern[] = [
+  { kind: "interrupted", test: /\binterrupt(ed|ion|ing)?\b|\baborted?\b|cancel(led|ed)/i, transient: true },
   { kind: "funds", test: /insufficient[ _-]?(funds|balance|credit|quota)|billing|payment required|no credits|exceeded your (current )?quota/i, transient: false },
   { kind: "rate", test: /rate ?limit|too many requests|429|slow down|throttl|retry after|quota exceeded for|resource exhausted/i, transient: true },
   { kind: "context", test: /context ?(length|window|limit)|maximum context|too long|prompt is too (long|large)|exceeds? (the )?max(imum)? context|tokens? (exceed|limit)/i, transient: false },
@@ -80,6 +87,9 @@ const STATUS_KINDS: Record<number, ErrorKind> = {
   413: "context",
   429: "rate",
   402: "funds",
+  // 499 is the conventional "client closed request": it can only be our own
+  // interrupt, so it is not the model's fault and must not trigger recovery.
+  499: "interrupted",
 }
 
 /** Classify an error from the session retry hook or a caught exception. */
@@ -97,7 +107,8 @@ export function classify(input: {
 
   // The provider's declared error type is the strongest signal.
   if (type) {
-    if (/fund|billing|credit|quota|payment/.test(type)) kind = "funds"
+    if (/interrupt|abort|cancel/.test(type)) kind = "interrupted"
+    else if (/fund|billing|credit|quota|payment/.test(type)) kind = "funds"
     else if (/rate|throttl|limit/.test(type)) kind = "rate"
     else if (/context|length|token/.test(type)) kind = "context"
     else if (/capab|modality|support|vision|tool/.test(type)) kind = "capability"
@@ -119,13 +130,28 @@ export function classify(input: {
     }
   }
 
-  const transient = kind === "rate" || kind === "network" || kind === "other"
+  const transient = kind === "rate" || kind === "network" || kind === "other" || kind === "interrupted"
   return { kind, message, status, transient }
 }
 
 /** Decide what to do about a classified error, given the current mode. */
 export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
   switch (error.kind) {
+    case "interrupted":
+      // Not a failure. The request was cancelled — by this plugin's own hang
+      // recovery, or by the user pressing escape. Cooldowns and rotation are
+      // what made a single interrupt spin into several: the same model got
+      // re-selected, got interrupted again, and the loop never learned
+      // anything. Do nothing but record it.
+      return {
+        cooldownMs: 0,
+        resweep: false,
+        degrade: false,
+        restrict: null,
+        stop: false,
+        reason: "request interrupted; not a model failure",
+      }
+
     case "funds":
       return {
         cooldownMs: 60 * 60 * 1000,
@@ -285,6 +311,7 @@ export function countsTowardStop(error: ClassifiedError): boolean {
 /** Short human description of an error kind, for logs and status. */
 export function describeError(kind: ErrorKind): string {
   switch (kind) {
+    case "interrupted": return "request interrupted"
     case "funds": return "insufficient funds"
     case "rate": return "rate limited"
     case "context": return "context exceeded"

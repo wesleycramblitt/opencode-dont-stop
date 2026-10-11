@@ -9,6 +9,18 @@
  * Lifecycle: `start()` arms the loop on a session, the heartbeat evaluates it
  * on the interval, events feed the clocks and the session tracker, and
  * `stop()` disarms it.
+ *
+ * Two rules keep it from running away, and both come from the same idea —
+ * *the loop may only touch what it owns*:
+ *
+ * - **Ownership.** A loop belongs to the instance that started it (`owner`).
+ *   Advancing, interrupting and rotating happen only there, so a second
+ *   opencode process — or a fresh one after a restart — never adopts a loop
+ *   it did not start, and an orphaned loop is halted rather than inherited.
+ * - **A budget per failure, not per recovery.** Rotations are counted against
+ *   completed turns, not against time: three rotations without a single
+ *   finished turn means the task is stuck, not the model, and the loop stops
+ *   instead of walking the chain forever.
  */
 
 import {
@@ -45,7 +57,7 @@ import {
 import { handoffDirectory } from "./state.ts"
 import { applyAgentDefaults, applySessionModels, sameSlot, slotFrom, type ApplyContext, type ModelPlan } from "./apply.ts"
 import type { Logger } from "./log.ts"
-import { appendLog, type Mode, type ModelSlot, type PluginState } from "./state.ts"
+import { bumpIntent, readState, type Mode, type ModelSlot, type PluginState } from "./state.ts"
 
 /** A session the engine is tracking for the loop. */
 export interface TrackedSession {
@@ -71,6 +83,14 @@ export interface EngineOptions {
   handoffThreshold?: number
   /** Where handoff summaries are written. */
   handoffDirectory?: string
+  /** Identifies this process as the loop's owner. Generated when omitted. */
+  instanceID?: string
+  /** Rotations allowed without a completed turn. */
+  maxRotations?: number
+  /** Delay between cancelling a hung turn and prompting again. */
+  redriveDelayMs?: number
+  /** How long a model that hung stays out of the chain. */
+  hangCooldownMs?: number
 }
 
 /**
@@ -80,6 +100,34 @@ export interface EngineOptions {
  * sentinel, and this exists so a model that never emits it cannot run forever.
  */
 export const DEFAULT_MAX_ITERATIONS = 100
+
+/**
+ * Rotations the loop may buy without a single completed turn before it gives
+ * up.
+ *
+ * This is the bound that replaces "rotate forever". A rotation is a bet that
+ * the *model* is the problem; three consecutive losing bets with no finished
+ * turn in between is the evidence that it is not. Cheap enough that a genuine
+ * model flake is still worked around, small enough that a stuck task stops.
+ */
+export const DEFAULT_MAX_ROTATIONS = 3
+
+/**
+ * How long to wait after cancelling a hung turn before prompting again.
+ *
+ * An aborted request does not emit the idle event the loop is normally driven
+ * by, so without this the loop would sit silently forever after its first
+ * hang — which is exactly what it did. The delay gives the host time to
+ * settle the abort; if a real turn starts in the meantime, the redrive stands
+ * down and the normal idle path takes over.
+ */
+export const DEFAULT_REDRIVE_DELAY_MS = 20_000
+
+/** How long a model that hung stays out of the chain (10 minutes). */
+export const DEFAULT_HANG_COOLDOWN_MS = 10 * 60_000
+
+/** Heartbeat intervals an owner may miss before its loop counts as orphaned. */
+export const LEASE_GRACE_BEATS = 3
 
 /**
  * The completion sentinel.
@@ -111,15 +159,30 @@ export class LoopEngine {
   private readonly clocks: ClockSet
   private rotation: Record<string, number> = {}
   private restrictions: Record<string, Requirements> = {}
-  private running = false
-  private abort = new AbortController()
+
+  /**
+   * This process's identity. Written into the state file as the loop's owner,
+   * it is what lets a second instance — or a new one after a restart — know
+   * that a loop it finds on disk belongs to somebody else.
+   */
+  readonly instanceID: string
+  /** Newest control intent this engine has acted on, so its own are not replayed. */
+  private appliedIntent: number
+  /** Deadline for re-driving the loop after a cancelled turn, or null. */
+  private redriveAt: number | null = null
+  /** Guards against sending two prompts for one idle event. */
+  private advancing = false
+  /** Whether a foreign loop has already been reported, so it is said once. */
+  private reportedForeignLoop = false
 
   private readonly maxIterations: number
   private readonly sentinel: string
   private readonly handoffThreshold: number
   private readonly handoffDirectory: string
-  /** Guards against sending two prompts for one idle event. */
-  private advancing = false
+  private readonly maxRotations: number
+  private readonly redriveDelayMs: number
+  private readonly hangCooldownMs: number
+  private readonly leaseGraceMs: number
 
   constructor(
     private readonly ctx: ApplyContext,
@@ -127,11 +190,18 @@ export class LoopEngine {
     private readonly log: Logger,
     private readonly options: EngineOptions = {},
   ) {
-    this.clocks = new ClockSet(options.clocks ?? DEFAULT_CLOCKS, log)
+    const clocks = options.clocks ?? DEFAULT_CLOCKS
+    this.clocks = new ClockSet(clocks, log)
+    this.instanceID = options.instanceID ?? newInstanceID()
+    this.appliedIntent = state.intent?.seq ?? 0
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS
     this.sentinel = options.completionSentinel ?? COMPLETION_SENTINEL
     this.handoffThreshold = options.handoffThreshold ?? DEFAULT_HANDOFF_THRESHOLD
     this.handoffDirectory = options.handoffDirectory ?? handoffDirectory()
+    this.maxRotations = options.maxRotations ?? DEFAULT_MAX_ROTATIONS
+    this.redriveDelayMs = options.redriveDelayMs ?? DEFAULT_REDRIVE_DELAY_MS
+    this.hangCooldownMs = options.hangCooldownMs ?? DEFAULT_HANG_COOLDOWN_MS
+    this.leaseGraceMs = clocks.intervalMs * LEASE_GRACE_BEATS
     for (const id of options.seedSessions ?? []) {
       this.track(id)
     }
@@ -153,6 +223,19 @@ export class LoopEngine {
 
   trackedSessions(): TrackedSession[] {
     return [...this.tracked.values()]
+  }
+
+  /**
+   * May this instance drive the loop right now?
+   *
+   * The single gate for every loop action — advancing, interrupting, rotating,
+   * re-driving. A loop is a live conversation with requests in flight, so it
+   * cannot be resumed by whoever reads the state file next; only its owner
+   * acts, and everyone else reports.
+   */
+  ownsLoop(): boolean {
+    const loop = this.state.loop
+    return loop.status === "active" && loop.sessionID !== null && loop.owner === this.instanceID
   }
 
   /* ------------------------------------------------------------ attribution */
@@ -393,6 +476,9 @@ export class LoopEngine {
     for (const entry of plan.sessions) {
       const record = this.tracked.get(entry.sessionID)
       if (!record) continue
+      // The loop session belongs to its owner alone: another instance planning
+      // a different model for it would fight the one actually driving it.
+      if (entry.sessionID === this.state.loop.sessionID && !this.ownsLoop()) continue
       if (!force && record.model && sameSlot(record.model, entry.model)) continue
       needsSwitch.push(entry)
     }
@@ -419,13 +505,27 @@ export class LoopEngine {
 
   /** One heartbeat: re-plan, apply, and judge the clocks. */
   async beat(): Promise<void> {
-    this.clocks.beat(Date.now())
+    const now = Date.now()
+    this.clocks.beat(now)
+
+    // The control plane first. A halt written by the TUI — or by another
+    // instance — is applied here even when the file watcher lost the race to
+    // a status write, so the worst case for "stop now" is one heartbeat.
+    // One read serves both: they are two views of the same file.
+    const onDisk = readState()
+    await this.applyIntent(onDisk)
+    await this.reapOrphanedLoop(onDisk)
 
     // Re-evaluate on the interval, per the power/free/cheap mode contracts.
     await this.refresh(false)
 
-    const verdicts = this.clocks.evaluate(Date.now())
-    for (const { sessionID, verdict, exhausted } of verdicts) {
+    if (this.ownsLoop()) {
+      this.state.loop.ownerBeatAt = now
+      await this.maybeRedrive()
+    }
+
+    const verdicts = this.clocks.evaluate(now)
+    for (const { sessionID, verdict } of verdicts) {
       if (verdict.action === "idle") {
         // A non-loop session going idle is simply untracked. The loop session
         // is *not* stopped here: idle between turns is the loop's normal state,
@@ -439,11 +539,12 @@ export class LoopEngine {
       }
 
       if (verdict.action === "hang") {
-        if (exhausted) {
-          this.log.warn(`session ${sessionID} still hung after repeated interrupts; stopping loop`)
-          this.stop(`session ${sessionID} unresponsive after repeated interrupts`)
-          return
-        }
+        // Only the loop's own session is ours to rescue. Interrupting a
+        // session nobody asked this plugin to manage is how a hang detector
+        // becomes something that kills unrelated work — including the very
+        // turn the user is watching.
+        if (sessionID !== this.state.loop.sessionID) continue
+        if (!this.ownsLoop()) continue
         await this.handleHang(sessionID, verdict.reason)
       }
     }
@@ -457,20 +558,186 @@ export class LoopEngine {
    * A running session producing no progress at all. Interrupt it so the
    * in-flight request is cancelled, then rotate to a different model: a model
    * that hangs is a property of the model, so the recovery is to change it.
+   *
+   * Two bounds make this recovery instead of a spin. The hung model goes on
+   * cooldown so the chain actually moves rather than cycling back to it, and
+   * rotations are counted against completed turns: if the budget is spent, the
+   * task — not the model — is stuck and the loop stops buying.
    */
   private async handleHang(sessionID: string, reason: string): Promise<void> {
+    const loop = this.state.loop
     this.log.warn(`hang detected on ${sessionID}: ${reason}`)
+
+    if (loop.rotations >= this.maxRotations) {
+      this.log.warn(`session ${sessionID} still hung after ${loop.rotations} model swaps; stopping loop`)
+      await this.stop(
+        `${this.maxRotations} model rotations without a completed turn on ${sessionID}; ` +
+          `the task is stuck, not the model`,
+      )
+      return
+    }
+
+    if (this.clocks.peek(sessionID)?.exhausted()) {
+      this.log.warn(`session ${sessionID} still hung after repeated interrupts; stopping loop`)
+      await this.stop(`session ${sessionID} unresponsive after repeated interrupts`)
+      return
+    }
+
+    const record = this.tracked.get(sessionID)
+    const previous = record?.model ? `${record.model.providerID}/${record.model.id}` : null
+
+    await this.interrupt(sessionID)
     this.clocks.clocksFor(sessionID).interrupted(Date.now())
 
+    // The await above yields the thread, and a halt may have landed in it.
+    // Re-read the loop and re-check ownership rather than rotating a loop
+    // that was stopped while the interrupt was in flight.
+    const current = this.state.loop
+    if (!this.ownsLoop() || current.sessionID !== sessionID) return
+
+    if (previous) {
+      this.state.cooldowns[previous] = Date.now() + this.hangCooldownMs
+      this.coolDown(previous, Date.now() + this.hangCooldownMs)
+    }
+
+    this.rotate(sessionID, "hang")
+    current.rotations += 1
+
+    // An aborted request never emits the idle event the loop is driven by, so
+    // without a scheduled re-drive the loop would go silent right here. The
+    // heartbeat picks this up; `maybeRedrive` stands down if a real turn
+    // started in the meantime.
+    this.redriveAt = Date.now() + this.redriveDelayMs
+    this.emit()
+  }
+
+  /**
+   * Re-drive the loop when its last turn was cancelled rather than completed.
+   *
+   * Deliberately conservative: it fires once, at the deadline, and only while
+   * the session is genuinely idle — if anything started a turn in the
+   * meantime, the normal idle path owns it and this does nothing.
+   */
+  private async maybeRedrive(): Promise<void> {
+    const at = this.redriveAt
+    if (at === null || Date.now() < at) return
+    this.redriveAt = null
+
+    const sessionID = this.state.loop.sessionID
+    if (!sessionID || !this.ownsLoop()) return
+    if (this.clocks.peek(sessionID)?.activity.running) return
+
+    try {
+      this.log.info(`re-driving ${sessionID} after a cancelled turn`)
+      await this.sendPrompt(sessionID, CONTINUE_PROMPT)
+      this.clocks.clocksFor(sessionID).start(Date.now())
+    } catch (error) {
+      await this.stop(`could not continue the loop: ${msg(error)}`)
+    }
+  }
+
+  /** Best-effort cancellation of an in-flight request. */
+  private async interrupt(sessionID: string): Promise<void> {
     try {
       await (this.ctx.session as unknown as { interrupt(input: { sessionID: string }): Promise<unknown> })
         .interrupt({ sessionID })
     } catch (error) {
       this.log.warn(`interrupt failed for ${sessionID}: ${msg(error)}`)
     }
+  }
 
-    this.rotate(sessionID, "hang")
-    this.emit()
+  /* ------------------------------------------------------- control intents */
+
+  /**
+   * Act on a control intent newer than the last one this engine handled.
+   *
+   * Intents live in the state file and are merged by sequence number, so a
+   * halt written by the TUI cannot be erased by a heartbeat that rewrote
+   * everything else in the file — the exact lost update that made
+   * `/dont-stop-halt` announce a stop that never happened.
+   *
+   * `halt` binds every instance: everybody stops driving. `start` binds only
+   * the instance that can see the session it names, which is how a loop is
+   * never adopted by a process it does not belong to.
+   */
+  async applyIntent(onDisk: PluginState = readState()): Promise<void> {
+    const intent = onDisk.intent
+    if (!intent || intent.seq <= this.appliedIntent) return
+    this.appliedIntent = intent.seq
+    this.state.intent = intent
+
+    if (intent.action === "halt") {
+      if (this.state.loop.status !== "active") return
+      this.log.info(`halt requested (intent ${intent.seq})`)
+      await this.stop(`halted by intent ${intent.seq}`)
+      return
+    }
+
+    if (intent.action === "start" && this.state.loop.status !== "active") {
+      const loop = onDisk.loop
+      if (!loop.sessionID || !loop.prompt) return
+      if (!this.tracked.has(loop.sessionID)) {
+        this.log.info(`ignoring start intent ${intent.seq}: ${loop.sessionID} is served by another instance`)
+        return
+      }
+      await this.start(loop.sessionID, loop.prompt)
+    }
+  }
+
+  /**
+   * Halt a loop whose owner instance is gone, and otherwise report the loop
+   * the owner actually has.
+   *
+   * A loop is a conversation in another process; when that process dies the
+   * file still says "active", and every later instance would otherwise treat
+   * it as live work. The owner's heartbeat is the lease: miss three beats and
+   * the loop is orphaned, and an orphaned loop is stopped, not inherited.
+   *
+   * The lease is judged from the file, not from this instance's memory of it:
+   * a non-owner's copy only ages while the owner keeps writing, so deciding
+   * from memory would eventually orphan a loop that is alive and beating.
+   * Ownership is the one field where memory wins — if either copy says this
+   * instance owns the loop, the file is behind and the function stands down.
+   */
+  async reapOrphanedLoop(onDisk: PluginState = readState()): Promise<void> {
+    const memory = this.state.loop
+    const disk = onDisk.loop
+
+    // Ours in either copy: this instance writes the lease, so memory is the
+    // fresher copy and a lagging file must never overwrite it.
+    if (memory.owner === this.instanceID || disk.owner === this.instanceID) return
+
+    // Not ours: the file is the truth to report — the owner writes it, and
+    // our copy only ages.
+    if (
+      disk.status !== memory.status ||
+      disk.sessionID !== memory.sessionID ||
+      disk.owner !== memory.owner ||
+      disk.ownerBeatAt !== memory.ownerBeatAt
+    ) {
+      this.state.loop = { ...memory, ...disk }
+    }
+
+    if (disk.status !== "active") return
+
+    const beatAt = disk.ownerBeatAt ?? 0
+    if (beatAt > 0 && Date.now() - beatAt <= this.leaseGraceMs) {
+      // Someone else's live loop. Say so once — a footer that reads "active"
+      // in a process doing nothing is otherwise a mystery.
+      if (!this.reportedForeignLoop) {
+        this.reportedForeignLoop = true
+        this.log.info(
+          `a loop is running on ${disk.sessionID} under instance ${disk.owner}; this instance reports but does not drive it`,
+        )
+      }
+      return
+    }
+
+    this.log.warn(
+      `loop on ${disk.sessionID ?? "unknown session"} is orphaned ` +
+        `(owner ${disk.owner ?? "none"} last beat ${beatAt > 0 ? `${Math.round((Date.now() - beatAt) / 1000)}s` : "never"} ago)`,
+    )
+    await this.stop("loop orphaned: the instance running it is gone")
   }
 
   /* ---------------------------------------------------------------- errors */
@@ -490,7 +757,12 @@ export class LoopEngine {
     const classified = classify(input)
     const action = actionFor(classified, this.state.mode)
 
-    this.log.warn(`${classified.kind}${input.sessionID ? ` on ${input.sessionID}` : ""}: ${classified.message || describe(classified)}`)
+    const where = input.sessionID ? ` on ${input.sessionID}` : ""
+    const line = `${classified.kind}${where}: ${classified.message || describe(classified)}`
+    // An interrupted request is the recovery working, not a failure; logging
+    // it as one buries the real errors in noise.
+    if (classified.kind === "interrupted") this.log.quiet("info", line)
+    else this.log.warn(line)
 
     if (action.cooldownMs > 0 && input.sessionID) {
       const record = this.tracked.get(input.sessionID)
@@ -513,7 +785,7 @@ export class LoopEngine {
     if (this.consecutive(classified)) {
       this.state.consecutiveErrors += 1
       if (this.state.consecutiveErrors >= 5) {
-        this.stop(`too many consecutive errors: ${this.state.consecutiveErrors}`)
+        await this.stop(`too many consecutive errors: ${this.state.consecutiveErrors}`)
         return action
       }
     } else {
@@ -552,6 +824,11 @@ export class LoopEngine {
    * and recorded so a rotation is always explicable after the fact.
    */
   rotate(sessionID: string, cause: string): void {
+    // Only the loop's owner moves a session's model. Rotation from an error on
+    // some other session — or from another instance watching the same file —
+    // is this plugin reaching into work it was not asked to manage.
+    if (!this.ownsLoop() || this.state.loop.sessionID !== sessionID) return
+
     const record = this.tracked.get(sessionID)
     if (!record) return
     const agent = record.agent
@@ -587,6 +864,8 @@ export class LoopEngine {
     this.state.preferredMode = null
     this.rotation = {}
     this.state.consecutiveErrors = 0
+    // A new chain is a new bet, so the episode's rotation budget starts over.
+    this.state.loop.rotations = 0
     this.log.info(`mode set to ${mode}`)
     await this.refresh(true)
   }
@@ -604,6 +883,7 @@ export class LoopEngine {
     this.log.warn(`degrading ${this.state.mode} -> ${next}: ${reason}`)
     this.state.mode = next
     this.rotation = {}
+    this.state.loop.rotations = 0
     await this.refresh(true)
   }
 
@@ -633,29 +913,35 @@ export class LoopEngine {
    */
   async advance(sessionID: string): Promise<void> {
     if (this.advancing) return
-    if (this.state.loop.status !== "active") return
+    if (!this.ownsLoop()) return
     if (this.state.loop.sessionID !== sessionID) return
 
     this.advancing = true
+    // A real turn completed, so any pending re-drive of a cancelled one is
+    // stale: this idle event is the driver now.
+    this.redriveAt = null
     try {
       this.state.loop.iterations += 1
+      // Finished work is the evidence that the model was not the problem, so
+      // the rotation budget starts over.
+      this.state.loop.rotations = 0
       const iteration = this.state.loop.iterations
       this.state.loop.lastResult = `iteration ${iteration} complete`
       this.emit()
 
       if (iteration >= this.maxIterations) {
-        this.stop(`iteration budget reached (${iteration})`)
+        await this.stop(`iteration budget reached (${iteration})`)
         return
       }
 
       const lastText = await this.lastAssistantText(sessionID)
       if (lastText.includes(this.sentinel)) {
-        this.stop(`task complete after ${iteration} iterations`)
+        await this.stop(`task complete after ${iteration} iterations`)
         return
       }
 
       if (this.state.consecutiveErrors >= 5) {
-        this.stop(`stopping after ${this.state.consecutiveErrors} consecutive errors`)
+        await this.stop(`stopping after ${this.state.consecutiveErrors} consecutive errors`)
         return
       }
 
@@ -684,7 +970,7 @@ export class LoopEngine {
       this.log.error(`advance failed on ${sessionID}: ${msg(error)}`)
       this.state.consecutiveErrors += 1
       if (this.state.consecutiveErrors >= 5) {
-        this.stop(`stopping after ${this.state.consecutiveErrors} consecutive loop errors`)
+        await this.stop(`stopping after ${this.state.consecutiveErrors} consecutive loop errors`)
       }
       this.emit()
     } finally {
@@ -808,6 +1094,15 @@ export class LoopEngine {
   /* -------------------------------------------------------- loop lifecycle */
 
   async start(sessionID: string, prompt: string): Promise<void> {
+    const loop = this.state.loop
+    if (loop.status === "active" && loop.owner !== this.instanceID) {
+      this.log.warn(
+        `a loop is already running on ${loop.sessionID} under instance ${loop.owner ?? "none"}; ` +
+          `stop it before starting another`,
+      )
+      return
+    }
+
     this.track(sessionID)
     this.state.loop = {
       status: "active",
@@ -816,9 +1111,15 @@ export class LoopEngine {
       iterations: 0,
       startedAt: Date.now(),
       lastResult: null,
+      owner: this.instanceID,
+      ownerBeatAt: Date.now(),
+      rotations: 0,
     }
     this.state.consecutiveErrors = 0
-    this.running = true
+    this.redriveAt = null
+    // Announce ownership in the control plane, so every other instance reads
+    // this loop as somebody else's and leaves it alone.
+    this.appliedIntent = bumpIntent(this.state, "start").seq
     this.clocks.clocksFor(sessionID).start(Date.now())
     this.log.info(`loop started on ${sessionID}: ${prompt.slice(0, 80)}`)
 
@@ -833,57 +1134,51 @@ export class LoopEngine {
       this.clocks.clocksFor(sessionID).start(Date.now())
     } catch (error) {
       this.log.error(`could not send the opening prompt: ${msg(error)}`)
-      this.stop(`failed to send the opening prompt: ${msg(error)}`)
+      await this.stop(`failed to send the opening prompt: ${msg(error)}`)
       return
     }
     this.emit()
   }
 
+  /**
+   * Disarm the loop and clean up after it, whether or not it was running.
+   *
+   * The cleanup is the point. The old form returned early when the status was
+   * already "stopped", which silently dropped the two things that actually end
+   * the *behaviour*: the in-flight request is cancelled, and the session's
+   * clocks are dropped so the hang detector stops judging a turn nobody is
+   * waiting on. Halting appeared to work — the status flipped — while the
+   * interrupt-and-rotate cycle it was meant to end kept firing.
+   */
   async stop(reason: string): Promise<void> {
-    if (this.state.loop.status === "stopped") return
-    this.state.loop.status = "stopped"
-    this.state.loop.lastResult = reason
-    this.state.loop.sessionID = null
-    this.running = false
-    this.log.info(`loop stopped: ${reason}`)
+    const loop = this.state.loop
+    const wasActive = loop.status === "active"
+    const sessionID = loop.sessionID
+
+    loop.status = "stopped"
+    loop.lastResult = reason
+    loop.sessionID = null
+    loop.owner = null
+    loop.ownerBeatAt = 0
+    loop.rotations = 0
+    this.redriveAt = null
+
+    // Announce the halt on the control plane: bumping the sequence is what
+    // lets this survive a status write that raced it, and tells every other
+    // instance the loop is over rather than merely idle.
+    this.appliedIntent = bumpIntent(this.state, "halt").seq
+
+    if (sessionID) {
+      const clocks = this.clocks.peek(sessionID)
+      if (clocks?.activity.running) await this.interrupt(sessionID)
+      // Forget the clocks, keep the session: a dropped session would make the
+      // next `start` fail with "no session to run the loop on" until the user
+      // happened to talk to it again.
+      this.clocks.forget(sessionID)
+    }
+
+    if (wasActive) this.log.info(`loop stopped: ${reason}`)
     this.emit()
-  }
-
-  /** One completed iteration. Called by the engine's driver. */
-  completeIteration(): void {
-    this.state.loop.iterations += 1
-    this.emit()
-  }
-
-  /* --------------------------------------------------------------- plumbing */
-
-  /** Subscribe to server events and pump them into `observe`. */
-  consume(events: AsyncIterable<{ type: string; properties?: Record<string, unknown> }>): Promise<void> {
-    return (async () => {
-      try {
-        for await (const event of events) {
-          this.observe(event)
-          if (event.type === "session.error" || event.type === "message.error") {
-            const props = event.properties as
-              | { info?: { id?: string }; sessionID?: string; error?: { message?: string; status?: number; type?: string } }
-              | undefined
-            await this.onError({
-              sessionID: props?.sessionID ?? props?.info?.id,
-              message: props?.error?.message,
-              status: props?.error?.status,
-              type: props?.error?.type,
-            })
-          }
-          if (event.type === "session.idle" && this.running) {
-            this.completeIteration()
-          }
-        }
-      } catch (error) {
-        if (!this.abort.signal.aborted) {
-          this.log.warn(`event consumer stopped: ${msg(error)}`)
-        }
-      }
-    })()
   }
 
   /** Persist and notify. */
@@ -990,8 +1285,13 @@ function msg(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function truncate(value: string, max: number): string {
-  return value.length <= max ? value : `${value.slice(0, max - 1)}...`
+/**
+ * A per-process identity for the loop's owner field.
+ *
+ * Deliberately opaque and never persisted in code: the only thing that
+ * matters is that two opencode instances cannot produce the same one, so a
+ * loop can never look like it belongs to the process reading it.
+ */
+function newInstanceID(): string {
+  return `${process.pid}-${Math.random().toString(36).slice(2, 10)}`
 }
-
-export { appendLog }

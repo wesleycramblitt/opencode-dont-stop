@@ -37,6 +37,34 @@ export interface LoopState {
   iterations: number
   startedAt: number | null
   lastResult: string | null
+  /**
+   * The instance (opencode process) allowed to drive this loop. A loop is a
+   * live conversation with in-flight requests, so it cannot be picked up by
+   * whoever reads the file next; only the instance that started it advances,
+   * interrupts and rotates. An empty owner means nobody may drive it.
+   */
+  owner: string | null
+  /** The owner's last heartbeat. A loop whose owner stopped beating is orphaned. */
+  ownerBeatAt: number
+  /** Model rotations bought since the last completed turn. */
+  rotations: number
+}
+
+/**
+ * A control request, separate from the status it affects.
+ *
+ * Everything else in this file is *reporting*: the engine writes what is true
+ * and any writer may overwrite it. An intent is an *instruction*, so it must
+ * survive being overwritten by a status write that raced it. That is what the
+ * sequence number is for: writers merge intents by `seq` instead of last-write
+ * wins, so a halt is never lost — and a writer that has already acted on a
+ * sequence ignores the replay of its own request.
+ */
+export interface Intent {
+  /** Monotonic across every writer. The highest `seq` is the newest word. */
+  seq: number
+  action: "none" | "start" | "halt"
+  at: number
 }
 
 export interface Cooldowns {
@@ -50,6 +78,8 @@ export interface PluginState {
   degraded: boolean
   preferredMode: Mode | null
   loop: LoopState
+  /** The newest control instruction. Written by any half, applied by the owner. */
+  intent: Intent
   /** The main session's model. */
   main: ModelSlot | null
   /** Per-agent-type model assignments, keyed by agent id. */
@@ -85,7 +115,11 @@ export function initialState(): PluginState {
       iterations: 0,
       startedAt: null,
       lastResult: null,
+      owner: null,
+      ownerBeatAt: 0,
+      rotations: 0,
     },
+    intent: { seq: 0, action: "none", at: 0 },
     main: null,
     agentModels: {},
     rotation: {},
@@ -117,6 +151,7 @@ export function readState(): PluginState {
 function mergeState(base: PluginState, patch: Partial<PluginState>): PluginState {
   const next: PluginState = { ...base, ...patch }
   next.loop = { ...base.loop, ...(patch.loop ?? {}) }
+  next.intent = { ...base.intent, ...(patch.intent ?? {}) }
   next.agentModels = { ...patch.agentModels }
   next.rotation = { ...patch.rotation }
   next.cooldowns = { ...patch.cooldowns }
@@ -124,11 +159,20 @@ function mergeState(base: PluginState, patch: Partial<PluginState>): PluginState
   return next
 }
 
-/** Write state atomically: temp file, then rename. Never throws. */
+/**
+ * Write state atomically: temp file, then rename. Never throws.
+ *
+ * One thing is merged rather than copied: the control intent. A status write
+ * from this writer may not erase an intent someone else wrote in the meantime,
+ * because the intent is the only field that outlives a race — the TUI's halt
+ * must still be the newest word after a heartbeat rewrites everything else.
+ */
 export function writeState(state: PluginState): void {
   try {
     const file = statePath()
     mkdirSync(dirname(file), { recursive: true })
+    const theirs = readState().intent
+    if (theirs.seq > state.intent.seq) state.intent = theirs
     state.updated = Date.now()
     const tmp = `${file}.tmp`
     writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", "utf8")
@@ -136,6 +180,20 @@ export function writeState(state: PluginState): void {
   } catch {
     // Best effort: a failed write must never take down the host.
   }
+}
+
+/**
+ * Issue the next control instruction. Reads the file first so a halt written
+ * by another half raises the sequence above it rather than fighting it.
+ */
+export function bumpIntent(state: PluginState, action: Intent["action"]): Intent {
+  const theirs = readState().intent
+  state.intent = {
+    seq: Math.max(theirs.seq, state.intent.seq) + 1,
+    action,
+    at: Date.now(),
+  }
+  return state.intent
 }
 
 /** Append a log line, keeping the tail bounded. Mutates `state.log`. */
