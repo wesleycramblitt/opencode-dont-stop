@@ -721,7 +721,7 @@ function makeEngine(instanceID: string, options: Partial<EngineOptions> = {}) {
 
 function armLoop(engine: LoopEngine, state: PluginState, instanceID: string, sessionID: string, mode: Mode = "free") {
   state.loops[sessionID] = {
-    status: "active", sessionID, prompt: "task", iterations: 0, sessionIterations: 0,
+    status: "active", sessionID, rotatedFrom: null, prompt: "task", iterations: 0, sessionIterations: 0,
     startedAt: Date.now(), lastResult: null, owner: instanceID,
     ownerBeatAt: Date.now(), rotations: 0,
     mode, degraded: false, preferredMode: null, consecutiveErrors: 0,

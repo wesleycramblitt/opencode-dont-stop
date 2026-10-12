@@ -541,9 +541,13 @@ A loop that runs for hours degrades: a long conversation makes the model worse
 at the work, not just slower, and a fresh session with the same prompt cures it.
 So the loop retires its session and starts a new one — an empty conversation
 with no carried-over history, no tool calls, and no summary. The repository is
-the state (plans, task files, the codebase index), and the seed prompt says so.
-This replaces the summary-based handoff, which existed only to bridge the two
-sessions; a session that already wrote its work to disk does not need bridging.
+the state (plans, task files, results on disk), and the seed prompt says so —
+while telling the successor to re-establish the work with *minimal* reading:
+the session that just retired filled its window, so a fresh session that
+re-reads everything wholesale would fill its own window in one turn and retire
+without producing work. This replaces the summary-based handoff, which existed
+only to bridge the two sessions; a session that already wrote its work to disk
+does not need bridging.
 
 Three things trigger a rotation:
 

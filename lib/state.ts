@@ -34,6 +34,12 @@ export interface LogEntry {
 export interface LoopState {
   status: "active" | "stopped"
   sessionID: string | null
+  /**
+   * The session this loop rotated away FROM, so a terminal sitting on the
+   * retired session can announce where the loop went instead of watching a
+   * quietly frozen conversation. Absent until the first rotation.
+   */
+  rotatedFrom: string | null
   prompt: string
   /** Loop iterations completed. */
   iterations: number
@@ -182,6 +188,7 @@ function loopState(mode: Mode): LoopState {
   return {
     status: "stopped",
     sessionID: null,
+    rotatedFrom: null,
     prompt: "",
     iterations: 0,
     sessionIterations: 0,

@@ -1827,8 +1827,10 @@ export class LoopEngine {
   private rotationSeed(prompt: string): string {
     return (
       `A previous session finished a stretch of work and was retired to keep context fresh. ` +
-      `Nothing was carried over: the repository is the state. Re-read the plans, the task files, ` +
-      `and the codebase index to re-establish where the work stands before continuing.\n\n` +
+      `Nothing was carried over: the repository is the state. Re-establish where the work stands ` +
+      `from the plans and task files, reading only as much as you need — the retired session ` +
+      `filled its window, so do not re-read large material wholesale and leave room in this one ` +
+      `for the work itself.\n\n` +
       `Original task: ${prompt.trim() || "(none recorded)"}` +
       SENTINEL_INSTRUCTION +
       CHECKPOINT_INSTRUCTION
@@ -1872,6 +1874,7 @@ export class LoopEngine {
     const next: LoopState = {
       ...loop,
       sessionID: newSessionID,
+      rotatedFrom: sessionID,
       sessionIterations: 0,
       lastResult: `rotated to ${newSessionID} after ${turns} turns (${reason})`,
     }
@@ -1942,6 +1945,7 @@ export class LoopEngine {
     this.state.loops[sessionID] = {
       status: "active",
       sessionID,
+      rotatedFrom: null,
       prompt,
       // A start is a fresh run: the iteration counter belongs to the run,
       // not to the session's earlier loops. The mode comes from the caller,

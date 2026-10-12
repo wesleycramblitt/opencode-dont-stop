@@ -80,6 +80,7 @@ export default {
     const disposeFooter = ctx.ui.slot({
       replace: "prompt.footer.status",
       render: (props: { sessionID?: string }) => {
+        currentSessionID = props.sessionID ?? null
         const [snap, setSnap] = createSignal<PluginState>(read())
         const version = ++slotVersion
         push = (state) => {
@@ -98,8 +99,11 @@ export default {
     // loop starting or stopping, and a model rotation. Deduplicated twice —
     // on the `updated` stamp so a heartbeat does not spam, and on the message
     // itself so a stale result cannot re-toast on every unrelated write.
+    // Scoped to the terminal's own session (fed by the footer render below):
+    // one rotation must not pop a toast in every open terminal.
     let lastAnnounced = 0
     let lastMessage = ""
+    let currentSessionID: string | null = null
     const announceInterval = setInterval(() => {
       const state = read()
       if (state.updated === lastAnnounced) return
@@ -111,7 +115,12 @@ export default {
         toast(ctx, "info", "dont-stop", `loop running in ${primary.mode} mode`)
         return
       }
-      const loop = primary ?? Object.values(state.loops)[0]
+      // Only loops this terminal can see are announced: the one on its own
+      // session, or the one that just rotated away from it — so a retirement
+      // is answered with where the loop went instead of a frozen-looking tab.
+      const loop =
+        (currentSessionID ? state.loops[currentSessionID] : undefined) ??
+        Object.values(state.loops).find((l) => l.status === "active" && l.rotatedFrom === currentSessionID)
       const message = loop?.lastResult
       if (previous === 0) {
         // First look at a settled state: this terminal never saw the stop
