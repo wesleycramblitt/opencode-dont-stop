@@ -47,7 +47,7 @@ import {
   type AgentKind,
   type TaskProfile,
 } from "./modes.ts"
-import { actionFor, classify, FUNDS_PROVIDER_WINDOW_MS, PERMANENT_COOLDOWN_MS, type ClassifiedError, type ErrorAction } from "./errors.ts"
+import { actionFor, classify, DEPRECATED_COOLDOWN_MS, FUNDS_PROVIDER_WINDOW_MS, PERMANENT_COOLDOWN_MS, type ClassifiedError, type ErrorAction } from "./errors.ts"
 import { ClockSet, DEFAULT_CLOCKS, type ClockOptions } from "./clocks.ts"
 import {
   DEFAULT_HANDOFF_THRESHOLD,
@@ -946,7 +946,7 @@ export class LoopEngine {
     if (!current || !this.ownsLoop(sessionID)) return
 
     if (previous && action.cooldownMs > 0) {
-      this.putOnCooldown(previous, Date.now() + action.cooldownMs)
+      this.putOnCooldown(previous, cooldownDeadline(action.cooldownMs))
     }
 
     const outcome = this.rotate(sessionID, `retry-after-${classified.kind}`)
@@ -1127,7 +1127,7 @@ export class LoopEngine {
     // straight at it, and the cooldown would only take it out of the chain the
     // retry is hoping to succeed on.
     if (key && !willRetry && action.cooldownMs > 0) {
-      this.putOnCooldown(key, Date.now() + action.cooldownMs)
+      this.putOnCooldown(key, cooldownDeadline(action.cooldownMs))
     }
 
     if (action.restrict) {
@@ -1889,4 +1889,17 @@ function msg(error: unknown): string {
  */
 function newInstanceID(): string {
   return `${process.pid}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+/**
+ * The deadline to store for a cooldown of `ms`.
+ *
+ * A sentinel is a fact about the model, not a duration. Storing
+ * `now + sentinel` produces a value larger than the sentinel it was made
+ * from, so `liftPermanentCooldowns` could never match a spent quota's
+ * exclusion and paid modes kept inheriting it. Sentinels are stored as
+ * themselves; ordinary durations stay deadlines.
+ */
+function cooldownDeadline(ms: number): number {
+  return ms >= DEPRECATED_COOLDOWN_MS ? ms : Date.now() + ms
 }

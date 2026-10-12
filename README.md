@@ -118,17 +118,29 @@ token quotas, and their models are not chat models). The allowance is per
 model, shown in the console, and not queryable through any public API — so
 it is declared data: `data/free-tiers.ts`, keyed by `provider/model`, dated
 by the snapshot it was taken from, with every entry naming its source and
-whether the account currently has the model switched on. The catalogue
-folds the table into rows at build time and re-applies it at load, so a
-stale file is corrected.
+whether the account currently has the model switched on.
+
+**The table is empty as of 2026-10-12.** The overnight loop drew the grants
+down model after model, and the provider refused each model it reached with
+"The free quota has been exhausted" — classified `freequota`, a permanent
+exclusion from the sweep. The grants are one-time (they expire 2027-01-10
+and do not reset), so those models are paid rows now and the table declares
+none of them. Add a line back only when the console shows an allowance
+alive again.
+
+The catalogue re-applies the table at load time, and the table is the
+authority: absence means spent, so clearing a line takes effect without a
+catalogue rebuild — the persisted row's copy is a snapshot of an older
+table and cannot outvote it.
 
 A quota-backed row is not priced at zero, but it is a legitimate member of
 the `free` sweep: after the genuinely free rows, before the local fallback,
 with the account's switched-on quotas ordered ahead of the switched-off
 ones — enablement is a console setting, not a property of the model, so
-both stay in the chain. When the allowance runs out, requests fail with a
-quota error, which the error classifier reads as `funds` — the model goes
-on cooldown and the chain moves on.
+both stay in the chain. When the allowance runs out, requests fail with the
+free-quota error, which the classifier reads as `freequota` — the model is
+excluded from the sweep for good, and leaving `free` mode is what lifts the
+exclusion so the same model is selectable as a paid row.
 
 The remaining allowance is account state the plugin deliberately does not
 pretend to measure: there is no usage API, and an invented "remaining"

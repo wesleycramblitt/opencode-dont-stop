@@ -392,23 +392,33 @@ test("unroutable and cooling models never satisfy a query", () => {
   assert.equal(meets(cooled, { text: true }), false)
 })
 
-test("the curated free tier table is the one the catalogue loads from", () => {
-  // The 2026-10-12 console snapshot: every row switched on, and the models
-  // whose promotional quota is spent (qwen3.7-flash among them) are absent —
-  // they are paid rows now, not free-tier rows.
-  assert.ok(FREE_TIERS["alibaba/qwen3.8-flash"]?.tokens === 1_000_000)
-  assert.equal(FREE_TIERS["alibaba/qwen3.8-flash"]?.enabled, true)
-  assert.equal(FREE_TIERS["alibaba/deepseek-v4-flash-0731"]?.enabled, true)
-  assert.ok(FREE_TIERS["alibaba/qwen3.7-flash"] === undefined)
-  // Every entry names its source and the account state, so a number can be
-  // audited rather than trusted, and the blanket promotion is uniform.
-  for (const [key, tier] of Object.entries(FREE_TIERS)) {
-    assert.ok(key.startsWith("alibaba/"), key)
-    assert.ok(tier.source.length > 0, key)
-    assert.ok(tier.windowDays > 0, key)
-    assert.equal(tier.tokens, 1_000_000, key)
-    assert.equal(typeof tier.enabled, "boolean", key)
-  }
+test("the free-tier table is empty: every 2026-10-12 grant was consumed", () => {
+  // The overnight loop drew the promotional grants down model after model
+  // and the provider refused each one with "free quota has been exhausted".
+  // The contract (data/free-tiers.ts): spent models are ABSENT, so the sweep
+  // can never offer them again — and absence must beat the stale copy in a
+  // catalogue file (the load applies this table outright).
+  assert.equal(Object.keys(FREE_TIERS).length, 0)
+})
+
+test("a spent free quota is stored as the sentinel itself, and a mode change lifts it", async () => {
+  const { engine, state } = makeEngine("i1")
+  injectCatalogue(engine, catalogueOf([
+    row({ key: "alibaba/x", providerID: "alibaba", id: "x" }),
+    row({ key: "b/y", providerID: "b", id: "y" }),
+  ]))
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!
+  tracked.model = { providerID: "alibaba", id: "x" }
+
+  // `now + sentinel` would be larger than the sentinel it was made from, so
+  // the exclusion could never be matched again — store the sentinel itself.
+  await engine.onError({ sessionID: "ses_loop", message: "The free quota has been exhausted" })
+  assert.equal(state.cooldowns["alibaba/x"], PERMANENT_COOLDOWN_MS)
+
+  // Leaving free mode lifts the quota exclusion: the model is a paid row now.
+  await engine.setMode("cheap", "ses_loop")
+  assert.ok(state.cooldowns["alibaba/x"] === undefined)
 })
 
 /* ---------------------------------------------------------------------- modes */

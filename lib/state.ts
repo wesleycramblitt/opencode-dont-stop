@@ -13,6 +13,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
+import { PERMANENT_COOLDOWN_MS } from "./errors.ts"
+
 export const MODES = ["free", "cheap", "local", "power", "stop"] as const
 export type Mode = (typeof MODES)[number]
 
@@ -238,6 +240,14 @@ function mergeState(base: PluginState, patch: Partial<PluginState>): PluginState
   next.intent = { ...base.intent, ...(patch.intent ?? {}) }
   next.agentModels = { ...patch.agentModels }
   next.cooldowns = { ...patch.cooldowns }
+  // Cooldowns written before sentinels were stored as themselves carry
+  // `now + sentinel`; normalize them back to the sentinel so the free-quota
+  // exclusions can be matched and lifted when a mode leaves `free` (engine's
+  // `liftPermanentCooldowns`). The deprecated sentinel sits one below and is
+  // left alone.
+  for (const [key, until] of Object.entries(next.cooldowns)) {
+    if (until >= PERMANENT_COOLDOWN_MS) next.cooldowns[key] = PERMANENT_COOLDOWN_MS
+  }
   next.fundsProviders = { ...patch.fundsProviders }
   next.log = [...(patch.log ?? [])]
   return next

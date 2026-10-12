@@ -282,10 +282,12 @@ function toModels(rows: Array<Record<string, unknown>>): CatalogueModel[] {
       provenance: provenance(raw.provenance),
       weights: weights(raw.weights),
       cloud: raw.cloud === true,
-      // A persisted row carries its own tier; a stale file is corrected from
-      // the curated table. The table key is `provider/model`, which is the
-      // row's identity — variants are not separately tiered.
-      freeTier: freeTierOf(raw) ?? FREE_TIERS[`${providerID}/${id}`] ?? null,
+      // The curated table is the account's current truth and absence means
+      // "spent", so it decides outright. A persisted row carries a copy of
+      // an older table; letting that copy outvote a removal is how a spent
+      // model kept being swept until the next rebuild. The key is
+      // `provider/model`, the row's identity — variants are not tiered.
+      freeTier: FREE_TIERS[`${providerID}/${id}`] ?? null,
       reachable: raw.reachable !== false,
       available: true,
       availabilityReason: null,
@@ -656,21 +658,6 @@ function provenance(value: unknown): Provenance {
     estimated: record.estimated === true,
     estimatedFields: Array.isArray(record.estimatedFields) ? (record.estimatedFields as string[]) : [],
   }
-}
-
-/** A persisted free tier, when the row carries one. */
-function freeTierOf(raw: Record<string, unknown>): FreeTier | null {
-  const tier = raw.freeTier
-  if (!tier || typeof tier !== "object") return null
-  const record = tier as Record<string, unknown>
-  const tokens = typeof record.tokens === "number" ? record.tokens : Number(record.tokens)
-  const windowDays = typeof record.windowDays === "number" ? record.windowDays : Number(record.windowDays)
-  const source = typeof record.source === "string" ? record.source : ""
-  if (!Number.isFinite(tokens) || !Number.isFinite(windowDays) || !source) return null
-  // `enabled` defaults true so a row persisted before the flag existed is not
-  // silently demoted.
-  const enabled = record.enabled === undefined ? true : record.enabled === true
-  return { tokens, windowDays, enabled, source }
 }
 
 function benchmarks(value: unknown): Record<string, number | string> | null {
