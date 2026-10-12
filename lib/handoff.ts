@@ -13,9 +13,12 @@
  *    session; handing the parent off under one orphans its context and leaves
  *    the child writing into a session that no longer exists. The handoff
  *    defers instead, and the next turn retries.
- * 3. **The threshold is the model's own context size.** A 128k model and a 1M
- *    model should not hand off at the same token count, so the fraction is
- *    applied to the window of the model actually in use.
+ * 3. **The threshold is the window the session can actually use.** A 128k
+ *    model and a 1M model should not hand off at the same token count, so the
+ *    fraction is applied to the window of the model actually in use — and for
+ *    a local model that is what the ollama daemon serves (`/api/ps`), not the
+ *    catalogue's native size, because the daemon truncates the prompt to its
+ *    own `OLLAMA_CONTEXT_LENGTH`.
  *
  * Pure functions do the deciding; `handoff` is the only part that touches I/O.
  */
@@ -101,6 +104,54 @@ export function measureContext(messages: unknown): number {
 export function shouldHandoff(used: number, limit: number, threshold = DEFAULT_THRESHOLD): boolean {
   if (limit <= 0) return false
   return used >= limit * threshold
+}
+
+/**
+ * The window a session can actually use, given two claims about it.
+ *
+ * A model's catalogue `context` is the architecture's native size, but the
+ * runtime serving it may hold less — a local ollama daemon serves whatever
+ * `OLLAMA_CONTEXT_LENGTH` says (64000 here) regardless of a native 3.5M, and
+ * truncates the prompt to fit. Truncated turns produce almost no output and
+ * the session never reaches a native-size threshold, so the loop stalls
+ * exactly where a handoff should have happened. The smaller figure is the one
+ * to measure; unknown values fall back to the other.
+ */
+export function effectiveContext(catalogueContext: number, servedContext: number): number {
+  if (catalogueContext > 0 && servedContext > 0) return Math.min(catalogueContext, servedContext)
+  return servedContext > 0 ? servedContext : catalogueContext
+}
+
+/**
+ * The local ollama daemon's loaded-model listing.
+ *
+ * Same host as the tags probe in `lib/fetch.ts`; this asks what is *loaded*
+ * because only a loaded model has a served window to read.
+ */
+export const OLLAMA_PS_URL = "http://localhost:11434/api/ps"
+
+/**
+ * The context window the local ollama daemon is serving `modelID`.
+ *
+ * Returns 0 for "unknown" — the daemon is down, the model is not loaded, or
+ * the response is malformed — and callers fall back to the catalogue figure.
+ */
+export async function ollamaServedContext(modelID: string, fetchImpl: typeof fetch = fetch): Promise<number> {
+  try {
+    const response = await fetchImpl(OLLAMA_PS_URL)
+    if (!response.ok) return 0
+    const body: unknown = await response.json()
+    if (!isRecord(body)) return 0
+    for (const entry of asArray(body.models)) {
+      if (!isRecord(entry)) continue
+      const name = typeof entry.name === "string" ? entry.name : typeof entry.model === "string" ? entry.model : ""
+      if (name !== modelID) continue
+      return numberOr(entry.context_length, 0)
+    }
+    return 0
+  } catch {
+    return 0
+  }
 }
 
 /* ------------------------------------------------------------ subagent safety */

@@ -523,9 +523,15 @@ Three properties make it safe where a compaction plugin was not:
    writing into a session that no longer exists. The walk is transitive —
    grandchildren count — and a deferral delays the handoff rather than losing
    it; the next turn retries.
-3. **The threshold is the model's own window.** A 128k model and a 1M model do
-   not hand off at the same token count, so the fraction (default 0.5) is
-   applied to the context size of the model actually in use.
+3. **The threshold is the window the session can actually use.** A 128k model
+   and a 1M model do not hand off at the same token count, so the fraction
+   (default 0.5) is applied to the context size of the model actually in use.
+   For a local model that size is asked of the ollama daemon (`/api/ps`)
+   rather than taken from the catalogue: the catalogue records the
+   architecture's native window, while the daemon serves whatever
+   `OLLAMA_CONTEXT_LENGTH` says and truncates the prompt to fit. Measuring
+   against the native figure is how a loop stalls — every turn comes back cut
+   off and the native-size threshold never arrives.
 
 Context usage is read from the last assistant message's reported `tokens.input`
 plus cache reads — the prompt size the provider actually measured. It is never

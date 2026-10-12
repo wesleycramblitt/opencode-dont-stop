@@ -20,7 +20,7 @@ import { SessionClocks } from "../lib/clocks.ts"
 import { classify, actionFor, DEPRECATED_COOLDOWN_MS, PERMANENT_COOLDOWN_MS } from "../lib/errors.ts"
 import { meets, loadCatalogue, type Catalogue, type CatalogueModel } from "../lib/catalogue.ts"
 import { rankForMode, profileFor } from "../lib/modes.ts"
-import { measureContext, transcriptFrom, descendantIDs, buildSummary } from "../lib/handoff.ts"
+import { measureContext, transcriptFrom, descendantIDs, buildSummary, effectiveContext, ollamaServedContext } from "../lib/handoff.ts"
 import { catalogueRefreshDue, parseAlibabaInventory, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
 import { LoopEngine, COMPLETION_SENTINEL } from "../lib/engine.ts"
 import { initialState, readState, type Mode, type PluginState } from "../lib/state.ts"
@@ -451,6 +451,31 @@ test("context usage is read from v2 message tokens", () => {
     { type: "assistant", content: [], tokens: { input: 30_000, output: 900, cache: { read: 5_000, write: 0 } } },
   ]})
   assert.equal(used, 35_000)
+})
+
+test("a local model's window is what the daemon serves, not the native size", () => {
+  // ollama's OLLAMA_CONTEXT_LENGTH=64000 against a 3.5M native claim: the
+  // session truncates at 64k, so that is the limit the handoff must use.
+  assert.equal(effectiveContext(3_500_000, 64_000), 64_000)
+  assert.equal(effectiveContext(3_500_000, 0), 3_500_000)
+  assert.equal(effectiveContext(0, 64_000), 64_000)
+  assert.equal(effectiveContext(0, 0), 0)
+})
+
+test("the ollama probe reads the served context and tolerates junk", async () => {
+  const respond = (body: unknown) =>
+    (async () => ({ ok: true, json: async () => body })) as unknown as typeof fetch
+  assert.equal(
+    await ollamaServedContext("qwen3.8:latest", respond({ models: [{ name: "qwen3.8:latest", context_length: 64_000 }] })),
+    64_000,
+  )
+  // Not loaded, or another model loaded: unknown, not a wrong number.
+  assert.equal(await ollamaServedContext("qwen3.8:latest", respond({ models: [{ name: "other", context_length: 64_000 }] })), 0)
+  assert.equal(await ollamaServedContext("qwen3.8:latest", respond({ models: "nope" })), 0)
+  const down = (async () => {
+    throw new Error("ollama is down")
+  }) as unknown as typeof fetch
+  assert.equal(await ollamaServedContext("qwen3.8:latest", down), 0)
 })
 
 test("transcripts read v2 content parts and files from tool state", () => {

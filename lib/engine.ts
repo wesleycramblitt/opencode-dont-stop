@@ -51,8 +51,10 @@ import { actionFor, classify, FUNDS_PROVIDER_WINDOW_MS, PERMANENT_COOLDOWN_MS, t
 import { ClockSet, DEFAULT_CLOCKS, type ClockOptions } from "./clocks.ts"
 import {
   DEFAULT_HANDOFF_THRESHOLD,
+  effectiveContext,
   handoff,
   measureContext,
+  ollamaServedContext,
   shouldHandoff,
   sessionTree as fetchSessionTree,
   transcriptFrom,
@@ -1541,7 +1543,7 @@ export class LoopEngine {
   private async checkHandoff(sessionID: string): Promise<"handed-off" | "deferred" | "not-needed"> {
     const loop = this.loopFor(sessionID)
     if (!loop) return "not-needed"
-    const limit = this.contextLimitFor(sessionID)
+    const limit = await this.contextLimitFor(sessionID)
     if (limit <= 0) return "not-needed"
 
     const used = await this.contextUsed(sessionID)
@@ -1600,12 +1602,19 @@ export class LoopEngine {
   }
 
   /** The context window of the session's current model, or 0 when unknown. */
-  private contextLimitFor(sessionID: string): number {
+  private async contextLimitFor(sessionID: string): Promise<number> {
     const slot = this.tracked.get(sessionID)?.model
     if (!slot || !this.catalogue) return 0
     const row = this.catalogue.byKey.get(`${slot.providerID}/${slot.id}`)
       ?? this.catalogue.byKey.get(`${slot.providerID}/${slot.id}#${slot.variant ?? ""}`)
-    return row?.context ?? 0
+    if (!row) return 0
+    // A local model's catalogue figure is the architecture's native window;
+    // the daemon may serve a fraction of it (OLLAMA_CONTEXT_LENGTH) and
+    // truncates the prompt to what it serves. Measuring against the native
+    // figure is how a session sails past the real limit and every turn comes
+    // back cut off, so the served window wins when the daemon reports one.
+    if (!row.local) return row.context
+    return effectiveContext(row.context, await ollamaServedContext(slot.id))
   }
 
   /** Tokens of context the session has consumed. */
