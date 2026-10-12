@@ -47,7 +47,7 @@ import {
   type AgentKind,
   type TaskProfile,
 } from "./modes.ts"
-import { actionFor, classify, type ClassifiedError, type ErrorAction } from "./errors.ts"
+import { actionFor, classify, PERMANENT_COOLDOWN_MS, type ClassifiedError, type ErrorAction } from "./errors.ts"
 import { ClockSet, DEFAULT_CLOCKS, type ClockOptions } from "./clocks.ts"
 import {
   DEFAULT_HANDOFF_THRESHOLD,
@@ -223,6 +223,8 @@ export class LoopEngine {
   private appliedIntent: number
   /** Deadline for re-driving the loop after a cancelled turn, or null. */
   private redriveAt: number | null = null
+  /** Last announced reachability counts, so a re-check logs only on change. */
+  private reachabilityCount: { reachable: number; unroutable: number } | null = null
   /** Guards against sending two prompts for one idle event. */
   private advancing = false
   /** Whether a foreign loop has already been reported, so it is said once. */
@@ -502,11 +504,29 @@ export class LoopEngine {
         if (model.reachable) reachable++
         else unroutable++
       }
-      this.log.info(`reachability: ${reachable} routable, ${unroutable} not routable from this install`)
+      // Announce only a change: this re-runs on a post-boot backoff and on
+      // heartbeats, and a line per beat would bury the real movement.
+      const before = this.reachabilityCount
+      if (!before || before.reachable !== reachable || before.unroutable !== unroutable) {
+        this.reachabilityCount = { reachable, unroutable }
+        this.log.info(`reachability: ${reachable} routable, ${unroutable} not routable from this install`)
+      }
       this.emit()
     } catch (error) {
       this.log.quiet("info", `reachability check unavailable: ${msg(error)}`)
     }
+  }
+
+  /**
+   * Re-derive reachability against the live registry.
+   *
+   * The registry is not guaranteed complete while `setup` is still running —
+   * provider definitions can still be loading — so the boot read can mark a
+   * routable provider unroutable and the free sweep loses its cheapest
+   * candidates. The startup backoff calls this until the count settles.
+   */
+  async recheckReachability(): Promise<void> {
+    await this.applyReachability()
   }
 
   /** Capture current availability so a reload can restore it. */
@@ -612,15 +632,19 @@ export class LoopEngine {
 
     await applyAgentDefaults(this.ctx as unknown as ApplyContext, () => plan)
 
+    // The session channel reaches the loop's own session ONLY. Tracking used
+    // to be incidental — `observe` records every session that emits an event —
+    // and the plan then switched the pinned model of *every* tracked session,
+    // which is how a free-sweep re-plan re-modelled a user's live session that
+    // had nothing to do with the loop. Being tracked is not consent: this
+    // plugin drives the loop it was asked to start, and nothing else.
     const needsSwitch: Array<{ sessionID: string; model: ModelSlot }> = []
-    for (const entry of plan.sessions) {
-      const record = this.tracked.get(entry.sessionID)
-      if (!record) continue
-      // The loop session belongs to its owner alone: another instance planning
-      // a different model for it would fight the one actually driving it.
-      if (entry.sessionID === this.state.loop.sessionID && !this.ownsLoop()) continue
-      if (!force && record.model && sameSlot(record.model, entry.model)) continue
-      needsSwitch.push(entry)
+    if (this.state.loop.sessionID !== null && this.ownsLoop()) {
+      const target = this.tracked.get(this.state.loop.sessionID)
+      const entry = plan.sessions.find((e) => e.sessionID === this.state.loop.sessionID)
+      if (entry && target) {
+        if (force || !target.model || !sameSlot(target.model, entry.model)) needsSwitch.push(entry)
+      }
     }
 
     if (needsSwitch.length > 0 || force) {
@@ -709,12 +733,11 @@ export class LoopEngine {
   private async handleHang(sessionID: string, reason: string): Promise<void> {
     this.log.warn(`hang detected on ${sessionID}: ${reason}`)
 
-    if (this.clocks.peek(sessionID)?.exhausted()) {
-      this.log.warn(`session ${sessionID} still hung after repeated interrupts; stopping loop`)
-      await this.stop(`session ${sessionID} unresponsive after repeated interrupts`)
-      return
-    }
-
+    // Not a stop when the session has been interrupted before (owner,
+    // 2026-10-11): a wedged session is still rotated and still re-driven, and
+    // the loop ends only on a halt. The count remains in the clocks so a
+    // genuinely stuck session is visible — and the model rotation is what
+    // actually fixes the common case of a model that never emits anything.
     const record = this.tracked.get(sessionID)
     const previous = record?.model ? modelKeyOf(record.model) : null
 
@@ -735,13 +758,16 @@ export class LoopEngine {
     }
 
     const outcome = this.rotate(sessionID, "hang")
-    if (outcome !== "moved") {
-      // `"not-ours"` cannot happen — the loop was just checked — but if it
-      // ever does, stopping somebody else's loop would be worse than saying
-      // nothing.
-      if (outcome === "not-ours") return
-      this.log.warn(`no untried model left for ${sessionID}; stopping loop`)
-      await this.stop(this.exhaustedReason("a hang", outcome))
+    if (outcome !== "moved" && outcome !== "not-ours") {
+      // Not a stop (owner, 2026-10-11): every model in the chain has had its
+      // try and none is cooling down yet (or nothing is left at all). The
+      // recovery is to wait for the cooldowns to expire — `expireCooldowns`
+      // re-admits models on the next beats — and re-drive. In `free` mode the
+      // local fallback is still the chain's tail, so this usually does not
+      // happen at all.
+      this.log.warn(`no untried model left for ${sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
+      if (this.redriveAt === null) this.redriveAt = Date.now() + this.redriveDelayMs
+      this.emit()
       return
     }
     current.rotations += 1
@@ -780,7 +806,12 @@ export class LoopEngine {
       await this.sendPrompt(sessionID, CONTINUE_PROMPT)
       this.clocks.clocksFor(sessionID).start(Date.now())
     } catch (error) {
-      await this.stop(`could not continue the loop: ${msg(error)}`)
+      // Not a stop (owner, 2026-10-11): a failed continue does not end the
+      // loop, it reschedules one — the session may be mid-teardown or the
+      // provider briefly unreachable, and the error funnel reports either.
+      this.log.warn(`re-drive failed on ${sessionID}: ${msg(error)}; will try again`)
+      this.redriveAt = Date.now() + this.redriveDelayMs
+      void this.onError({ sessionID, error, message: msg(error) }).catch(() => {})
     }
   }
 
@@ -948,16 +979,10 @@ export class LoopEngine {
     }
 
     if (this.consecutive(classified)) {
-      // The budget counts against the loop's own session only: another
-      // session's repeated failures — a user's experiment, a different
-      // project — must not stop a loop they were never part of.
-      if (ownsThis) {
-        this.state.consecutiveErrors += 1
-        if (this.state.consecutiveErrors >= 5) {
-          await this.stop(`too many consecutive errors: ${this.state.consecutiveErrors}`)
-          return action
-        }
-      }
+      // Reported, not stopped (owner, 2026-10-11): the loop survives error
+      // streaks. The counter is in the state file, so a degenerate provider
+      // run is visible before it becomes a wallpaper.
+      if (ownsThis) this.state.consecutiveErrors += 1
     } else if (ownsThis) {
       this.state.consecutiveErrors = 0
     }
@@ -970,11 +995,13 @@ export class LoopEngine {
       this.redriveAt = Date.now() + this.redriveDelayMs
     } else if (action.resweep && input.sessionID && ownsThis) {
       const outcome = this.rotate(input.sessionID, classified.kind)
-      // `"not-ours"` is a rotation that was never ours to make, and quietly
-      // does nothing — it is the one outcome that is not the loop running out
-      // of models, so it must not read as a reason to stop.
+      // Not a stop when the chain has nothing left (owner, 2026-10-11): the
+      // loop waits for cooldowns to expire instead. `"not-ours"` is a rotation
+      // that was never ours to make, and quietly does nothing.
       if (outcome !== "moved" && outcome !== "not-ours") {
-        await this.stop(this.exhaustedReason(classified.kind, outcome))
+        this.log.warn(`no untried model left for ${input.sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
+        if (this.redriveAt === null) this.redriveAt = Date.now() + this.redriveDelayMs
+        this.emit()
         return action
       }
     }
@@ -1081,23 +1108,6 @@ export class LoopEngine {
     return "moved"
   }
 
-  /**
-   * Why a rotation found nothing to move to, for the stop reason.
-   *
-   * The two situations that end a loop the same way want different advice:
-   * every model having been tried is the task proving it cannot be finished by
-   * any of them, while an empty chain is a configuration problem.
-   */
-  private exhaustedReason(cause: string, outcome: RotationOutcome): string {
-    if (outcome === "unavailable") {
-      return `no model available in the ${this.state.mode} chain for this task`
-    }
-    return (
-      `every model in the ${this.state.mode} chain has had its try since the last ` +
-      `completed turn, after ${cause}; the task is stuck, not the model`
-    )
-  }
-
   /* ----------------------------------------------------------- mode changes */
 
   /** Switch mode, reset per-mode state, and re-plan. */
@@ -1107,10 +1117,26 @@ export class LoopEngine {
     this.state.degraded = false
     this.state.preferredMode = null
     this.state.consecutiveErrors = 0
+    // A permanent free-quota exclusion belongs to the free sweep, and only to
+    // it: in `cheap` the same model is a paid row and is selectable again. So
+    // leaving free mode lifts every permanent cooldown; ordinary timed
+    // cooldowns are untouched.
+    if (mode !== "free") this.liftPermanentCooldowns()
     // A new chain is a new bet, so the episode's try budget starts over.
     this.resetEpisode()
     this.log.info(`mode set to ${mode}`)
     await this.refresh(true)
+  }
+
+  /** Clear the cooldowns a spent free quota earned. */
+  private liftPermanentCooldowns(): void {
+    const keys = Object.keys(this.state.cooldowns).filter(
+      (key) => this.state.cooldowns[key] >= PERMANENT_COOLDOWN_MS,
+    )
+    if (keys.length === 0) return
+    for (const key of keys) delete this.state.cooldowns[key]
+    if (this.catalogue) for (const key of keys) clearCooldown(this.catalogue, key)
+    this.log.info(`mode left the free sweep; lifted ${keys.length} permanent quota exclusions`)
   }
 
   /** Drop to a cheaper mode, recording where we degraded from. */
@@ -1177,8 +1203,10 @@ export class LoopEngine {
       this.emit()
 
       if (iteration >= this.maxIterations) {
-        await this.stop(`iteration budget reached (${iteration})`)
-        return
+        // Not a stop (owner, 2026-10-11): the loop runs until it is halted or
+        // the task's own completion sentinel appears. The iteration counter is
+        // still reported so a runaway is visible in the footer.
+        this.log.warn(`iteration ${iteration} reached the ${this.maxIterations} budget; continuing`)
       }
 
       const lastText = await this.lastAssistantText(sessionID)
@@ -1188,8 +1216,9 @@ export class LoopEngine {
       }
 
       if (this.state.consecutiveErrors >= 5) {
-        await this.stop(`stopping after ${this.state.consecutiveErrors} consecutive errors`)
-        return
+        // Not a stop (owner, 2026-10-11): the loop survives its own error
+        // streaks. The count is reported so the condition is visible.
+        this.log.warn(`${this.state.consecutiveErrors} consecutive errors and continuing`)
       }
 
       // Hand off before continuing when the context window is spent. This is
@@ -1216,9 +1245,6 @@ export class LoopEngine {
     } catch (error) {
       this.log.error(`advance failed on ${sessionID}: ${msg(error)}`)
       this.state.consecutiveErrors += 1
-      if (this.state.consecutiveErrors >= 5) {
-        await this.stop(`stopping after ${this.state.consecutiveErrors} consecutive loop errors`)
-      }
       this.emit()
     } finally {
       this.advancing = false
@@ -1424,7 +1450,12 @@ export class LoopEngine {
    */
   async stop(reason: string): Promise<void> {
     const loop = this.state.loop
-    const wasActive = loop.status === "active"
+    // Nothing is running: an idle stop — a plugin teardown, a second halt for
+    // a loop that already ended, a duplicate command — must not overwrite the
+    // last real result. `loop.lastResult` is what the terminal announces, and
+    // one teardown writing "plugin unloaded" over it is how a single unload
+    // became an endless toast.
+    if (loop.status !== "active") return
     const sessionID = loop.sessionID
 
     loop.status = "stopped"
@@ -1459,7 +1490,7 @@ export class LoopEngine {
       // user happened to talk to it again.
     }
 
-    if (wasActive) this.log.info(`loop stopped: ${reason}`)
+    this.log.info(`loop stopped: ${reason}`)
     this.emit()
   }
 

@@ -220,17 +220,20 @@ it are where the old design spun:
   the loop's progress while leaving it "active".
 - **Every model gets one try per turn.** Rotation moves to the best-ranked model
   that has not been attempted since the last completed turn, so the chain is
-  walked once in rank order and then stops instead of cycling through the same
-  few forever. In `free` that means the hosted free sweep first and the local
-  models after it, which is the point of having local models at all; in `cheap`
-  it is paid, then free, then local. Models that are unreachable or cooling down
-  are filtered out before this point, so they never consume a try.
-- **A rate limit's timeout buys the model its turn back.** When a cooldown
+  walked once in rank order and then starts waiting instead of cycling through
+  the same few forever. In `free` that means the hosted free sweep first and the
+  local models after it, which is the point of having local models at all; in
+  `cheap` it is paid, then free, then local. Models that are unreachable or
+  cooling down are filtered out before this point, so they never consume a try.
+- **A cooldown's expiry buys the model its turn back.** When a cooldown
   expires the model is not just available again but untried again, so a free
-  model that hit a 60s limit wins its next try *ahead* of the local tail
-  rather than being locked out for the rest of the turn.
-- When the chain is spent, or three interrupts have gone by with nothing
-  finished, the loop stops escalating and says which of the two it was.
+  model that was refused wins its next try *ahead* of the local tail rather
+  than being locked out for the rest of the turn.
+- **The loop does not stop itself** (owner, 2026-10-11). The iteration budget,
+  the consecutive-error budget, an exhausted chain and repeated interrupts
+  are all *reported*, never terminal: the loop waits for cooldowns, keeps
+  re-driving, and ends only on a halt — or on the task's own completion
+  sentinel, which an indefinite prompt never emits.
 
 Hang recovery only ever touches the session the loop is driving. Any other
 session — including the user's own — is never interrupted or re-modelled by
@@ -238,34 +241,41 @@ this plugin.
 
 ## Errors
 
-Classification is regex + HTTP status, applied before any recovery path. The
-`retry` column is one retry **per model per turn**, and only for failures
-that could plausibly clear on their own — a dropped connection, an
-unclassified error. A rate limit does **not** get one: it is a statement
-about the model right now, and when a second free model is waiting in the
-chain the cheap move is to hand the turn over immediately. The 60-second
-cooldown then buys the limited model its turn back through expiry (`expireCooldowns`
-re-admits it, ahead of the local tail), which is the "try again on free"
-path. Everything that is a fact about the model rotates at once, because a
-second attempt would only cost time.
+Classification is regex + HTTP status, applied before any recovery path, with
+the provider's **message itself as the strongest signal** — a provider error
+*type* or a wrapped status is coarser than the sentence, and were both
+observed calling a rate limit a *funds* error, which bought a mode degrade
+instead of a rotation. The `retry` column is one retry **per model per turn**,
+and only for failures that could plausibly clear on their own — a dropped
+connection, an unclassified error — and **only outside the free sweep**: the
+free-mode policy (owner, 2026-10-11) is one try per endpoint, a full day out
+of the sweep after any failure, and a spent promotional quota out **forever**.
 
-| Kind | Trigger | Retry | Action |
-| --- | --- | --- | --- |
-| `interrupted` | our own interrupt, a user escape, a cancelled request | — | nothing: not a failure, no cooldown, no rotation |
-| `funds` | insufficient balance / quota | no | cooldown 1h, degrade to a cheaper mode |
-| `rate` | 429, rate limit, throttling | no | cooldown 1m, rotate, re-sweep |
-| `capability` | model lacks a required capability | no | cooldown 5m, restrict the pool |
-| `context` | context window exceeded | no | rotate to a larger-context model |
-| `notfound` | model gone or deprecated | no | cooldown 24h, rotate past |
-| `auth` | 401/403, bad key | no | cooldown 15m, rotate to another provider |
-| `network` | timeout, reset, DNS | yes | cooldown 15s, retry |
-| `other` | unclassified | yes | cooldown 30s, counts toward the 5-error stop budget |
+| Kind | Trigger | Retry | Action (base) | In `free` mode |
+| --- | --- | --- | --- | --- |
+| `interrupted` | our own interrupt, a user escape, a cancelled request | — | nothing: not a failure, no cooldown, no rotation | same |
+| `funds` | insufficient balance / quota (opencode and alibaba phrasings), arrears | no | cooldown 1h, degrade to a cheaper mode | cooldown 24h, degrade is a no-op at the floor |
+| `freequota` | "The free quota has been exhausted…" (alibaba promotional allowance) | no | cooldown 1h, rotate | **permanent** exclusion from the sweep (lifted when the mode leaves `free`) |
+| `rate` | 429, rate limit, throttling | no | cooldown 1m, rotate, re-sweep | cooldown 24h |
+| `capability` | model lacks a required capability | no | cooldown 5m, restrict the pool | cooldown 24h |
+| `context` | context window exceeded | no | rotate to a larger-context model | cooldown 24h |
+| `notfound` | model gone or deprecated | no | cooldown 24h, rotate past | same |
+| `auth` | 401/403, bad key | no | cooldown 15m, rotate to another provider | cooldown 24h |
+| `network` | timeout, reset, DNS | yes | cooldown 15s, retry | no retry, cooldown 24h |
+| `other` | unclassified | yes | cooldown 30s | no retry, cooldown 24h |
 
 `interrupted` leads the pattern list on purpose. The loop's own hang recovery
 produces exactly this error — "tool interrupted" — and scoring it as an
 unclassified failure is what sent recovery into a spin: one interrupt bought a
 rotation, the rotation got interrupted, and the loop paid for its own
 recovery.
+
+A free model that fails once is not tried again for a full day — `freequota`
+models never return, because a spent promotional quota does not come back with
+a timeout. The local fallback is the recovery when the whole sweep is cooling:
+the free chain's tail is the local models, and cooling rows are filtered out
+of the ranking before rotation sees them, so a cooled-out sweep hands the turn
+to ollama instead of stopping.
 
 A capability error pins the session to a pool that avoids the missing
 capability (`no-vision`, `no-tools`, `text-only`) rather than merely cooling the
@@ -293,6 +303,29 @@ models.dev, the local ollama daemon, and Alibaba's inventory when a key is
 resolvable — writes `data/catalogue.json`, then reloads and re-plans. The
 equivalent CLI step is `npx tsx scripts/update-catalogue.ts`, which adds
 `--dry-run`, `--table`, and `--alibaba-key`.
+
+## Disabling
+
+Three switches, from strongest to weakest:
+
+1. **Env var — `DONT_STOP_DISABLED=1`** (any value other than "" / "0").
+   Honored by both halves at load with **no restart**: the server half loads
+   inert (no engine, no watcher, no command surface, no model can move) and
+   the terminal half renders a plain `◍ dont-stop off` footer. This is the
+   switch that "the plugin is still switching my models" reaches for, because
+   removing the plugin from `plugins` in opencode.json only takes effect when
+   the server next restarts.
+2. **Remove from `plugins`** in `~/.config/opencode/opencode.json`, then
+   `opencode service restart`. The plugin then does not load at all.
+3. **`dont-stop: stop loop`** (command palette) or
+   `/dont-stop-set stop` — halts the loop but leaves the plugin loaded and
+   ready to start another on request.
+
+The state file (`~/.config/opencode/dont-stop-state.json`, written
+atomically and only when content actually changed — identical writes are
+skipped, because a write that feeds its own watcher churns the UI) reports
+what the plugin is doing at any moment; the footer is always visible, so a
+stopped loop reads `◍ free idle` instead of vanishing.
 
 ## Layout
 
@@ -391,14 +424,11 @@ every prompt is appended with an instruction to reply with exactly
 it is deterministic and costs no extra model call, which an "is it done?" probe
 would.
 
-Three safety bounds stop a loop whose model never emits the sentinel:
-`maxIterations` (default 100), the consecutive-error budget (5), and one try
-per model — the chain is walked once, in rank order, and a loop that has spent
-every model in it stops rather than buying a second round. Three interrupts
-with nothing finished stop it too, since that is the session being wedged and
-no model swap will fix it. A read failure is
-treated as *not complete*, so a broken message read runs the loop to its
-budget rather than halting it.
+The sentinel is the only self-stop left (owner, 2026-10-11): the iteration
+budget, the consecutive-error budget, an exhausted chain and three interrupts
+are all reported but never terminal — the loop waits for cooldowns, re-drives,
+and keeps working until a halt. A read failure is treated as *not complete*, so
+a broken message read keeps the loop working rather than ending it.
 
 ### Re-planning between turns
 

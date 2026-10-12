@@ -17,7 +17,7 @@ import { homedir } from "node:os"
 import { Plugin } from "@opencode/plugin/tui"
 import type { JSX } from "@opentui/solid"
 
-import { MODES, readState, writeState, type Mode, type PluginState } from "./lib/state.ts"
+import { MODES, dontStopDisabled, readState, writeState, type Mode, type PluginState } from "./lib/state.ts"
 import { describeMode } from "./lib/modes.ts"
 
 const statePath = join(homedir(), ".config", "opencode", "dont-stop-state.json")
@@ -25,6 +25,26 @@ const statePath = join(homedir(), ".config", "opencode", "dont-stop-state.json")
 export default {
   id: "dont-stop",
   setup(ctx: Parameters<NonNullable<Plugin.Definition["setup"]>>[0]) {
+    /* ------------------------------------------------------- disabled gate */
+
+    // The hard switch, honored with no restart: an inert footer that says the
+    // plugin is off, and no command surface. Removing the plugin from
+    // `plugins` in opencode.json requires restarting the service; the env var
+    // does not.
+    if (dontStopDisabled()) {
+      const disposeFooter = ctx.ui.slot({
+        replace: "prompt.footer.status",
+        render: () => (
+          <box flexDirection="row" gap={1}>
+            <text fg="gray">◍ dont-stop off</text>
+          </box>
+        ),
+      })
+      return () => {
+        disposeFooter()
+      }
+    }
+
     /* ------------------------------------------------------------- state feed */
 
     // The state file is the bridge. Watch its mtime rather than polling its
@@ -65,9 +85,11 @@ export default {
     /* ---------------------------------------------------------------- toasts */
 
     // Announce transitions that a user would otherwise miss: a mode change, a
-    // loop starting or stopping, and a model rotation. Deduplicated on the
-    // state's `updated` stamp so a heartbeat does not spam.
+    // loop starting or stopping, and a model rotation. Deduplicated twice —
+    // on the `updated` stamp so a heartbeat does not spam, and on the message
+    // itself so a stale result cannot re-toast on every unrelated write.
     let lastAnnounced = 0
+    let lastMessage = ""
     const announceInterval = setInterval(() => {
       const state = read()
       if (state.updated === lastAnnounced) return
@@ -78,8 +100,10 @@ export default {
         toast(ctx, "info", "dont-stop", `loop running in ${state.mode} mode`)
         return
       }
-      if (state.loop.lastResult) {
-        toast(ctx, "info", "dont-stop", state.loop.lastResult)
+      const message = state.loop.lastResult
+      if (message && message !== lastMessage) {
+        lastMessage = message
+        toast(ctx, "info", "dont-stop", message)
       }
     }, 1000)
 
@@ -114,6 +138,17 @@ export default {
      */
     const commands = [
       {
+        id: "dont-stop.status",
+        title: "dont-stop: show status",
+        description: "Report mode, loop state, iterations and model",
+        group: "dont-stop",
+        suggested: true,
+        run: () => {
+          const s = read()
+          toast(ctx, "info", "dont-stop", statusLine(s))
+        },
+      },
+      {
         id: "dont-stop.cycle-mode",
         title: "dont-stop: cycle mode",
         description: "Cycle free, cheap, local, power",
@@ -145,6 +180,13 @@ export default {
     const disposeKeymapSlot = ctx.ui.slot({
       append: "app",
       render: () => {
+        // Dispose the previous layer before registering the next one. The app
+        // slot can re-render (a state-file churn re-renders the tree it sits
+        // in), and a render that registered a fresh layer on top of the old
+        // one left both live — every re-render added a duplicate "dont-stop"
+        // command to the palette, which is the "Session/System sections
+        // cycling" symptom: the palette wasn't refreshing, it was growing.
+        disposeKeymap?.()
         disposeKeymap = ctx.keymap.layer(() => ({
           mode: "global",
           priority: 10,
@@ -221,18 +263,14 @@ interface FooterProps {
 }
 
 /**
- * The footer. Shows mode, loop progress, and the working model. Kept to two
- * short segments so it never crowds the composer it sits beside.
+ * The footer. Always visible, so the loop's state is never a mystery: mode,
+ * iterations while running, a pending halt, and the model. Kept to two short
+ * segments so it never crowds the composer it sits beside.
  */
 function DontStopFooter(props: FooterProps): JSX.Element {
   const state = props.state
   const mode = state.mode
   const loop = state.loop
-
-  if (loop.status !== "active" && mode === "free") {
-    // The default mode with no loop running is not worth any footer space.
-    return <></>
-  }
 
   const iterations = loop.iterations
   const degraded = state.degraded ? "!" : ""
@@ -260,8 +298,24 @@ function DontStopFooter(props: FooterProps): JSX.Element {
       ) : (
         <text fg="gray">idle</text>
       )}
+      {state.cooldowns && Object.keys(state.cooldowns).length > 0 ? (
+        <text fg="yellow">cooling {Object.keys(state.cooldowns).length}</text>
+      ) : null}
     </box>
   )
+}
+
+/** One-line status, for the palette command and status toasts. */
+function statusLine(state: PluginState): string {
+  const loop = state.loop
+  const parts = [
+    `mode ${state.mode}${state.degraded ? " (degraded)" : ""}`,
+    `loop ${loop.status}${loop.iterations > 0 ? `, ${loop.iterations} iteration${loop.iterations === 1 ? "" : "s"}` : ""}`,
+  ]
+  if (state.main) parts.push(`model ${state.main.providerID}/${state.main.id}`)
+  const cooling = Object.keys(state.cooldowns).length
+  if (cooling > 0) parts.push(`${cooling} model${cooling === 1 ? "" : "s"} cooling`)
+  return parts.join(" · ")
 }
 
 /* ------------------------------------------------------------------ helpers */

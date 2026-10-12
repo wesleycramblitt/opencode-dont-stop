@@ -17,6 +17,7 @@ import type { Mode } from "./state.ts"
 export type ErrorKind =
   | "interrupted"
   | "funds"
+  | "freequota"
   | "rate"
   | "capability"
   | "notfound"
@@ -58,6 +59,29 @@ export interface ErrorAction {
   reason: string
 }
 
+/**
+ * A free model that failed stays out of the sweep for a full day.
+ *
+ * Free endpoints fail at the door: a provider-wide rate limit, an exhausted
+ * promotional quota, a dropped socket on a hosted free tier. None of those
+ * clear in seconds, and the observed cost of the old 60s/15s/30s windows was a
+ * loop that handed the same refused model its turn again — and again — instead
+ * of walking the sweep. One try, one day out.
+ */
+export const FREE_MODEL_TIMEOUT_MS = 24 * 60 * 60 * 1000
+
+/**
+ * A free model whose promotional quota is spent is out for good.
+ *
+ * The allowance is gone for the grant's whole window (91 days), so waiting
+ * does not bring it back: putting it on cooldown is what the sweep needed, and
+ * a timeout is the cooldown shape the rest of this module already speaks. It
+ * survives restarts, which is the point — a spent quota is not a flake — and a
+ * mode change clears it, because the free sweep is the only reason the model
+ * was excluded (in `cheap` the same model is a paid row and is selectable).
+ */
+export const PERMANENT_COOLDOWN_MS = Number.MAX_SAFE_INTEGER
+
 interface Pattern {
   kind: ErrorKind
   test: RegExp
@@ -73,10 +97,16 @@ interface Pattern {
  * user's), and scoring it as a failure is what used to send recovery into a
  * spin — the interrupt that unstuck a turn came back as an "unclassified
  * error" and bought another rotation.
+ *
+ * `freequota` sits above `funds` because it is the narrower fact: an
+ * exhausted promotional allowance says nothing about the account's balance,
+ * and answering it with "out of money" would degrade a mode that still has
+ * plenty of paid models behind it.
  */
 const PATTERNS: Pattern[] = [
   { kind: "interrupted", test: /\binterrupt(ed|ion|ing)?\b|\baborted?\b|cancel(led|ed)/i, transient: true },
-  { kind: "funds", test: /insufficient[ _-]?(funds|balance|credit|quota)|billing|payment required|no credits|exceeded your (current )?quota/i, transient: false },
+  { kind: "freequota", test: /free[ _-]?quota|promotional (quota|allowance|tier)|quota .{0,40}(exhaust|depleted|used up|ran out)|(exhaust|depleted|used up|ran out).{0,40}quota|free tier limit/i, transient: false },
+  { kind: "funds", test: /insufficient[ _-]?(funds|balance|credit|quota)|billing|payment required|no credits|exceeded your (current )?quota|arrear|account balance|balance is insufficient|insufficient (account )?balance/i, transient: false },
   { kind: "rate", test: /rate ?limit|too many requests|429|slow down|throttl|retry after|quota exceeded for|resource exhausted/i, transient: true },
   { kind: "context", test: /context ?(length|window|limit)|maximum context|too long|prompt is too (long|large)|exceeds? (the )?max(imum)? context|tokens? (exceed|limit)/i, transient: false },
   { kind: "capability", test: /does not support|unsupported|not support|capability|vision|image input|tool (call|use)|function call|invalid (model|modality)|modality|cannot process|no such tool/i, transient: false },
@@ -110,40 +140,75 @@ export function classify(input: {
   const status = input.status ?? statusOfError(input.error)
   const type = (input.type ?? "").toLowerCase()
 
-  let kind: ErrorKind = "other"
-
-  // The provider's declared error type is the strongest signal.
-  if (type) {
-    if (/interrupt|abort|cancel/.test(type)) kind = "interrupted"
-    else if (/fund|billing|credit|quota|payment/.test(type)) kind = "funds"
-    else if (/rate|throttl|limit/.test(type)) kind = "rate"
-    else if (/context|length|token/.test(type)) kind = "context"
-    else if (/capab|modality|support|vision|tool/.test(type)) kind = "capability"
-    else if (/not.?found|missing|unknown/.test(type)) kind = "notfound"
-    else if (/auth|permission|forbidden/.test(type)) kind = "auth"
-    else if (/network|timeout|connection/.test(type)) kind = "network"
-  }
-
-  // Then the status code, then the message body.
-  if (kind === "other" && status !== undefined && STATUS_KINDS[status]) {
-    kind = STATUS_KINDS[status]
-  }
-  if (kind === "other" && message) {
-    for (const pattern of PATTERNS) {
-      if (pattern.test.test(message)) {
-        kind = pattern.kind
-        break
-      }
-    }
-  }
+  const byType = type ? kindOfType(type) : undefined
+  const byStatus = status !== undefined ? STATUS_KINDS[status] : undefined
+  // The message outranks both the type and the status, and the order matters:
+  // an `AI.Error` from the AI SDK carries a *class* name that is coarser than
+  // the failure it reports, and a status wrapped by a proxy can belong to a
+  // different failure than the sentence describes. Both were observed calling
+  // "Rate limit exceeded. Please try again later." a *funds* error — which
+  // bought a mode degrade instead of a rotation. The provider's own words are
+  // the fact; the labels are hints. `interrupted` leads the message patterns
+  // so the loop's own cancellation is never scored as a failure.
+  const byMessage = message ? firstMatch(message) : undefined
+  const kind = byMessage ?? byType ?? byStatus ?? "other"
 
   const transient = kind === "rate" || kind === "network" || kind === "other" || kind === "interrupted"
-  return { kind, message, status, transient }
+  return { kind: kind as ClassifiedError["kind"], message, status, transient }
+}
+
+/** The kind a message's own wording names, or undefined when it says none. */
+function firstMatch(message: string): ErrorKind | undefined {
+  for (const pattern of PATTERNS) if (pattern.test.test(message)) return pattern.kind
+  return undefined
+}
+
+/** The kind a provider error *type* string names. */
+function kindOfType(type: string): ErrorKind | undefined {
+  if (/interrupt|abort|cancel/.test(type)) return "interrupted"
+  if (/free[ _-]?quota|promotional/.test(type)) return "freequota"
+  if (/fund|billing|credit|quota|payment/.test(type)) return "funds"
+  if (/rate|throttl|limit/.test(type)) return "rate"
+  if (/context|length|token/.test(type)) return "context"
+  if (/capab|modality|support|vision|tool/.test(type)) return "capability"
+  if (/not.?found|missing|unknown/.test(type)) return "notfound"
+  if (/auth|permission|forbidden/.test(type)) return "auth"
+  if (/network|timeout|connection/.test(type)) return "network"
+  return undefined
 }
 
 /** Decide what to do about a classified error, given the current mode. */
 export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
-  switch (error.kind) {
+  const action = actionForKind(error.kind, error.message)
+  if (error.kind === "interrupted") return action
+  if (mode !== "free") return action
+
+  // The free-sweep policy (owner, 2026-10-11): one try per free endpoint,
+  // then it stays out of the sweep. A spent promotional quota is out for the
+  // grant's whole window — PERMANENT_COOLDOWN_MS — which is different in kind
+  // from a transient failure: the model is not down, it is no longer free. Any
+  // other failure gets a full day, and nothing in the free sweep ever gets a
+  // second attempt from a retry flag. Rotation is the recovery: every turn
+  // walks to the next untried model, and the cooldown expiry — or a mode
+  // change, which clears permanent entries — is what brings one back.
+  if (error.kind === "freequota") {
+    return {
+      ...action,
+      cooldownMs: PERMANENT_COOLDOWN_MS,
+      reason: "free quota exhausted; model stays out of the free sweep",
+    }
+  }
+  return {
+    ...action,
+    retry: false,
+    cooldownMs: Math.max(action.cooldownMs, FREE_MODEL_TIMEOUT_MS),
+    reason: `${action.reason} — free policy: one day out of the sweep`,
+  }
+}
+
+/** The base action per kind, before the mode's policy is applied. */
+function actionForKind(kind: ErrorKind, message: string): ErrorAction {
+  switch (kind) {
     case "interrupted":
       // Not a failure. The request was cancelled — by this plugin's own hang
       // recovery, or by the user pressing escape. Cooldowns and rotation are
@@ -164,12 +229,29 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
       return {
         cooldownMs: 60 * 60 * 1000,
         resweep: true,
+        // The account is out of money: drop to a cheaper mode, and stay there
+        // until the user brings it back — the owner's policy is that a mode
+        // degraded away is not self-reinstated.
         degrade: true,
         restrict: null,
         stop: false,
-        // The account is out of money: a second attempt fails the same way.
+        // A second attempt fails the same way.
         retry: false,
         reason: "insufficient funds; degrading to a cheaper mode",
+      }
+
+    case "freequota":
+      return {
+        // Outside the free sweep this is a fact about the promotional grant,
+        // not the account: rotate past the model for the rest of the hour. In
+        // `free` mode `actionFor` turns this into PERMANENT_COOLDOWN_MS.
+        cooldownMs: 60 * 60 * 1000,
+        resweep: true,
+        degrade: false,
+        restrict: null,
+        stop: false,
+        retry: false,
+        reason: "promotional free quota exhausted; rotating past it",
       }
 
     case "rate":
@@ -178,7 +260,8 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
         // The limit clears, the cooldown expires, and `expireCooldowns` puts
         // the model back into contention — which is the "try again on free"
         // path: the sweep moves on *now* instead of waiting out the window on
-        // a model that is refusing work.
+        // a model that is refusing work. In `free` mode `actionFor` lengthens
+        // this to a full day; this value is the paid-mode policy.
         cooldownMs: 60 * 1000,
         resweep: true,
         degrade: false,
@@ -201,7 +284,7 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
         cooldownMs: 5 * 60 * 1000,
         resweep: true,
         degrade: false,
-        restrict: restrictionFor(error.message),
+        restrict: restrictionFor(message),
         stop: false,
         retry: false,
         reason: "model lacks a required capability; restricting the pool",
@@ -320,27 +403,12 @@ function statusOfError(error: unknown): number | undefined {
   return undefined
 }
 
-/**
- * How many consecutive unclassified/other errors before the loop gives up.
- * Classified transient errors do not count toward this.
- */
-export const MAX_CONSECUTIVE_ERRORS = 5
-
-/** Should the accumulated error count stop the loop? */
-export function shouldStop(count: number): boolean {
-  return count >= MAX_CONSECUTIVE_ERRORS
-}
-
-/** Does this error count toward the consecutive-failure budget? */
-export function countsTowardStop(error: ClassifiedError): boolean {
-  return error.kind === "other" || error.kind === "auth"
-}
-
 /** Short human description of an error kind, for logs and status. */
 export function describeError(kind: ErrorKind): string {
   switch (kind) {
     case "interrupted": return "request interrupted"
     case "funds": return "insufficient funds"
+    case "freequota": return "promotional free quota exhausted"
     case "rate": return "rate limited"
     case "context": return "context exceeded"
     case "capability": return "capability mismatch"

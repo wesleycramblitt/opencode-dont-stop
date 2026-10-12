@@ -139,21 +139,43 @@ test("classification reads status and message", () => {
   assert.equal(classify({ message: "ECONNRESET while streaming" }).kind, "network")
 })
 
-test("a rate limit rotates now, and the cooldown is what buys the model its turn back", () => {
-  const action = actionFor(classify({ status: 429, message: "rate limit reached" }), "free")
-  assert.equal(action.resweep, true)
-  assert.equal(action.retry, false)
-  assert.equal(action.cooldownMs, 60_000)
+test("the message outranks a mislabeled type or status", () => {
+  // Observed in the wild: "Rate limit exceeded. Please try again later." was
+  // read as a *funds* error through a wrapped status, which degraded a mode
+  // instead of rotating. The provider's own sentence wins.
+  assert.equal(classify({ message: "Rate limit exceeded. Please try again later.", status: 402 }).kind, "rate")
+  assert.equal(classify({ message: "The free quota has been exhausted: qwen3-turbo", status: 402 }).kind, "freequota")
 })
 
-test("funds errors steer down the chain, network errors retry once", () => {
+test("free-mode failures: one try, one day out, spent quotas out forever", () => {
+  const rate = actionFor(classify({ message: "rate limit reached" }), "free")
+  assert.equal(rate.resweep, true)
+  assert.equal(rate.retry, false)
+  assert.equal(rate.cooldownMs, 24 * 60 * 60 * 1000)
+
+  const network = actionFor(classify({ message: "fetch failed" }), "free")
+  assert.equal(network.retry, false)
+  assert.equal(network.cooldownMs, 24 * 60 * 60 * 1000)
+
+  const quota = actionFor(classify({ message: "The free quota has been exhausted" }), "free")
+  assert.equal(quota.retry, false)
+  assert.equal(quota.cooldownMs, Number.MAX_SAFE_INTEGER)
+  assert.equal(quota.degrade, false)
+})
+
+test("outside the free sweep the base actions stand, and freequota rotates", () => {
   const funds = actionFor(classify({ message: "insufficient funds" }), "cheap")
   assert.equal(funds.degrade, true)
   assert.equal(funds.retry, false)
 
-  const network = actionFor(classify({ message: "fetch failed" }), "free")
+  const network = actionFor(classify({ message: "fetch failed" }), "cheap")
   assert.equal(network.retry, true)
   assert.equal(network.degrade, false)
+
+  const quota = actionFor(classify({ message: "The free quota has been exhausted" }), "cheap")
+  assert.equal(quota.retry, false)
+  assert.equal(quota.degrade, false)
+  assert.equal(quota.cooldownMs, 60 * 60 * 1000)
 })
 
 /* -------------------------------------------------------------------- catalogue */
@@ -227,9 +249,13 @@ test("unroutable and cooling models never satisfy a query", () => {
 })
 
 test("the curated free tier table is the one the catalogue loads from", () => {
-  assert.ok(FREE_TIERS["alibaba/qwen3.7-flash"]?.tokens === 1_000_000)
-  assert.equal(FREE_TIERS["alibaba/qwen3.7-flash"]?.enabled, true)
-  assert.equal(FREE_TIERS["alibaba/deepseek-v4-flash-0731"]?.enabled, false)
+  // The 2026-10-12 console snapshot: every row switched on, and the models
+  // whose promotional quota is spent (qwen3.7-flash among them) are absent —
+  // they are paid rows now, not free-tier rows.
+  assert.ok(FREE_TIERS["alibaba/qwen3.8-flash"]?.tokens === 1_000_000)
+  assert.equal(FREE_TIERS["alibaba/qwen3.8-flash"]?.enabled, true)
+  assert.equal(FREE_TIERS["alibaba/deepseek-v4-flash-0731"]?.enabled, true)
+  assert.ok(FREE_TIERS["alibaba/qwen3.7-flash"] === undefined)
   // Every entry names its source and the account state, so a number can be
   // audited rather than trusted, and the blanket promotion is uniform.
   for (const [key, tier] of Object.entries(FREE_TIERS)) {

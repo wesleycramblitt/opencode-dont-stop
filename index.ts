@@ -20,6 +20,7 @@ import { eventData, eventSignals, TURN_END_TYPES, type SessionEvent } from "./li
 import { fetchCatalogue, writeCatalogue } from "./lib/fetch.ts"
 import {
   MODES,
+  dontStopDisabled,
   readState,
   statePath,
   writeState,
@@ -58,6 +59,17 @@ export default {
 
   async setup(ctx: unknown) {
     const context = ctx as PluginServerContext
+
+    // The hard switch (lib/state.ts dontStopDisabled): with the plugin still
+    // registered, an inert load means nothing is applied — no engine, no
+    // watcher, no command surface — so no session's model can move. It is
+    // honored without a restart, which removing the plugin from `plugins`
+    // cannot be.
+    if (dontStopDisabled()) {
+      console.log("[dont-stop] disabled (DONT_STOP_DISABLED); loading inert")
+      return () => {}
+    }
+
     const state: PluginState = readState()
     const log = createLogger(state)
 
@@ -193,6 +205,16 @@ export default {
         void context.agent.reload().catch(() => {})
       }, delay),
     )
+
+    // The model registry is likewise still settling while setup runs, so the
+    // reachability read `discover()` took can be missing providers that load
+    // moments later. Re-derive until it settles; each pass is an in-process
+    // read that logs only when the counts move.
+    for (const delay of [500, 2000, 5000, 15000]) {
+      setTimeout(() => {
+        void engine.recheckReachability().catch(() => {})
+      }, delay)
+    }
 
     // Discovery must not hold up startup; the engine applies the plan the
     // moment it lands.
