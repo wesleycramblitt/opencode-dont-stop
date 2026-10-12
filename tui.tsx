@@ -80,6 +80,12 @@ export default {
     const disposeFooter = ctx.ui.slot({
       replace: "prompt.footer.status",
       render: (props: { sessionID?: string }) => {
+        // Session switched: the follow flags belong to the session the
+        // terminal was watching, not to the terminal itself.
+        if (props.sessionID !== currentSessionID) {
+          watchingLoop = false
+          sawLoopHere = false
+        }
         currentSessionID = props.sessionID ?? null
         const [snap, setSnap] = createSignal<PluginState>(read())
         const version = ++slotVersion
@@ -105,10 +111,13 @@ export default {
     let lastMessage = ""
     let currentSessionID: string | null = null
     // Whether the last observation had THIS terminal's session as an active
-    // loop's home. Only such a terminal follows a rotation — a tab opened on
-    // an already-retired session stays put instead of being yanked to the
-    // loop's current home.
+    // loop's home, and whether this terminal has EVER seen a loop record on
+    // its session. A terminal that saw one and then finds it gone — rotations
+    // delete the record — follows the loop that claims to have left, so a tab
+    // can never sit staring at a retired loop, even one opened after the
+    // rotation moment.
     let watchingLoop = false
+    let sawLoopHere = false
     const announceInterval = setInterval(() => {
       const state = read()
       if (state.updated === lastAnnounced) return
@@ -119,12 +128,14 @@ export default {
       const primary = loops.find((l) => l.status === "active")
       const here = currentSessionID ? state.loops[currentSessionID] : undefined
 
-      // The loop rotated away from this terminal's session: move the view to
+      // The loop left this terminal's session — a rotation. Move the view to
       // the successor so a terminal that was watching the loop keeps
       // watching it. Chains follow naturally — once this terminal lands on
       // the successor, the next rotation retires it the same way.
-      if (watchingLoop && !here && primary && primary.rotatedFrom === currentSessionID) {
-        watchingLoop = false
+      if (here) {
+        sawLoopHere = true
+      } else if (sawLoopHere && primary && primary.rotatedFrom === currentSessionID) {
+        sawLoopHere = false
         followSession(primary.sessionID!)
       }
       watchingLoop = here?.status === "active"

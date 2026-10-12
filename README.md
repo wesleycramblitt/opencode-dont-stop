@@ -566,11 +566,13 @@ Three things trigger a rotation:
    local fallback, where OpenCode's model metadata (a 3.5M native window) does
    not match what the daemon serves (64k), so auto-compaction would not fire.
 
-The architect's free-mode chain leads with `qwen3-coder:30b-ctx256k`, a local
-variant whose Modelfile bakes `num_ctx 262144`: the ollama daemon serves the
-plain `qwen3-coder:30b` tag at `OLLAMA_CONTEXT_LENGTH` (64k here), which
-would retire an architect session after one turn. The engine measures the
-window `/api/ps` actually reports, so the baked parameter is what the
+The architect's free-mode chain leads with `qwen3.5:9b-ctx256k`, a local
+variant whose Modelfile bakes `num_ctx 262144`, with `qwen3-coder:30b-ctx256k`
+(a same-window variant) as the capable fallback: the ollama daemon serves the
+plain tags at `OLLAMA_CONTEXT_LENGTH` (64k here), which would retire an
+architect session after one turn, and a 30B at 262k is tight on a 24GB card —
+the 9B serves the same window for a fraction of the VRAM. The engine measures
+the window `/api/ps` actually reports, so the baked parameter is what the
 rotation threshold (0.8 × served) uses.
 
 Three properties make rotation safe:

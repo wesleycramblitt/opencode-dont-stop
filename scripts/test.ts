@@ -468,14 +468,17 @@ function catalogueOf(models: CatalogueModel[]): Catalogue {
   }
 }
 
-test("the architect's free-mode chain leads with its preferred model", () => {
+test("the architect's free-mode chain leads with its preferred models", () => {
   const cat = catalogueOf([
     row({ key: "oller/zeta", providerID: "oller", id: "zeta", local: false, context: 262144 }),
-    row({ key: "ollama/qwen3-coder:30b", providerID: "ollama", id: "qwen3-coder:30b", local: true, context: 262144 }),
+    row({ key: "ollama/qwen3.5:9b", providerID: "ollama", id: "qwen3.5:9b", local: true, context: 262144 }),
+    row({ key: "ollama/qwen3.5:9b-ctx256k", providerID: "ollama", id: "qwen3.5:9b-ctx256k", local: true, context: 262144 }),
     row({ key: "ollama/qwen3-coder:30b-ctx256k", providerID: "ollama", id: "qwen3-coder:30b-ctx256k", local: true, context: 262144 }),
+    row({ key: "ollama/qwen3-coder:30b", providerID: "ollama", id: "qwen3-coder:30b", local: true, context: 262144 }),
   ])
   const architect = rankForMode(cat, "free", profileFor("architect"))
-  assert.equal(architect[0].key, "ollama/qwen3-coder:30b-ctx256k", "the architect leads with the big-window local coder")
+  assert.equal(architect[0].key, "ollama/qwen3.5:9b-ctx256k", "the architect leads with the small big-window coder")
+  assert.equal(architect[1].key, "ollama/qwen3-coder:30b-ctx256k", "the 30B variant follows as the capable fallback")
   assert.ok(architect.some((m) => m.key === "ollama/qwen3-coder:30b"), "the plain tag stays in the chain as fallback")
   const general = rankForMode(cat, "free", profileFor("general"))
   assert.equal(general[0].key, "oller/zeta", "smaller tasks keep the remote-first sweep")
@@ -991,6 +994,24 @@ test("a failed delete of the retired session is non-fatal", async () => {
   await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
   assert.ok(state.loops["ses_new"], "the rotation still lands on the successor")
   assert.equal(state.loops["ses_loop"], undefined, "the loop record still moves to it")
+})
+
+test("the retired session delete retries once before giving up", async () => {
+  const { engine, state } = makeEngine("i1", { sessionSteps: 1, sessionMinSteps: 1 })
+  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
+  armLoop(engine, state, "i1", "ses_loop")
+  const flaky = fakeContext()
+  let calls = 0
+  ;(flaky.context.session as unknown as { remove(input: { sessionID: string }): Promise<unknown> }).remove =
+    async () => {
+      calls += 1
+      if (calls === 1) throw new Error("first attempt raced the settle")
+    }
+  ;(engine as unknown as { ctx: unknown }).ctx = flaky.context
+
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(calls, 2, "the remove is retried once")
+  assert.ok(state.loops["ses_new"], "the rotation landed")
 })
 
 test("a task-boundary signal rotates only after real work in the session", async () => {

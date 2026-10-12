@@ -106,10 +106,12 @@ export function profileFor(kind: AgentKind, overrides: Partial<TaskProfile> = {}
  * (gemini, qwen3.5, the remote free sweep) serves the smaller tasks.
  */
 export const AGENT_LEADS: Partial<Record<AgentKind, readonly string[]>> = {
-  // The `-ctx256k` variant carries a Modelfile-baked num_ctx of 262144 — the
-  // daemon serves the plain `qwen3-coder:30b` tag at OLLAMA_CONTEXT_LENGTH
-  // (64k), which retires an architect session after one turn.
-  architect: ["ollama/qwen3-coder:30b-ctx256k"],
+  // Big-window local variants, leading with the small model: the KV cache
+  // scales with the weights, so qwen3.5:9b-ctx256k serves the same 262144
+  // window as the 30B for a fraction of the VRAM — the daemon serves the
+  // plain tags at OLLAMA_CONTEXT_LENGTH (64k), which retires an architect
+  // session after one turn, and the 30B at 262k is tight on a 24GB card.
+  architect: ["ollama/qwen3.5:9b-ctx256k", "ollama/qwen3-coder:30b-ctx256k"],
 }
 
 /** Rank rows for one task under one mode. Pure and deterministic. */

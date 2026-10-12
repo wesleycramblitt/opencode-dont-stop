@@ -319,8 +319,16 @@ export async function rotate(
     await ctx.session.remove({ sessionID: input.sessionID })
     deletedOld = true
   } catch (error) {
-    deleteError = messageOf(error)
-    console.warn(`[dont-stop] could not delete retired session ${input.sessionID}: ${deleteError}`)
+    // One retry a second later: the removal runs moments after the retired
+    // session's turn ends, and a server-side settle can race the first call.
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    try {
+      await ctx.session.remove({ sessionID: input.sessionID })
+      deletedOld = true
+    } catch (again) {
+      deleteError = messageOf(again)
+      console.warn(`[dont-stop] could not delete retired session ${input.sessionID}: ${deleteError}`)
+    }
   }
 
   return { rotated: true, newSessionID, deletedOld, deleteError }
