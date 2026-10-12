@@ -60,15 +60,6 @@ export interface LoopState {
   preferredMode: Mode | null
   /** Consecutive errors this loop's session survived (reported, never fatal). */
   consecutiveErrors: number
-  /**
-   * A completion claim awaiting verification. A model's first
-   * `<loop-complete/>` does not stop the loop: it buys one verification turn
-   * in which the model is asked to confirm the deliverables before it may
-   * end the loop, so a single bare token cannot stop hours of work. Set when
-   * the sentinel is first seen, cleared when the loop stops or the model
-   * continues working.
-   */
-  pendingComplete: boolean
 }
 
 /** One loop per session, keyed by session id. */
@@ -187,7 +178,6 @@ function loopState(mode: Mode): LoopState {
     degraded: false,
     preferredMode: null,
     consecutiveErrors: 0,
-    pendingComplete: false,
   }
 }
 
@@ -218,7 +208,7 @@ function mergeState(base: PluginState, patch: Partial<PluginState>): PluginState
   next.loops = { ...patch.loops }
   // Normalize per-session rows: files written before a field existed carry
   // only the pieces their writer knew, so each row is completed over the
-  // factory default — `pendingComplete` included.
+  // factory default.
   for (const [sessionID, row] of Object.entries(next.loops)) {
     if (row) next.loops[sessionID] = { ...loopState(row.mode ?? base.mode), ...row }
   }

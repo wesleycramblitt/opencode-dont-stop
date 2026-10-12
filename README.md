@@ -230,10 +230,9 @@ it are where the old design spun:
   model that was refused wins its next try *ahead* of the local tail rather
   than being locked out for the rest of the turn.
 - **The loop does not stop itself** (owner, 2026-10-11). The iteration budget,
-  the consecutive-error budget, an exhausted chain and repeated interrupts
-  are all *reported*, never terminal: the loop waits for cooldowns, keeps
-  re-driving, and ends only on a halt — or on the task's own completion
-  sentinel, which an indefinite prompt never emits.
+  the consecutive-error budget, an exhausted chain, repeated interrupts and a
+  completion claim are all *reported*, never terminal: the loop waits for
+  cooldowns, keeps re-driving, and ends only on a halt.
 
 Hang recovery only ever touches the session the loop is driving. Any other
 session — including the user's own — is never interrupted or re-modelled by
@@ -422,7 +421,7 @@ session.execution.*        -> advance()  (only in the owning instance)
   if the turn completed    -> reset the try budget (models tried, failures)
   if the turn merely errored into idleness, the budget survives it
   read the last assistant turn
-  if completion sentinel   -> stop that loop ("task complete after N iterations")
+  if completion sentinel   -> report the claim, keep working (never a stop)
   otherwise:
     re-plan                 -> re-rank, sweep for a better/available model, switch
     send the continue prompt -> session goes busy, hang clock re-arms
@@ -479,22 +478,22 @@ every prompt is appended with an instruction to reply with exactly
 it is deterministic and costs no extra model call, which an "is it done?" probe
 would.
 
-**One sentinel never stops the loop — completion needs two commitments.** The
-sentinel is the model's own judgement, and models get it wrong: an eager model
-once declared a review-and-build sweep complete after compiling task files but
-before building anything. So the first `<loop-complete/>` only buys a
-verification turn (`VERIFY_PROMPT`): the model is asked to confirm the
-deliverables exist, the checks pass, and nothing promised is outstanding, and
-to reply with the sentinel again only then. A second sentinel — the answer to
-that explicit question — stops the loop; a model that reconsiders during the
-verification keeps working and the pending claim is cleared (`pendingComplete`
-on the loop record, reported in the state file).
+**But a sentinel never stops the loop.** The plan is that a loop ends only when
+its owner halts it (owner, 2026-10-12) — the sentinel is a *report*, and models
+get completion judgements wrong (one declared a review-and-build sweep complete
+after compiling task files but before building anything). So a claim is logged,
+surfaced through the loop's `lastResult`, and answered with
+`AFTER_COMPLETE_PROMPT`, which tells the model the policy plainly and turns the
+claim back into work: re-verify the final state, fix what is wrong or
+unverified, continue. A model that wants to stop the loop cannot; only the
+owner can.
 
-The sentinel is the only self-stop left (owner, 2026-10-11): the iteration
-budget, the consecutive-error budget, an exhausted chain and three interrupts
-are all reported but never terminal — the loop waits for cooldowns, re-drives,
-and keeps working until a halt. A read failure is treated as *not complete*, so
-a broken message read keeps the loop working rather than ending it.
+Nothing else is terminal either: the iteration budget, the consecutive-error
+budget, an exhausted chain and three interrupts are all reported but never stop
+— the loop waits for cooldowns, re-drives, and keeps working. A read failure is
+treated as *not complete*, so a broken message read keeps the loop working
+rather than ending it. `stop` — the halt command, the TUI key, the intent —
+is the one way out.
 
 ### Re-planning between turns
 

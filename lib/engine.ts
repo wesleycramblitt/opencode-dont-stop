@@ -100,10 +100,11 @@ export interface EngineOptions {
 }
 
 /**
- * How many iterations a loop may run before it stops itself.
+ * The iteration count at which the loop reports a runaway.
  *
- * A bound, not a target: the loop's real stopping condition is the completion
- * sentinel, and this exists so a model that never emits it cannot run forever.
+ * A report, not a bound (owner, 2026-10-11): loops end only when their owner
+ * halts them, so crossing this line logs a warning and continues — the
+ * counter exists so a runaway is visible in the footer, not so it can stop.
  */
 export const DEFAULT_MAX_ITERATIONS = 100
 
@@ -148,12 +149,15 @@ export const LEASE_GRACE_BEATS = 3
 /**
  * The completion sentinel.
  *
- * The loop cannot know on its own whether a task is finished — that is a
- * judgement about the work, and the only entity with the context is the model
- * doing it. So the loop asks: the prompt instructs the model to emit this exact
- * token when, and only when, the task is genuinely complete. Reading for it is
- * deterministic and needs no extra model call, which a "is it done?" probe
- * would.
+ * A *report*, never a stop. The loop cannot know on its own whether a task is
+ * finished — that is a judgement about the work, and the only entity with the
+ * context is the model doing it. So the prompt instructs the model to emit
+ * this exact token when it believes the task is complete; reading for it is
+ * deterministic and needs no extra model call. But the owner's policy is that
+ * a loop ends only when the owner halts it, so the claim is logged, surfaced
+ * through `lastResult`, and answered with `AFTER_COMPLETE_PROMPT` — the loop
+ * keeps working. A model that wants to stop the loop cannot; only its owner
+ * can.
  */
 export const COMPLETION_SENTINEL = "<loop-complete/>"
 
@@ -170,24 +174,21 @@ export const SENTINEL_INSTRUCTION =
 export const CONTINUE_PROMPT = "Continue. If the task is now fully complete, reply with only " + COMPLETION_SENTINEL
 
 /**
- * Sent after a model first claims completion with the sentinel.
+ * Sent after a model claims completion.
  *
- * A single `<loop-complete/>` must not be able to end hours of work: the
- * sentinel is the model's own judgement, and models get it wrong — an eager
- * model declared a review-and-build sweep complete after compiling task files
- * but before building anything. Before the loop may stop, the model is asked
- * to verify the claim (deliverables exist, checks pass, nothing promised
- * outstanding) and to confirm the sentinel a second time. If the verification
- * comes back with the sentinel again, the loop stops; if it comes back with
- * work, the loop simply continues and the pending claim is cleared.
+ * The sentinel is a report, never a stop: the loop only ends when its owner
+ * halts it, and a model that believes the task is done must keep working
+ * rather than park on the marker. This prompt acknowledges the claim, states
+ * the policy explicitly (so the model does not just emit the sentinel again),
+ * and points it back at the work: verify the final state, fix what is wrong
+ * or unverified, and continue.
  */
-export const VERIFY_PROMPT =
-  `You signalled that the task is fully complete with ${COMPLETION_SENTINEL}. ` +
-  `Before the loop stops, verify that claim: confirm the deliverables actually exist, ` +
-  `the checks actually pass, and nothing the task promised is still outstanding ` +
-  `(read files, run the verification steps). ` +
-  `Reply with exactly ${COMPLETION_SENTINEL} only if the task is genuinely, fully ` +
-  `finished — otherwise keep working and reply normally.`
+export const AFTER_COMPLETE_PROMPT =
+  `You signalled completion with ${COMPLETION_SENTINEL}, but this loop does not ` +
+  `stop on its own — only its owner halts it. Verify the final state once more ` +
+  `and continue the underlying task: fix anything still wrong, incomplete, or ` +
+  `unverified, and carry on working. Do not reply with ${COMPLETION_SENTINEL} ` +
+  `again; reply with the work.`
 
 /**
  * What a rotation attempt did.
@@ -1383,8 +1384,10 @@ export class LoopEngine {
    *
    * 1. Count the completed iteration.
    * 2. Read the last assistant turn and look for the completion sentinel. Its
-   *    presence means the model judged the work finished, which stops the loop.
-   * 3. Stop if the iteration budget or the error budget is spent.
+   *    presence is *reported*, never acted on: a loop ends only when its owner
+   *    halts it, so the claim is logged and answered with a prompt that turns
+   *    it back into work.
+   * 3. Report (but never act on) a spent iteration budget or error budget.
    * 4. Otherwise **re-plan** — re-rank the catalogue, sweep for a model that
    *    has become available or a better one for the task, and switch the
    *    session if the answer changed. This is the "continually evaluate on each
@@ -1419,35 +1422,23 @@ export class LoopEngine {
       this.emit()
 
       if (iteration >= this.maxIterations) {
-        // Not a stop (owner, 2026-10-11): the loop runs until it is halted or
-        // the task's own completion sentinel appears. The iteration counter is
-        // still reported so a runaway is visible in the footer.
+        // Not a stop (owner, 2026-10-11): the loop runs until its owner
+        // halts it. The iteration counter is still reported so a runaway is
+        // visible in the footer.
         this.log.warn(`iteration ${iteration} reached the ${this.maxIterations} budget; continuing`)
       }
 
       const lastText = await this.lastAssistantText(sessionID)
-      if (lastText.includes(this.sentinel)) {
-        // Completion needs two commitments. The first sentinel buys a
-        // verification turn (VERIFY_PROMPT): the model is asked to confirm
-        // the deliverables before it may end the loop. A second sentinel —
-        // the answer to that explicit question — stops it; a first sentinel
-        // on its own never does.
-        if (!loop.pendingComplete) {
-          loop.pendingComplete = true
-          loop.lastResult = "completion claimed; verifying before stopping"
-          this.log.info(`completion claimed on ${sessionID}; asking the model to verify before stopping`)
-          await this.sendPrompt(sessionID, VERIFY_PROMPT)
-          this.clocks.clocksFor(sessionID).start(Date.now())
-          this.emit()
-          return
-        }
-        loop.pendingComplete = false
-        await this.stop(`task complete after ${iteration} iterations (verified)`, sessionID)
-        return
+      const claimed = lastText.includes(this.sentinel)
+      if (claimed) {
+        // A completion claim is a report, never a stop: the loop only ends
+        // when its owner halts it (owner policy). It is logged and surfaced
+        // through lastResult so the owner can see the model believes the task
+        // is done — and then the loop continues with a prompt that turns the
+        // claim back into work instead of inviting a sentinel echo.
+        this.log.info(`completion claimed on ${sessionID} at iteration ${iteration}; continuing (loops end only by halt)`)
+        loop.lastResult = `completion claimed at iteration ${iteration}; continuing`
       }
-      // A turn with no sentinel claim is the model still working: whatever
-      // was pending is no longer pending.
-      loop.pendingComplete = false
 
       if (loop.consecutiveErrors >= 5) {
         // Not a stop (owner, 2026-10-11): the loop survives its own error
@@ -1467,13 +1458,17 @@ export class LoopEngine {
       // model rather than whatever happened to be selected earlier.
       await this.refresh(false)
 
-      await this.sendPrompt(sessionID, CONTINUE_PROMPT)
+      // A fresh completion claim is pointed back at the work; anything else
+      // gets the plain continue.
+      await this.sendPrompt(sessionID, claimed ? AFTER_COMPLETE_PROMPT : CONTINUE_PROMPT)
       this.clocks.clocksFor(sessionID).start(Date.now())
       // A deferred handoff is worth surfacing: the loop is continuing on a
       // window that is already past its threshold, and the reason (usually a
       // live subagent) is the thing a user would want to know.
       const deferred = handoff === "deferred" ? ` (handoff deferred: ${loop.lastResult ?? "unknown"})` : ""
-      loop.lastResult = `iteration ${iteration} done; continuing${deferred}`
+      loop.lastResult = claimed
+        ? `iteration ${iteration} done; completion claimed, continuing${deferred}`
+        : `iteration ${iteration} done; continuing${deferred}`
       this.log.info(`loop iteration ${iteration} complete; continuing`)
       this.emit()
     } catch (error) {
@@ -1660,7 +1655,6 @@ export class LoopEngine {
       degraded: false,
       preferredMode: null,
       consecutiveErrors: 0,
-      pendingComplete: false,
     }
     const loop = this.state.loops[sessionID]
     this.failedTurns.delete(sessionID)
@@ -1719,7 +1713,6 @@ export class LoopEngine {
       loop.owner = null
       loop.ownerBeatAt = 0
       loop.rotations = 0
-      loop.pendingComplete = false
       this.redrives.delete(sid)
       // The loop keeps its sessionID so a later `start` finds its home; the
       // owner is what says nobody drives it right now.
