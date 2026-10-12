@@ -848,7 +848,7 @@ export interface CatalogueRow {
   /** Strength scores 0-10. From benchmarks when available, else derived. */
   scores: { reasoning: number; code: number; agentic: number; general: number; capability: number }
   /** A declared free allowance, when one is curated for this model. */
-  freeTier: { tokens: number; windowDays: number; source: string } | null
+  freeTier: { tokens: number; windowDays: number; enabled: boolean; source: string } | null
   provenance: {
     metadata: "models.dev" | "ollama" | "local" | "alibaba"
     benchmark: string | null

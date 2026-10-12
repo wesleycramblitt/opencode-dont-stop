@@ -143,9 +143,16 @@ function rankFree(candidates: CatalogueModel[], task: TaskProfile): CatalogueMod
   const verified = sortBy(remoteFree.filter((m) => !m.provenance.estimated), sorts.verifiedFirst)
   const estimated = sortBy(remoteFree.filter((m) => m.provenance.estimated), sorts.capabilityContext)
 
-  // Quota-backed rows: the free allowance is the reason they are here, and
-  // within it the better model should be tried first.
-  const quotaRanked = sortBy(quota, sorts.capabilityContext)
+  // Quota-backed rows: the free allowance is the reason they are here. Order
+  // the account's switched-on quotas first (a "Not Enabled" model is a settings
+  // flip away, but it is not callable today and the chain is walked once per
+  // episode), then the better model within each group.
+  const quotaRanked = sortBy(quota, (a, b) => {
+    const ea = a.freeTier?.enabled === true ? 0 : 1
+    const eb = b.freeTier?.enabled === true ? 0 : 1
+    if (ea !== eb) return ea - eb
+    return sorts.capabilityContext(a, b)
+  })
 
   // Local fallback: best local model for the task.
   const localRanked = sortBy(local, sorts.capabilityContext)

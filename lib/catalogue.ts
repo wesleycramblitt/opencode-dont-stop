@@ -135,6 +135,8 @@ export interface FreeTier {
   tokens: number
   /** Window length in days. */
   windowDays: number
+  /** Whether the account has the model switched on. Account state, from the console snapshot. */
+  enabled: boolean
   source: string
 }
 
@@ -655,7 +657,10 @@ function freeTierOf(raw: Record<string, unknown>): FreeTier | null {
   const windowDays = typeof record.windowDays === "number" ? record.windowDays : Number(record.windowDays)
   const source = typeof record.source === "string" ? record.source : ""
   if (!Number.isFinite(tokens) || !Number.isFinite(windowDays) || !source) return null
-  return { tokens, windowDays, source }
+  // `enabled` defaults true so a row persisted before the flag existed is not
+  // silently demoted.
+  const enabled = record.enabled === undefined ? true : record.enabled === true
+  return { tokens, windowDays, enabled, source }
 }
 
 function benchmarks(value: unknown): Record<string, number | string> | null {

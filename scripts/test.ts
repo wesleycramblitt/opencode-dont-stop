@@ -228,10 +228,16 @@ test("unroutable and cooling models never satisfy a query", () => {
 
 test("the curated free tier table is the one the catalogue loads from", () => {
   assert.ok(FREE_TIERS["alibaba/qwen3.7-flash"]?.tokens === 1_000_000)
-  // Every entry names its source, so a number can be audited rather than trusted.
+  assert.equal(FREE_TIERS["alibaba/qwen3.7-flash"]?.enabled, true)
+  assert.equal(FREE_TIERS["alibaba/deepseek-v4-flash-0731"]?.enabled, false)
+  // Every entry names its source and the account state, so a number can be
+  // audited rather than trusted, and the blanket promotion is uniform.
   for (const [key, tier] of Object.entries(FREE_TIERS)) {
+    assert.ok(key.startsWith("alibaba/"), key)
     assert.ok(tier.source.length > 0, key)
     assert.ok(tier.windowDays > 0, key)
+    assert.equal(tier.tokens, 1_000_000, key)
+    assert.equal(typeof tier.enabled, "boolean", key)
   }
 })
 
@@ -240,11 +246,20 @@ test("the curated free tier table is the one the catalogue loads from", () => {
 test("free ranking walks free, then quota, then local", () => {
   const cat = catalogueOf([
     row({ key: "free/a", id: "a", scores: { reasoning: 7, code: 7, agentic: 7, general: 7, capability: 7 } }),
-    row({ key: "quota/b", id: "b", pricing: { input: 0.03, output: 0.13, cacheRead: 0, cacheWrite: 0 }, freeTier: { tokens: 1_000_000, windowDays: 90, source: "t" }, scores: { reasoning: 7, code: 7, agentic: 7, general: 7, capability: 7.5 } }),
+    row({ key: "quota/b", id: "b", pricing: { input: 0.03, output: 0.13, cacheRead: 0, cacheWrite: 0 }, freeTier: { tokens: 1_000_000, windowDays: 90, enabled: false, source: "t" }, scores: { reasoning: 7, code: 7, agentic: 7, general: 7, capability: 7.5 } }),
     row({ key: "local/c", id: "c", local: true, scores: { reasoning: 6, code: 6, agentic: 6, general: 6, capability: 6.2 } }),
   ])
   const ranked = rankForMode(cat, "free", profileFor("general"))
   assert.deepEqual(ranked.map((m) => m.id), ["a", "b", "c"])
+})
+
+test("an enabled quota outranks a switched-off one of equal capability", () => {
+  const cat = catalogueOf([
+    row({ key: "quota/off", id: "off", pricing: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }, freeTier: { tokens: 1_000_000, windowDays: 91, enabled: false, source: "t" }, scores: { reasoning: 9, code: 9, agentic: 9, general: 9, capability: 9 } }),
+    row({ key: "quota/on", id: "on", pricing: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }, freeTier: { tokens: 1_000_000, windowDays: 91, enabled: true, source: "t" }, scores: { reasoning: 7, code: 7, agentic: 7, general: 7, capability: 7 } }),
+  ])
+  const ranked = rankForMode(cat, "free", profileFor("general"))
+  assert.deepEqual(ranked.map((m) => m.id), ["on", "off"])
 })
 
 test("cheap ranking leads with the cheapest capable model, free tail after", () => {

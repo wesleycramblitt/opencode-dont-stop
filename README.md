@@ -111,22 +111,29 @@ so the normal path stays pure network I/O.
 
 ### Free tiers
 
-Alibaba grants accounts a per-model promotional quota (commonly 1M tokens
-within 90 days). It is not queryable through any API — the console shows
-it — so it is declared data: `data/free-tiers.ts`, keyed by
-`provider/model`, every entry naming its source. The catalogue folds the
-table into rows at build time and re-applies it at load, so a stale file is
-corrected.
+Alibaba grants accounts a per-model promotional quota — on this account,
+1M tokens per language model inside 91 days, plus small generation-count
+quotas for image/video models (kept out of the table entirely: they are not
+token quotas, and their models are not chat models). The allowance is per
+model, shown in the console, and not queryable through any public API — so
+it is declared data: `data/free-tiers.ts`, keyed by `provider/model`, dated
+by the snapshot it was taken from, with every entry naming its source and
+whether the account currently has the model switched on. The catalogue
+folds the table into rows at build time and re-applies it at load, so a
+stale file is corrected.
 
 A quota-backed row is not priced at zero, but it is a legitimate member of
-the `free` sweep: after the genuinely free rows, before the local fallback.
-When the allowance runs out, requests fail with a quota error, which the
-error classifier reads as `funds` — the model goes on cooldown and the chain
-moves on. Edit the one table when the console says otherwise.
+the `free` sweep: after the genuinely free rows, before the local fallback,
+with the account's switched-on quotas ordered ahead of the switched-off
+ones — enablement is a console setting, not a property of the model, so
+both stay in the chain. When the allowance runs out, requests fail with a
+quota error, which the error classifier reads as `funds` — the model goes
+on cooldown and the chain moves on.
 
-The allowance is account state the plugin deliberately does not pretend to
-measure: there is no usage API, and an invented "remaining" number would be
-a guess presented as a fact.
+The remaining allowance is account state the plugin deliberately does not
+pretend to measure: there is no usage API, and an invented "remaining"
+number would be a guess presented as a fact. The table is the contract;
+edit it when the console changes.
 
 ### Updating
 

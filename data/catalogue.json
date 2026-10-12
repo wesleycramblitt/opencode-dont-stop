@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-10-11T21:00:02.394Z",
+  "generatedAt": "2026-10-12T00:06:37.981Z",
   "sources": [
     {
       "id": "models.dev",
@@ -28541,8 +28541,9 @@
       },
       "freeTier": {
         "tokens": 1000000,
-        "windowDays": 90,
-        "source": "alibaba-promotion-1m-90d"
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
       },
       "provenance": {
         "metadata": "alibaba",
@@ -28613,8 +28614,9 @@
       },
       "freeTier": {
         "tokens": 1000000,
-        "windowDays": 90,
-        "source": "alibaba-promotion-1m-90d"
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
       },
       "provenance": {
         "metadata": "alibaba",
@@ -28680,7 +28682,12 @@
         "general": 6.45,
         "capability": 7.54
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -28941,7 +28948,12 @@
         "general": 5.92,
         "capability": 5.74
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -29009,7 +29021,12 @@
         "general": 6.11,
         "capability": 6.39
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -29077,8 +29094,9 @@
       },
       "freeTier": {
         "tokens": 1000000,
-        "windowDays": 90,
-        "source": "alibaba-promotion-1m-90d"
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
       },
       "provenance": {
         "metadata": "alibaba",
@@ -29140,7 +29158,12 @@
         "general": 5.82,
         "capability": 5.11
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -29340,7 +29363,12 @@
         "general": 6.71,
         "capability": 7.59
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -29469,7 +29497,12 @@
         "general": 6.42,
         "capability": 7.1
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -29726,8 +29759,9 @@
       },
       "freeTier": {
         "tokens": 1000000,
-        "windowDays": 90,
-        "source": "alibaba-promotion-1m-90d"
+        "windowDays": 131,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: legacy grant, expires 2026-11-11"
       },
       "provenance": {
         "metadata": "alibaba",
@@ -29798,8 +29832,9 @@
       },
       "freeTier": {
         "tokens": 1000000,
-        "windowDays": 90,
-        "source": "alibaba-promotion-1m-90d"
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
       },
       "provenance": {
         "metadata": "alibaba",
@@ -30059,11 +30094,7 @@
         "general": 3.74,
         "capability": 5.47
       },
-      "freeTier": {
-        "tokens": 1000000,
-        "windowDays": 90,
-        "source": "alibaba-promotion-1m-90d"
-      },
+      "freeTier": null,
       "provenance": {
         "metadata": "models.dev",
         "benchmark": null,
@@ -30650,7 +30681,12 @@
         "general": 6.21,
         "capability": 6.49
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -30718,7 +30754,12 @@
         "general": 6.16,
         "capability": 6.44
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -30917,8 +30958,9 @@
       },
       "freeTier": {
         "tokens": 1000000,
-        "windowDays": 90,
-        "source": "alibaba-promotion-1m-90d"
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
       },
       "provenance": {
         "metadata": "alibaba",
@@ -30982,8 +31024,9 @@
       },
       "freeTier": {
         "tokens": 1000000,
-        "windowDays": 90,
-        "source": "alibaba-promotion-1m-90d"
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
       },
       "provenance": {
         "metadata": "alibaba",
@@ -31112,7 +31155,12 @@
         "general": 5.94,
         "capability": 4.97
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -31242,11 +31290,7 @@
         "general": 5.64,
         "capability": 6.36
       },
-      "freeTier": {
-        "tokens": 1000000,
-        "windowDays": 90,
-        "source": "alibaba-promotion-1m-90d"
-      },
+      "freeTier": null,
       "provenance": {
         "metadata": "models.dev",
         "benchmark": null,
@@ -31378,7 +31422,12 @@
         "general": 5.73,
         "capability": 6.4
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -31511,7 +31560,12 @@
         "general": 6.04,
         "capability": 6.33
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -31705,7 +31759,12 @@
         "general": 6.26,
         "capability": 6.52
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -31836,7 +31895,12 @@
         "general": 6.16,
         "capability": 7.38
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -32099,7 +32163,12 @@
         "general": 6.34,
         "capability": 6.6
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -32167,7 +32236,12 @@
         "general": 6.56,
         "capability": 7.23
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -32300,7 +32374,12 @@
         "general": 6.42,
         "capability": 7.11
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -39736,7 +39815,12 @@
         "general": 7.16,
         "capability": 7.81
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -39871,7 +39955,12 @@
         "general": 5.18,
         "capability": 5.91
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -39938,7 +40027,12 @@
         "general": 7.15,
         "capability": 7.64
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40006,7 +40100,12 @@
         "general": 6.42,
         "capability": 7.11
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40071,7 +40170,12 @@
         "general": 6.45,
         "capability": 7.54
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40136,7 +40240,12 @@
         "general": 6.44,
         "capability": 7.54
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40204,7 +40313,12 @@
         "general": 5.96,
         "capability": 6.61
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40269,7 +40383,12 @@
         "general": 6.16,
         "capability": 6.86
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40334,7 +40453,12 @@
         "general": 6.44,
         "capability": 7.54
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40664,7 +40788,12 @@
         "general": 6.48,
         "capability": 7.16
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40732,7 +40861,12 @@
         "general": 6.42,
         "capability": 7.1
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40800,7 +40934,12 @@
         "general": 5.43,
         "capability": 6.13
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40867,7 +41006,12 @@
         "general": 5.52,
         "capability": 6.48
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40933,7 +41077,12 @@
         "general": 5.96,
         "capability": 7.23
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -40999,7 +41148,12 @@
         "general": 6.23,
         "capability": 7.48
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -41060,7 +41214,12 @@
         "general": 4.62,
         "capability": 3.71
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -41128,7 +41287,12 @@
         "general": 6.36,
         "capability": 6.62
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -41196,7 +41360,12 @@
         "general": 6.56,
         "capability": 7.23
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -41262,7 +41431,12 @@
         "general": 6.26,
         "capability": 7.47
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -41328,7 +41502,12 @@
         "general": 5.94,
         "capability": 6.63
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -41779,7 +41958,12 @@
         "general": 4.59,
         "capability": 3.7
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -41840,7 +42024,12 @@
         "general": 4.7,
         "capability": 3.8
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -41901,7 +42090,12 @@
         "general": 5.53,
         "capability": 4.83
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -41965,7 +42159,12 @@
         "general": 6,
         "capability": 6.6
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -42030,7 +42229,12 @@
         "general": 5.45,
         "capability": 6.25
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -42094,7 +42298,12 @@
         "general": 5.72,
         "capability": 5.62
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -42159,7 +42368,12 @@
         "general": 5.63,
         "capability": 5.7
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -42281,7 +42495,12 @@
         "general": 4.95,
         "capability": 5.04
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -42342,7 +42561,12 @@
         "general": 5.27,
         "capability": 4.16
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": true,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -42468,7 +42692,12 @@
         "general": 5.05,
         "capability": 5.81
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
@@ -42602,7 +42831,12 @@
         "general": 6.54,
         "capability": 7.17
       },
-      "freeTier": null,
+      "freeTier": {
+        "tokens": 1000000,
+        "windowDays": 91,
+        "enabled": false,
+        "source": "alibaba model studio console 2026-10-11: 1M tokens / 91-day promotion"
+      },
       "provenance": {
         "metadata": "alibaba",
         "benchmark": null,
