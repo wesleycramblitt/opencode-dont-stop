@@ -472,9 +472,11 @@ test("the architect's free-mode chain leads with its preferred model", () => {
   const cat = catalogueOf([
     row({ key: "oller/zeta", providerID: "oller", id: "zeta", local: false, context: 262144 }),
     row({ key: "ollama/qwen3-coder:30b", providerID: "ollama", id: "qwen3-coder:30b", local: true, context: 262144 }),
+    row({ key: "ollama/qwen3-coder:30b-ctx256k", providerID: "ollama", id: "qwen3-coder:30b-ctx256k", local: true, context: 262144 }),
   ])
   const architect = rankForMode(cat, "free", profileFor("architect"))
-  assert.equal(architect[0].key, "ollama/qwen3-coder:30b", "the architect leads with the big-window local coder")
+  assert.equal(architect[0].key, "ollama/qwen3-coder:30b-ctx256k", "the architect leads with the big-window local coder")
+  assert.ok(architect.some((m) => m.key === "ollama/qwen3-coder:30b"), "the plain tag stays in the chain as fallback")
   const general = rankForMode(cat, "free", profileFor("general"))
   assert.equal(general[0].key, "oller/zeta", "smaller tasks keep the remote-first sweep")
   const power = rankForMode(cat, "power", profileFor("architect"))

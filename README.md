@@ -294,6 +294,8 @@ unclassified failure is what sent recovery into a spin: one interrupt bought a
 rotation, the rotation got interrupted, and the loop paid for its own
 recovery.
 
+### Free-model cooldown
+
 A free model that fails once is not tried again for an hour — `freequota`
 models never return, because a spent promotional quota does not come back with
 a timeout. A deprecated model never returns either, in any mode, and no mode
@@ -563,6 +565,13 @@ Three things trigger a rotation:
    that — it is what keeps the backstop theoretical. It matters most for the
    local fallback, where OpenCode's model metadata (a 3.5M native window) does
    not match what the daemon serves (64k), so auto-compaction would not fire.
+
+The architect's free-mode chain leads with `qwen3-coder:30b-ctx256k`, a local
+variant whose Modelfile bakes `num_ctx 262144`: the ollama daemon serves the
+plain `qwen3-coder:30b` tag at `OLLAMA_CONTEXT_LENGTH` (64k here), which
+would retire an architect session after one turn. The engine measures the
+window `/api/ps` actually reports, so the baked parameter is what the
+rotation threshold (0.8 × served) uses.
 
 Three properties make rotation safe:
 
