@@ -2003,9 +2003,21 @@ export class LoopEngine {
    * clocks are dropped so the hang detector stops judging a turn nobody is
    * waiting on. Halting appeared to work — the status flipped — while the
    * interrupt-and-rotate cycle it was meant to end kept firing.
+   *
+   * A loop the FILE has already settled is not re-settled here: opencode loads
+   * a plugin instance per session and unloads it on every session switch, so
+   * a teardown frequently finds a loop that another instance's teardown (or a
+   * halt intent) already stopped. Re-writing it with our own reason is how
+   * one unload became an endless "plugin unloaded" toast — every stale
+   * instance clobbered `lastResult` anew. The on-disk record is adopted into
+   * memory instead, the cleanup still runs, and the follow-up persist writes
+   * nothing new.
    */
-  async stop(reason: string, sessionID?: string): Promise<void> {
+  async stop(reason: string, sessionID?: string, onDiskArg?: PluginState): Promise<void> {
+    const onDiskLoops = (onDiskArg ?? readState()).loops
     const targets = sessionID ? (this.state.loops[sessionID] ? [sessionID] : []) : Object.keys(this.state.loops)
+    let acted = false
+    let unsettled = false
     for (const sid of targets) {
       const loop = this.state.loops[sid]
       // Nothing is running: an idle stop — a plugin teardown, a second halt
@@ -2014,13 +2026,23 @@ export class LoopEngine {
       // announces, and one teardown writing "plugin unloaded" over it is how a
       // single unload became an endless toast.
       if (loop.status !== "active") continue
+      acted = true
 
-      loop.status = "stopped"
-      loop.lastResult = reason
-      loop.owner = null
-      loop.ownerBeatAt = 0
-      loop.rotations = 0
-      loop.turnStartedAt = null
+      const settled = onDiskLoops[sid]?.status === "stopped"
+      if (settled) {
+        // The file already describes this halt — whoever got there first kept
+        // the report the terminal already announced. Adopt it wholesale so
+        // this teardown's persist is a no-op instead of a re-toast.
+        this.state.loops[sid] = { ...onDiskLoops[sid]! }
+      } else {
+        unsettled = true
+        loop.status = "stopped"
+        loop.lastResult = reason
+        loop.owner = null
+        loop.ownerBeatAt = 0
+        loop.rotations = 0
+        loop.turnStartedAt = null
+      }
       this.redrives.delete(sid)
       this.pendingRotation.delete(sid)
       // The loop keeps its sessionID so a later `start` finds its home; the
@@ -2045,9 +2067,9 @@ export class LoopEngine {
       // user happened to talk to it again.
     }
     // The episode's try budget belongs to a loop that is over.
-    if (targets.length > 0) this.resetEpisode()
+    if (acted) this.resetEpisode()
 
-    if (targets.length > 0) {
+    if (unsettled) {
       // Announce the halt on the control plane: bumping the sequence is what
       // lets this survive a status write that raced it, and tells every other
       // instance the loop is over rather than merely idle.

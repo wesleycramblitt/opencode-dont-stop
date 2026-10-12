@@ -113,6 +113,14 @@ export default {
       }
       const loop = primary ?? Object.values(state.loops)[0]
       const message = loop?.lastResult
+      if (previous === 0) {
+        // First look at a settled state: this terminal never saw the stop
+        // that produced the last result, so announcing it would toast
+        // "plugin unloaded" on every session start. Record it and wait for
+        // a real transition.
+        if (message) lastMessage = message
+        return
+      }
       if (message && message !== lastMessage) {
         lastMessage = message
         toast(ctx, "info", "dont-stop", message)

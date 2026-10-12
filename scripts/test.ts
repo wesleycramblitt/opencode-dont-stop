@@ -1107,6 +1107,40 @@ test("a halt with no session stops every loop this instance drives", async () =>
   assert.equal(state.loops["ses_b"].status, "stopped")
 })
 
+test("a stale teardown adopts a loop the file has already settled instead of re-toasting it", async () => {
+  const { engine, state } = makeEngine("i1")
+  armLoop(engine, state, "i1", "ses_loop")
+  // The disk record was settled by someone else (an earlier teardown, a halt
+  // intent) while this instance's memory still thinks the loop is active —
+  // the shape every session-switch unload finds the plugin in.
+  const disk = initialState()
+  disk.loops["ses_loop"] = {
+    ...state.loops["ses_loop"]!,
+    status: "stopped",
+    owner: null,
+    ownerBeatAt: 0,
+    lastResult: "loop stopped: plugin unloaded",
+  }
+
+  await engine.stop("plugin unloaded", undefined, disk)
+  const loop = state.loops["ses_loop"]
+  assert.equal(loop.status, "stopped")
+  assert.equal(loop.lastResult, "loop stopped: plugin unloaded", "the file's report survives the teardown")
+  assert.equal(state.intent.action, "none", "no halt intent is announced for an already-settled loop")
+})
+
+test("a stop that actually halts a loop still announces it", async () => {
+  const { engine, state } = makeEngine("i1")
+  armLoop(engine, state, "i1", "ses_loop")
+  // The file agrees the loop is active: this stop is the first settlement.
+  const disk = initialState()
+  disk.loops["ses_loop"] = { ...state.loops["ses_loop"]! }
+
+  await engine.stop("stopped by command", undefined, disk)
+  assert.equal(state.loops["ses_loop"].lastResult, "stopped by command")
+  assert.equal(state.intent.action, "halt", "an actual halt is announced on the control plane")
+})
+
 test("consecutive errors from foreign sessions never stop the loop", async () => {
   const { engine, state } = makeEngine("i1")
   armLoop(engine, state, "i1", "ses_loop")
