@@ -14,7 +14,7 @@ import assert from "node:assert/strict"
 
 import { eventSignals } from "../lib/events.ts"
 import { SessionClocks } from "../lib/clocks.ts"
-import { classify, actionFor } from "../lib/errors.ts"
+import { classify, actionFor, DEPRECATED_COOLDOWN_MS, PERMANENT_COOLDOWN_MS } from "../lib/errors.ts"
 import { meets, loadCatalogue, type Catalogue, type CatalogueModel } from "../lib/catalogue.ts"
 import { rankForMode, profileFor } from "../lib/modes.ts"
 import { measureContext, transcriptFrom, descendantIDs, buildSummary } from "../lib/handoff.ts"
@@ -159,7 +159,7 @@ test("free-mode failures: one try, one day out, spent quotas out forever", () =>
 
   const quota = actionFor(classify({ message: "The free quota has been exhausted" }), "free")
   assert.equal(quota.retry, false)
-  assert.equal(quota.cooldownMs, Number.MAX_SAFE_INTEGER)
+  assert.equal(quota.cooldownMs, PERMANENT_COOLDOWN_MS)
   assert.equal(quota.degrade, false)
 })
 
@@ -176,6 +176,30 @@ test("outside the free sweep the base actions stand, and freequota rotates", () 
   assert.equal(quota.retry, false)
   assert.equal(quota.degrade, false)
   assert.equal(quota.cooldownMs, 60 * 60 * 1000)
+})
+
+test("a deprecated model is out of every mode, permanently", () => {
+  const deprecated = actionFor(classify({ message: "model has been deprecated" }), "cheap")
+  assert.equal(deprecated.retry, false)
+  assert.equal(deprecated.cooldownMs, DEPRECATED_COOLDOWN_MS)
+  assert.equal(deprecated.degrade, false)
+  // The free-mode floor does not soften it: a day out is weaker than forever.
+  const free = actionFor(classify({ message: "the model is deprecated" }), "free")
+  assert.equal(free.cooldownMs, DEPRECATED_COOLDOWN_MS)
+})
+
+test("leaving free mode lifts spent quotas but never deprecated models", async () => {
+  const { engine, state } = makeEngine("i1")
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x" }),
+    row({ key: "b/y", providerID: "b", id: "y" }),
+  ])
+  injectCatalogue(engine, cat)
+  state.cooldowns["a/x"] = PERMANENT_COOLDOWN_MS     // spent promotional quota
+  state.cooldowns["b/y"] = DEPRECATED_COOLDOWN_MS    // deprecated model
+  await engine.setMode("cheap")
+  assert.ok(state.cooldowns["a/x"] === undefined)
+  assert.equal(state.cooldowns["b/y"], DEPRECATED_COOLDOWN_MS)
 })
 
 /* -------------------------------------------------------------------- catalogue */

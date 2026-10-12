@@ -21,6 +21,7 @@ export type ErrorKind =
   | "rate"
   | "capability"
   | "notfound"
+  | "deprecated"
   | "context"
   | "auth"
   | "network"
@@ -82,6 +83,16 @@ export const FREE_MODEL_TIMEOUT_MS = 24 * 60 * 60 * 1000
  */
 export const PERMANENT_COOLDOWN_MS = Number.MAX_SAFE_INTEGER
 
+/**
+ * A model the provider says is deprecated is out everywhere, permanently.
+ *
+ * Distinct from the free-quota sentinel on purpose: a spent quota is a fact
+ * about the *free sweep* (lifted when the mode leaves `free`), while a
+ * deprecated model is a fact about the model itself — no mode will ever want
+ * it again, so nothing lifts this one.
+ */
+export const DEPRECATED_COOLDOWN_MS = Number.MAX_SAFE_INTEGER - 1
+
 interface Pattern {
   kind: ErrorKind
   test: RegExp
@@ -108,6 +119,9 @@ const PATTERNS: Pattern[] = [
   { kind: "freequota", test: /free[ _-]?quota|promotional (quota|allowance|tier)|quota .{0,40}(exhaust|depleted|used up|ran out)|(exhaust|depleted|used up|ran out).{0,40}quota|free tier limit/i, transient: false },
   { kind: "funds", test: /insufficient[ _-]?(funds|balance|credit|quota)|billing|payment required|no credits|exceeded your (current )?quota|arrear|account balance|balance is insufficient|insufficient (account )?balance/i, transient: false },
   { kind: "rate", test: /rate ?limit|too many requests|429|slow down|throttl|retry after|quota exceeded for|resource exhausted/i, transient: true },
+  // Deprecated leads notfound: "model has been deprecated" says the row is
+  // gone for good, not merely missing.
+  { kind: "deprecated", test: /deprecat/i, transient: false },
   { kind: "context", test: /context ?(length|window|limit)|maximum context|too long|prompt is too (long|large)|exceeds? (the )?max(imum)? context|tokens? (exceed|limit)/i, transient: false },
   { kind: "capability", test: /does not support|unsupported|not support|capability|vision|image input|tool (call|use)|function call|invalid (model|modality)|modality|cannot process|no such tool/i, transient: false },
   { kind: "notfound", test: /not found|404|does not exist|no such model|unknown model|model .* not available|deleted|deprecated model/i, transient: false },
@@ -169,6 +183,7 @@ function kindOfType(type: string): ErrorKind | undefined {
   if (/free[ _-]?quota|promotional/.test(type)) return "freequota"
   if (/fund|billing|credit|quota|payment/.test(type)) return "funds"
   if (/rate|throttl|limit/.test(type)) return "rate"
+  if (/deprecat/.test(type)) return "deprecated"
   if (/context|length|token/.test(type)) return "context"
   if (/capab|modality|support|vision|tool/.test(type)) return "capability"
   if (/not.?found|missing|unknown/.test(type)) return "notfound"
@@ -313,13 +328,29 @@ function actionForKind(kind: ErrorKind, message: string): ErrorAction {
         reason: "model not found; rotating past it",
       }
 
+    case "deprecated":
+      return {
+        // The provider says the row is deprecated: out of every mode,
+        // permanently, and nothing lifts it (not even leaving the free
+        // sweep — a spent quota is a fact about the sweep, this is a fact
+        // about the model).
+        cooldownMs: DEPRECATED_COOLDOWN_MS,
+        resweep: true,
+        degrade: false,
+        restrict: null,
+        stop: false,
+        retry: false,
+        reason: "model deprecated; removing it from the chain",
+      }
+
     case "auth":
       return {
         cooldownMs: 15 * 60 * 1000,
         resweep: true,
-        // Auth failures usually affect a whole provider, so a cheaper mode on
-        // a different provider is the useful escape.
-        degrade: true,
+        // A failed key usually affects a whole provider, so the rotation
+        // walks the rest of the chain; the mode itself is NOT changed — only
+        // insufficient funds moves a mode (owner, 2026-10-12).
+        degrade: false,
         restrict: null,
         stop: false,
         retry: false,
@@ -413,6 +444,7 @@ export function describeError(kind: ErrorKind): string {
     case "context": return "context exceeded"
     case "capability": return "capability mismatch"
     case "notfound": return "model not found"
+    case "deprecated": return "model deprecated"
     case "auth": return "authorization failed"
     case "network": return "network error"
     case "other": return "unclassified error"

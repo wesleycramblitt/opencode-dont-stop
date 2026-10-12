@@ -1131,7 +1131,11 @@ export class LoopEngine {
   /** Clear the cooldowns a spent free quota earned. */
   private liftPermanentCooldowns(): void {
     const keys = Object.keys(this.state.cooldowns).filter(
-      (key) => this.state.cooldowns[key] >= PERMANENT_COOLDOWN_MS,
+      // Exact match, deliberately: only the free-sweep sentinel is lifted. A
+      // deprecated model's own permanent sentinel (DEPRECATED_COOLDOWN_MS =
+      // PERMANENT_COOLDOWN_MS - 1) is a fact about the model, never about the
+      // mode, so leaving the sweep must not bring it back.
+      (key) => this.state.cooldowns[key] === PERMANENT_COOLDOWN_MS,
     )
     if (keys.length === 0) return
     for (const key of keys) delete this.state.cooldowns[key]

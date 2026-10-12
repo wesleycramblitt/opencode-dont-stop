@@ -260,6 +260,7 @@ of the sweep after any failure, and a spent promotional quota out **forever**.
 | `capability` | model lacks a required capability | no | cooldown 5m, restrict the pool | cooldown 24h |
 | `context` | context window exceeded | no | rotate to a larger-context model | cooldown 24h |
 | `notfound` | model gone or deprecated | no | cooldown 24h, rotate past | same |
+| `deprecated` | "…has been deprecated…" — the provider retires the row | no | **permanent** in every mode; nothing lifts it | same |
 | `auth` | 401/403, bad key | no | cooldown 15m, rotate to another provider | cooldown 24h |
 | `network` | timeout, reset, DNS | yes | cooldown 15s, retry | no retry, cooldown 24h |
 | `other` | unclassified | yes | cooldown 30s | no retry, cooldown 24h |
@@ -272,10 +273,19 @@ recovery.
 
 A free model that fails once is not tried again for a full day — `freequota`
 models never return, because a spent promotional quota does not come back with
-a timeout. The local fallback is the recovery when the whole sweep is cooling:
-the free chain's tail is the local models, and cooling rows are filtered out
-of the ranking before rotation sees them, so a cooled-out sweep hands the turn
-to ollama instead of stopping.
+a timeout. A deprecated model never returns either, in any mode, and no mode
+change revives it. Only `funds` moves a mode (cheap → free, staying there
+until the user brings the mode back — a key error rotates instead of
+degrading). The local fallback is the recovery when the whole sweep is
+cooling: the free chain's tail is the local models, and cooling rows are
+filtered out of the ranking before rotation sees them, so a cooled-out sweep
+hands the turn to ollama instead of stopping.
+
+In `cheap` mode the chain is the paid rows cheapest-first — today that is
+`alibaba/qwen3.7-flash` ($0.03 input) ahead of `qwen-turbo` / `qwen-flash`
+($0.05), then `opencode/deepseek-v4-flash` ($0.14) — then the free tail, then
+local. A failure rotates to the next cheapest untried row; the mode itself
+only changes on insufficient funds.
 
 A capability error pins the session to a pool that avoids the missing
 capability (`no-vision`, `no-tools`, `text-only`) rather than merely cooling the
