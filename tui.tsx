@@ -280,35 +280,32 @@ export default {
 function DontStopFooter(props: { state: PluginState; sessionID: string | null }): JSX.Element {
   const state = props.state
   const loop = loopForFooter(state, props.sessionID)
+  const active = loop?.status === "active"
 
-  if (!loop) {
-    return (
-      <box flexDirection="row" gap={1}>
-        <text fg="magenta">◍</text>
-        <text fg="gray">idle</text>
-      </box>
-    )
-  }
+  // The mode shown is the loop's own while it runs; otherwise the default
+  // mode, which is what mode changes actually move. A stopped loop's stale
+  // mode must not hide the new default from the footer.
+  const mode = active ? loop!.mode : state.mode
 
-  const degraded = loop.degraded ? "!" : ""
+  const degraded = !active ? false : loop!.degraded === true
   // A halt is a request, not an event: the status keeps reading "active" until
   // the owning instance applies it, so the pending request is what the footer
   // shows in the meantime — otherwise a halt looks like it did nothing.
   const halting =
-    loop.status === "active" &&
+    active &&
     state.intent.action === "halt" &&
-    state.intent.at > (loop.startedAt ?? 0)
+    state.intent.at > (loop!.startedAt ?? 0)
 
   return (
     <box flexDirection="row" gap={1}>
       <text fg="magenta">◍</text>
-      <text fg="cyan">{loop.mode}{degraded}</text>
-      {loop.status === "active" ? (
+      <text fg="cyan">{mode}{degraded ? "!" : ""}</text>
+      {active ? (
         halting ? (
           <text fg="yellow">halting…</text>
         ) : (
           <>
-            <text fg="green">⟳ {loop.iterations}</text>
+            <text fg="green">⟳ {loop!.iterations}</text>
             {state.main ? <text fg="gray">{state.main.providerID}/{state.main.id}</text> : null}
           </>
         )
