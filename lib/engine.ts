@@ -1823,7 +1823,24 @@ export class LoopEngine {
     return `context ${Math.round((used / limit) * 100)}%`
   }
 
-  /** The seed for a rotated session: the loop's own prompt, plus the protocol. */
+  /**
+ * The successor session's title: the loop's task, then its session number.
+ *
+ * The task label is the first substantial line of the loop prompt, so a loop
+ * whose prompt names its work ("Task 1 changing the widget") titles its
+ * sessions "Task 1 changing the widget · loop 3". A leading mode line
+ * ("mode free") is skipped — it is policy, not task.
+ */
+private rotationTitle(loop: LoopState): string {
+  const lines = loop.prompt
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+  const task = lines.find((l) => !/^mode\s+\w+$/i.test(l)) ?? "loop"
+  return `${task.slice(0, 70)} · loop ${(loop.sessionNumber ?? 1) + 1}`
+}
+
+/** The seed for a rotated session: the loop's own prompt, plus the protocol. */
   private rotationSeed(prompt: string): string {
     return (
       `A previous session finished a stretch of work and was retired to keep context fresh. ` +
@@ -1853,6 +1870,7 @@ export class LoopEngine {
       sessionID,
       seed: this.rotationSeed(loop.prompt),
       agent: record?.agent,
+      title: this.rotationTitle(loop),
     })
 
     if (!result.rotated) {
@@ -1875,10 +1893,14 @@ export class LoopEngine {
       ...loop,
       sessionID: newSessionID,
       rotatedFrom: sessionID,
+      sessionNumber: (loop.sessionNumber ?? 1) + 1,
       sessionIterations: 0,
       lastResult: `rotated to ${newSessionID} after ${turns} turns (${reason})`,
     }
     this.state.loops[newSessionID] = next
+    if (result.deletedOld === false) {
+      this.log.warn(`retired session ${sessionID} could not be deleted; it stays idle`)
+    }
     // The seed prompt is the successor's opening turn, so arm it here, or the
     // first turn-end event would be a duplicate ending and the loop would
     // stand down. The seed is also a turn in flight, and its message count is
@@ -1946,6 +1968,7 @@ export class LoopEngine {
       status: "active",
       sessionID,
       rotatedFrom: null,
+      sessionNumber: 1,
       prompt,
       // A start is a fresh run: the iteration counter belongs to the run,
       // not to the session's earlier loops. The mode comes from the caller,

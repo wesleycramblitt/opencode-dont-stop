@@ -47,6 +47,7 @@ export interface RotationContext {
     active(): Promise<unknown>
     create(input?: Record<string, unknown>): Promise<{ id?: string }>
     prompt(input: { sessionID: string; text: string }): Promise<unknown>
+    remove(input: { sessionID: string }): Promise<unknown>
   }
 }
 
@@ -253,6 +254,8 @@ export interface RotationResult {
   /** Sessions that were live and forced the deferral. */
   busy?: string[]
   newSessionID?: string
+  /** Whether the retired session was deleted after a successful rotation. */
+  deletedOld?: boolean
 }
 
 /**
@@ -265,7 +268,7 @@ export interface RotationResult {
  */
 export async function rotate(
   ctx: RotationContext,
-  input: { sessionID: string; seed: string; agent?: string },
+  input: { sessionID: string; seed: string; agent?: string; title?: string },
 ): Promise<RotationResult> {
   // Refuse while any descendant session is live.
   const descendants = await sessionTree(ctx, input.sessionID)
@@ -285,7 +288,9 @@ export async function rotate(
   let newSessionID: string
   try {
     const created = await ctx.session.create({
-      title: `dont-stop continuation of ${input.sessionID}`,
+      title:
+        input.title ??
+        `dont-stop continuation of ${input.sessionID}`,
       ...(input.agent ? { agent: input.agent } : {}),
     })
     newSessionID = created?.id ?? ""
@@ -302,7 +307,18 @@ export async function rotate(
     return { rotated: false, deferred: `session created but unprompted: ${messageOf(error)}`, newSessionID }
   }
 
-  return { rotated: true, newSessionID }
+  // The retired session is deleted once its successor is seeded. Failure is
+  // non-fatal: the loop is already on the successor, and the old session
+  // (left intact and idle) is what stays.
+  let deletedOld = false
+  try {
+    await ctx.session.remove({ sessionID: input.sessionID })
+    deletedOld = true
+  } catch (error) {
+    console.warn(`[dont-stop] could not delete retired session ${input.sessionID}: ${messageOf(error)}`)
+  }
+
+  return { rotated: true, newSessionID, deletedOld }
 }
 
 /* ------------------------------------------------------------------- helpers */

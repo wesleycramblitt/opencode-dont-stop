@@ -693,6 +693,8 @@ function fakeContext() {
   const switched: Array<{ sessionID: string; model: unknown }> = []
   const interrupted: string[] = []
   const prompts: Array<{ sessionID: string; text: string }> = []
+  const created: Array<{ title?: string; agent?: string }> = []
+  const removed: string[] = []
   const sessions: Record<string, { id: string; parentID: string | null }> = {}
   const messages: unknown[] = []
   const compacted: string[] = []
@@ -711,7 +713,13 @@ function fakeContext() {
       prompt: async (input: { sessionID: string; text: string }) => {
         prompts.push(input)
       },
-      create: async () => ({ id: "ses_new" }),
+      create: async (input: { title?: string; agent?: string }) => {
+        created.push(input)
+        return { id: "ses_new" }
+      },
+      remove: async (input: { sessionID: string }) => {
+        removed.push(input.sessionID)
+      },
       list: async (input?: { parentID?: string | null }) => ({
         data: Object.values(sessions).filter((s) => (input?.parentID ?? null) === (s.parentID ?? null)),
       }),
@@ -722,7 +730,7 @@ function fakeContext() {
   }
   return {
     context: context as unknown as ConstructorParameters<typeof LoopEngine>[0],
-    switched, interrupted, prompts, sessions, messages, compacted,
+    switched, interrupted, prompts, created, removed, sessions, messages, compacted,
   }
 }
 
@@ -736,7 +744,7 @@ function makeEngine(instanceID: string, options: Partial<EngineOptions> = {}) {
 
 function armLoop(engine: LoopEngine, state: PluginState, instanceID: string, sessionID: string, mode: Mode = "free") {
   state.loops[sessionID] = {
-    status: "active", sessionID, rotatedFrom: null, prompt: "task", iterations: 0, sessionIterations: 0,
+    status: "active", sessionID, rotatedFrom: null, sessionNumber: 1, prompt: "task", iterations: 0, sessionIterations: 0,
     startedAt: Date.now(), lastResult: null, owner: instanceID,
     ownerBeatAt: Date.now(), rotations: 0,
     mode, degraded: false, preferredMode: null, consecutiveErrors: 0,
@@ -958,11 +966,15 @@ test("a session rotates at the turn budget, carrying the loop", async () => {
   assert.equal(next.sessionID, "ses_new")
   assert.equal(next.iterations, 3)
   assert.equal(next.sessionIterations, 0)
+  assert.equal(next.sessionNumber, 2, "the loop counts its sessions")
   assert.match(next.lastResult ?? "", /rotated to ses_new after 3 turns \(session budget\)/)
   const prompt = fakes.prompts[fakes.prompts.length - 1]
   assert.equal(prompt.sessionID, "ses_new")
   assert.match(prompt.text, /Original task: task/)
   assert.match(prompt.text, /loop-checkpoint/)
+  const created = fakes.created[fakes.created.length - 1]
+  assert.equal(created.title, "task · loop 2", "the successor is named for its task and loop number")
+  assert.deepEqual(fakes.removed, ["ses_loop"], "the retired session is deleted after rotation")
 })
 
 test("a task-boundary signal rotates only after real work in the session", async () => {

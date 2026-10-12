@@ -598,8 +598,15 @@ estimated from text length, which would be wrong by a factor of several.
 
 The loop record moves to the successor: `iterations` is the loop's and carries,
 while `sessionIterations` — the freshness metric in the footer — starts over.
-The old session is left behind, intact and idle; nothing is deleted, and the
-TUI can still open it.
+The retired session is deleted once its successor is seeded (its subagent
+sessions go with it, recursively); a failed deletion is reported in the log
+and the session stays behind, intact and idle.
+
+The successor is named for the work and its place in the run: the first
+substantial line of the loop prompt — skipping a leading `mode …` line — cut
+to ~70 characters, then ` · loop N`. A loop whose prompt names its task
+produces sessions like "Task 1 changing the widget · loop 3", where N comes
+from a `sessionNumber` carried on the loop record.
 
 The terminal follows the rotation: a TUI that was showing the loop's session
 switches to the successor (focused as a tab when tabs are enabled, a route

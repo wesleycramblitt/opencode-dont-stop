@@ -40,6 +40,11 @@ export interface LoopState {
    * quietly frozen conversation. Absent until the first rotation.
    */
   rotatedFrom: string | null
+  /**
+   * How many sessions the loop has lived on (1 = the session it started in).
+   * Carried across rotations and used in the successor's title ("loop N").
+   */
+  sessionNumber: number
   prompt: string
   /** Loop iterations completed. */
   iterations: number
@@ -189,6 +194,7 @@ function loopState(mode: Mode): LoopState {
     status: "stopped",
     sessionID: null,
     rotatedFrom: null,
+    sessionNumber: 1,
     prompt: "",
     iterations: 0,
     sessionIterations: 0,
