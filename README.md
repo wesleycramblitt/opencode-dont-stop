@@ -479,6 +479,17 @@ every prompt is appended with an instruction to reply with exactly
 it is deterministic and costs no extra model call, which an "is it done?" probe
 would.
 
+**One sentinel never stops the loop — completion needs two commitments.** The
+sentinel is the model's own judgement, and models get it wrong: an eager model
+once declared a review-and-build sweep complete after compiling task files but
+before building anything. So the first `<loop-complete/>` only buys a
+verification turn (`VERIFY_PROMPT`): the model is asked to confirm the
+deliverables exist, the checks pass, and nothing promised is outstanding, and
+to reply with the sentinel again only then. A second sentinel — the answer to
+that explicit question — stops the loop; a model that reconsiders during the
+verification keeps working and the pending claim is cleared (`pendingComplete`
+on the loop record, reported in the state file).
+
 The sentinel is the only self-stop left (owner, 2026-10-11): the iteration
 budget, the consecutive-error budget, an exhausted chain and three interrupts
 are all reported but never terminal — the loop waits for cooldowns, re-drives,

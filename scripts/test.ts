@@ -620,6 +620,7 @@ function armLoop(engine: LoopEngine, state: PluginState, instanceID: string, ses
     startedAt: Date.now(), lastResult: null, owner: instanceID,
     ownerBeatAt: Date.now(), rotations: 0,
     mode, degraded: false, preferredMode: null, consecutiveErrors: 0,
+    pendingComplete: false,
   }
   engine.track(sessionID, "general")
   // A live turn: the server's own execution-started event is what arms the
@@ -683,23 +684,58 @@ test("our own interrupt defers to the re-drive instead of advancing", async () =
   assert.ok((engine as unknown as { redriveAt: number | null }).redriveAt !== null)
 })
 
-test("the completion sentinel stops the loop", async () => {
+test("one sentinel claims completion, a verified second commitment stops the loop", async () => {
   const { engine, state } = makeEngine("i1")
   armLoop(engine, state, "i1", "ses_loop")
-  const withMessages = {
-    ...fakeContext(),
+  const canned = (text: string) => ({
     session: {
-      ...fakeContext().context.session,
       context: async () => ({ data: [
         { type: "user", text: "task" },
-        { type: "assistant", content: [{ type: "text", text: `done ${COMPLETION_SENTINEL}` }] },
+        { type: "assistant", content: [{ type: "text", text }] },
       ]}),
     },
-  }
-  ;(engine as unknown as { ctx: unknown }).ctx = { session: withMessages.session }
+  })
+
+  // First sentinel: the loop does NOT stop — it asks the model to verify.
+  ;(engine as unknown as { ctx: unknown }).ctx = canned(COMPLETION_SENTINEL)
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(state.loops["ses_loop"].status, "active")
+  assert.equal(state.loops["ses_loop"].pendingComplete, true)
+  assert.match(state.loops["ses_loop"].lastResult ?? "", /verifying/)
+
+  // The verification turn doubles down: stop, with the verified reason.
+  ;(engine as unknown as { ctx: unknown }).ctx = canned(`still complete ${COMPLETION_SENTINEL}`)
   await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
   assert.equal(state.loops["ses_loop"].status, "stopped")
-  assert.match(state.loops["ses_loop"].lastResult ?? "", /task complete/)
+  assert.match(state.loops["ses_loop"].lastResult ?? "", /task complete.*verified/)
+
+  // A stale state would leave a pending claim behind; stopping clears it.
+  assert.equal(state.loops["ses_loop"].pendingComplete, false)
+})
+
+test("a model that reconsiders during verification keeps working", async () => {
+  const { engine, state } = makeEngine("i1")
+  armLoop(engine, state, "i1", "ses_loop")
+  const canned = (text: string) => ({
+    session: {
+      context: async () => ({ data: [
+        { type: "user", text: "task" },
+        { type: "assistant", content: [{ type: "text", text }] },
+      ]}),
+    },
+  })
+
+  ;(engine as unknown as { ctx: unknown }).ctx = canned(COMPLETION_SENTINEL)
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(state.loops["ses_loop"].pendingComplete, true)
+
+  // Verification came back with work instead of a second sentinel: the
+  // pending claim is cleared and the loop continues.
+  ;(engine as unknown as { ctx: unknown }).ctx = canned("You're right — checking the build now.")
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(state.loops["ses_loop"].status, "active")
+  assert.equal(state.loops["ses_loop"].pendingComplete, false)
+  assert.equal(state.loops["ses_loop"].iterations, 2)
 })
 
 test("halt interrupts the whole tree, drops clocks, and keeps the loop session tracked", async () => {

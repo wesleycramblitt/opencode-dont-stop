@@ -170,6 +170,26 @@ export const SENTINEL_INSTRUCTION =
 export const CONTINUE_PROMPT = "Continue. If the task is now fully complete, reply with only " + COMPLETION_SENTINEL
 
 /**
+ * Sent after a model first claims completion with the sentinel.
+ *
+ * A single `<loop-complete/>` must not be able to end hours of work: the
+ * sentinel is the model's own judgement, and models get it wrong — an eager
+ * model declared a review-and-build sweep complete after compiling task files
+ * but before building anything. Before the loop may stop, the model is asked
+ * to verify the claim (deliverables exist, checks pass, nothing promised
+ * outstanding) and to confirm the sentinel a second time. If the verification
+ * comes back with the sentinel again, the loop stops; if it comes back with
+ * work, the loop simply continues and the pending claim is cleared.
+ */
+export const VERIFY_PROMPT =
+  `You signalled that the task is fully complete with ${COMPLETION_SENTINEL}. ` +
+  `Before the loop stops, verify that claim: confirm the deliverables actually exist, ` +
+  `the checks actually pass, and nothing the task promised is still outstanding ` +
+  `(read files, run the verification steps). ` +
+  `Reply with exactly ${COMPLETION_SENTINEL} only if the task is genuinely, fully ` +
+  `finished — otherwise keep working and reply normally.`
+
+/**
  * What a rotation attempt did.
  *
  * `"moved"` is the only success. `"exhausted"` and `"unavailable"` mean the
@@ -1407,9 +1427,27 @@ export class LoopEngine {
 
       const lastText = await this.lastAssistantText(sessionID)
       if (lastText.includes(this.sentinel)) {
-        await this.stop(`task complete after ${iteration} iterations`, sessionID)
+        // Completion needs two commitments. The first sentinel buys a
+        // verification turn (VERIFY_PROMPT): the model is asked to confirm
+        // the deliverables before it may end the loop. A second sentinel —
+        // the answer to that explicit question — stops it; a first sentinel
+        // on its own never does.
+        if (!loop.pendingComplete) {
+          loop.pendingComplete = true
+          loop.lastResult = "completion claimed; verifying before stopping"
+          this.log.info(`completion claimed on ${sessionID}; asking the model to verify before stopping`)
+          await this.sendPrompt(sessionID, VERIFY_PROMPT)
+          this.clocks.clocksFor(sessionID).start(Date.now())
+          this.emit()
+          return
+        }
+        loop.pendingComplete = false
+        await this.stop(`task complete after ${iteration} iterations (verified)`, sessionID)
         return
       }
+      // A turn with no sentinel claim is the model still working: whatever
+      // was pending is no longer pending.
+      loop.pendingComplete = false
 
       if (loop.consecutiveErrors >= 5) {
         // Not a stop (owner, 2026-10-11): the loop survives its own error
@@ -1622,6 +1660,7 @@ export class LoopEngine {
       degraded: false,
       preferredMode: null,
       consecutiveErrors: 0,
+      pendingComplete: false,
     }
     const loop = this.state.loops[sessionID]
     this.failedTurns.delete(sessionID)
@@ -1680,6 +1719,7 @@ export class LoopEngine {
       loop.owner = null
       loop.ownerBeatAt = 0
       loop.rotations = 0
+      loop.pendingComplete = false
       this.redrives.delete(sid)
       // The loop keeps its sessionID so a later `start` finds its home; the
       // owner is what says nobody drives it right now.
