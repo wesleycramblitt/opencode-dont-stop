@@ -14,7 +14,7 @@
         "thinking",
         "cloud"
       ],
-      "description": "DeepSeek-V4.1-Flash is an advanced tool designed to enhance search capabilities, providing users with faster and more accurate results. Medium usage $0.30 in \u00b7 $1.20 out per 1M tokens"
+      "description": "DeepSeek-V4.1-Flash is an advanced tool designed to enhance search capabilities, providing users with faster and more accurate results. Medium usage $0.30 in · $1.20 out per 1M tokens"
     },
     {
       "rank": 2,
@@ -26,7 +26,7 @@
         "thinking",
         "cloud"
       ],
-      "description": "Z.ai's flagship model and the most capable open-weights model for coding, with major gains on long-horizon agentic tasks. High usage $1.40 in \u00b7 $4.40 out per 1M tokens $$$$ | 1M context | tools"
+      "description": "Z.ai's flagship model and the most capable open-weights model for coding, with major gains on long-horizon agentic tasks. High usage $1.40 in · $4.40 out per 1M tokens $$$$ | 1M context | tools"
     },
     {
       "rank": 3,
@@ -384,7 +384,7 @@
         "tools",
         "thinking"
       ],
-      "description": "North Mini Code is Cohere's first model for developers \u2014 a 30B Mixture-of-Experts model."
+      "description": "North Mini Code is Cohere's first model for developers — a 30B Mixture-of-Experts model."
     },
     {
       "rank": 34,
@@ -1064,6 +1064,17 @@
         "tools"
       ],
       "description": "The IBM Granite 1B and 3B models are long-context mixture-of-experts models."
+    },
+    {
+      "rank": 101,
+      "name": "qwen3-coder:30b",
+      "context": 262144,
+      "parameterSize": "30B",
+      "capabilities": [
+        "tools",
+        "thinking"
+      ],
+      "description": "Qwen3-Coder is a 30B coding model with a 256K context window, built for code generation, agentic workflows and long-context software tasks."
     }
   ]
 }

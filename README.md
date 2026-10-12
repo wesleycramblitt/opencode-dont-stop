@@ -260,22 +260,22 @@ observed calling a rate limit a *funds* error, which bought a mode degrade
 instead of a rotation. The `retry` column is one retry **per model per turn**,
 and only for failures that could plausibly clear on their own — a dropped
 connection, an unclassified error — and **only outside the free sweep**: the
-free-mode policy (owner, 2026-10-11) is one try per endpoint, a full day out
+free-mode policy (owner, 2026-10-11) is one try per endpoint, an hour out
 of the sweep after any failure, and a spent promotional quota out **forever**.
 
 | Kind | Trigger | Retry | Action (base) | In `free` mode |
 | --- | --- | --- | --- | --- |
 | `interrupted` | our own interrupt, a user escape, a cancelled request | — | nothing: not a failure, no cooldown, no rotation | same |
-| `funds` | insufficient balance / quota (opencode and alibaba phrasings), arrears | no | cooldown 1h; degrades a mode **only when two different providers are both out of money** (a single provider out rotates) | cooldown 24h, degrade is a no-op at the floor |
+| `funds` | insufficient balance / quota (opencode and alibaba phrasings), arrears | no | cooldown 1h; degrades a mode **only when two different providers are both out of money** (a single provider out rotates) | cooldown 1h, degrade is a no-op at the floor |
 | `freequota` | "The free quota has been exhausted…" (alibaba promotional allowance) | no | cooldown 1h, rotate | **permanent** exclusion from the sweep (lifted when the mode leaves `free`) |
-| `rate` | 429, rate limit, throttling | no | cooldown 1m, rotate, re-sweep | cooldown 24h |
-| `capability` | model lacks a required capability | no | cooldown 5m, restrict the pool | cooldown 24h |
-| `context` | context window exceeded | no | rotate to a larger-context model | cooldown 24h |
+| `rate` | 429, rate limit, throttling | no | cooldown 1m, rotate, re-sweep | cooldown 1h |
+| `capability` | model lacks a required capability | no | cooldown 5m, restrict the pool | cooldown 1h |
+| `context` | context window exceeded | no | rotate to a larger-context model | cooldown 1h |
 | `notfound` | model gone or deprecated | no | cooldown 24h, rotate past | same |
 | `deprecated` | "…has been deprecated…" — the provider retires the row | no | **permanent** in every mode; nothing lifts it | same |
-| `auth` | 401/403, bad key | no | cooldown 15m, rotate to another provider | cooldown 24h |
-| `network` | timeout, reset, DNS | yes | cooldown 15s, retry | no retry, cooldown 24h |
-| `other` | unclassified | yes | cooldown 30s | no retry, cooldown 24h |
+| `auth` | 401/403, bad key | no | cooldown 15m, rotate to another provider | cooldown 1h |
+| `network` | timeout, reset, DNS | yes | cooldown 15s, retry | no retry, cooldown 1h |
+| `other` | unclassified | yes | cooldown 30s | no retry, cooldown 1h |
 
 **A retry storm is cut short, not watched.** opencode's own client retries a
 failed request ("retrying in 5s attempt 2…") — up to five attempts that can
@@ -294,7 +294,7 @@ unclassified failure is what sent recovery into a spin: one interrupt bought a
 rotation, the rotation got interrupted, and the loop paid for its own
 recovery.
 
-A free model that fails once is not tried again for a full day — `freequota`
+A free model that fails once is not tried again for an hour — `freequota`
 models never return, because a spent promotional quota does not come back with
 a timeout. A deprecated model never returns either, in any mode, and no mode
 change revives it. Only `funds` moves a mode (cheap → free, staying there

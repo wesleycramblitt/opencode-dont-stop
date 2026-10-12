@@ -61,15 +61,17 @@ export interface ErrorAction {
 }
 
 /**
- * A free model that failed stays out of the sweep for a full day.
+ * A free model that failed stays out of the sweep for an hour.
  *
  * Free endpoints fail at the door: a provider-wide rate limit, an exhausted
  * promotional quota, a dropped socket on a hosted free tier. None of those
  * clear in seconds, and the observed cost of the old 60s/15s/30s windows was a
  * loop that handed the same refused model its turn again — and again — instead
- * of walking the sweep. One try, one day out.
+ * of walking the sweep. One try, one hour out. The 24h experiment (2026-10-12)
+ * made the sweep too thin — the loop spent a day on local fallbacks while the
+ * remote free rows sat cooling — so the window is an hour again.
  */
-export const FREE_MODEL_TIMEOUT_MS = 24 * 60 * 60 * 1000
+export const FREE_MODEL_TIMEOUT_MS = 60 * 60 * 1000
 
 /**
  * A free model whose promotional quota is spent is out for good.
@@ -211,7 +213,7 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
   // then it stays out of the sweep. A spent promotional quota is out for the
   // grant's whole window — PERMANENT_COOLDOWN_MS — which is different in kind
   // from a transient failure: the model is not down, it is no longer free. Any
-  // other failure gets a full day, and nothing in the free sweep ever gets a
+  // other failure gets an hour, and nothing in the free sweep ever gets a
   // second attempt from a retry flag. Rotation is the recovery: every turn
   // walks to the next untried model, and the cooldown expiry — or a mode
   // change, which clears permanent entries — is what brings one back.
@@ -226,7 +228,7 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
     ...action,
     retry: false,
     cooldownMs: Math.max(action.cooldownMs, FREE_MODEL_TIMEOUT_MS),
-    reason: `${action.reason} — free policy: one day out of the sweep`,
+    reason: `${action.reason} — free policy: one hour out of the sweep`,
   }
 }
 
@@ -285,7 +287,7 @@ function actionForKind(kind: ErrorKind, message: string): ErrorAction {
         // the model back into contention — which is the "try again on free"
         // path: the sweep moves on *now* instead of waiting out the window on
         // a model that is refusing work. In `free` mode `actionFor` lengthens
-        // this to a full day; this value is the paid-mode policy.
+        // this to an hour; this value is the paid-mode policy.
         cooldownMs: 60 * 1000,
         resweep: true,
         degrade: false,

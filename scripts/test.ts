@@ -157,15 +157,15 @@ test("the message outranks a mislabeled type or status", () => {
   assert.equal(classify({ message: "The free quota has been exhausted: qwen3-turbo", status: 402 }).kind, "freequota")
 })
 
-test("free-mode failures: one try, one day out, spent quotas out forever", () => {
+test("free-mode failures: one try, one hour out, spent quotas out forever", () => {
   const rate = actionFor(classify({ message: "rate limit reached" }), "free")
   assert.equal(rate.resweep, true)
   assert.equal(rate.retry, false)
-  assert.equal(rate.cooldownMs, 24 * 60 * 60 * 1000)
+  assert.equal(rate.cooldownMs, 60 * 60 * 1000)
 
   const network = actionFor(classify({ message: "fetch failed" }), "free")
   assert.equal(network.retry, false)
-  assert.equal(network.cooldownMs, 24 * 60 * 60 * 1000)
+  assert.equal(network.cooldownMs, 60 * 60 * 1000)
 
   const quota = actionFor(classify({ message: "The free quota has been exhausted" }), "free")
   assert.equal(quota.retry, false)
@@ -258,10 +258,10 @@ test("a retry scheduled on a free-mode loop cuts the storm: cooldown, rotate, re
 
   await engine.onRetryScheduled("ses_loop", { message: "upstream request failed", type: "provider.error" })
 
-  // The failing model is on the free sweep's one-day cooldown, the turn was
+  // The failing model is on the free sweep's one-hour cooldown, the turn was
   // interrupted, and the chain rotated to the next untried model.
   assert.ok(state.cooldowns["a/x"] !== undefined)
-  assert.ok(state.cooldowns["a/x"]! > Date.now() + 23 * 60 * 60 * 1000)
+  assert.ok(state.cooldowns["a/x"]! > Date.now() + 59 * 60 * 1000)
   assert.deepEqual(fakes.interrupted, ["ses_loop"])
   assert.equal(state.loops["ses_loop"].lastResult, "rotated general to b/y (retry-after-network)")
   // The re-drive owns the next prompt, exactly like a hang interrupt.
@@ -467,6 +467,19 @@ function catalogueOf(models: CatalogueModel[]): Catalogue {
     byCanonical: new Map(),
   }
 }
+
+test("the architect's free-mode chain leads with its preferred model", () => {
+  const cat = catalogueOf([
+    row({ key: "oller/zeta", providerID: "oller", id: "zeta", local: false, context: 262144 }),
+    row({ key: "ollama/qwen3-coder:30b", providerID: "ollama", id: "qwen3-coder:30b", local: true, context: 262144 }),
+  ])
+  const architect = rankForMode(cat, "free", profileFor("architect"))
+  assert.equal(architect[0].key, "ollama/qwen3-coder:30b", "the architect leads with the big-window local coder")
+  const general = rankForMode(cat, "free", profileFor("general"))
+  assert.equal(general[0].key, "oller/zeta", "smaller tasks keep the remote-first sweep")
+  const power = rankForMode(cat, "power", profileFor("architect"))
+  assert.equal(power[0].key, "oller/zeta", "the lead does not leak into power mode")
+})
 
 test("unroutable and cooling models never satisfy a query", () => {
   const reachable = row({ key: "a/x", providerID: "a", id: "x" })

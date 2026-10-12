@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-10-12T17:32:23.665Z",
+  "generatedAt": "2026-10-12T22:09:34.271Z",
   "sources": [
     {
       "id": "models.dev",
@@ -10,7 +10,7 @@
     {
       "id": "ollama-popular",
       "url": "https://ollama.com/search?o=popular&c=text",
-      "models": 100
+      "models": 101
     },
     {
       "id": "alibaba",
@@ -39646,6 +39646,71 @@
       }
     },
     {
+      "key": "ollama/qwen3-coder:30b",
+      "providerID": "ollama",
+      "id": "qwen3-coder:30b",
+      "name": "qwen3-coder:30b",
+      "description": "Qwen3-Coder is a 30B coding model with a 256K context window, built for code generation, agentic workflows and long-context software tasks.",
+      "family": "",
+      "releaseDate": "",
+      "knowledge": "",
+      "openWeights": true,
+      "context": 262144,
+      "maxOutput": 0,
+      "capabilities": {
+        "text": true,
+        "image": false,
+        "audio": false,
+        "pdf": false,
+        "video": false,
+        "reasoning": true,
+        "toolCall": true,
+        "structured": false,
+        "embedding": false
+      },
+      "pricing": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0
+      },
+      "local": true,
+      "weights": {
+        "total": 30,
+        "active": 30,
+        "moe": false,
+        "source": "tag"
+      },
+      "cloud": false,
+      "reachable": true,
+      "capabilityTags": [
+        "text",
+        "reasoning",
+        "toolCall"
+      ],
+      "canonicalID": null,
+      "benchmarks": null,
+      "scores": {
+        "reasoning": 4.58,
+        "code": 3.75,
+        "agentic": 4.41,
+        "general": 3.46,
+        "capability": 4.38
+      },
+      "freeTier": null,
+      "provenance": {
+        "metadata": "local",
+        "benchmark": null,
+        "estimated": true,
+        "estimatedFields": [
+          "reasoning",
+          "code",
+          "agentic",
+          "general"
+        ]
+      }
+    },
+    {
       "key": "alibaba/qwen3.8-max-0902",
       "providerID": "alibaba",
       "id": "qwen3.8-max-0902",
@@ -43152,70 +43217,6 @@
         "agentic": 2.78,
         "general": 3.63,
         "capability": 2.9
-      },
-      "freeTier": null,
-      "provenance": {
-        "metadata": "local",
-        "benchmark": null,
-        "estimated": true,
-        "estimatedFields": [
-          "reasoning",
-          "code",
-          "agentic",
-          "general"
-        ]
-      }
-    },
-    {
-      "key": "ollama/qwen3-coder:30b",
-      "providerID": "ollama",
-      "id": "qwen3-coder:30b",
-      "name": "qwen3-coder:30b",
-      "description": "Alibaba's performant long-context models for agentic and coding tasks.",
-      "family": "",
-      "releaseDate": "",
-      "knowledge": "",
-      "openWeights": true,
-      "context": 262144,
-      "maxOutput": 0,
-      "capabilities": {
-        "text": true,
-        "image": false,
-        "audio": false,
-        "pdf": false,
-        "video": false,
-        "reasoning": false,
-        "toolCall": true,
-        "structured": false,
-        "embedding": false
-      },
-      "pricing": {
-        "input": 0,
-        "output": 0,
-        "cacheRead": 0,
-        "cacheWrite": 0
-      },
-      "local": true,
-      "weights": {
-        "total": 30,
-        "active": 30,
-        "moe": false,
-        "source": "tag"
-      },
-      "cloud": false,
-      "reachable": true,
-      "capabilityTags": [
-        "text",
-        "toolCall"
-      ],
-      "canonicalID": null,
-      "benchmarks": null,
-      "scores": {
-        "reasoning": 3.05,
-        "code": 3.07,
-        "agentic": 4.41,
-        "general": 3.46,
-        "capability": 3.87
       },
       "freeTier": null,
       "provenance": {

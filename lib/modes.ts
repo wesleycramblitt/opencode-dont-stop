@@ -93,6 +93,22 @@ export function profileFor(kind: AgentKind, overrides: Partial<TaskProfile> = {}
   return { ...base, ...overrides, kind }
 }
 
+/**
+ * Models an agent kind leads its chain with, ahead of the mode's own ranking.
+ *
+ * Keyed by catalogue key; rows absent from the catalogue are skipped, so the
+ * preference degrades gracefully when a model is not installed. Applied to
+ * the free sweep only: cheap mode's promise is "cheapest *paid* first", local
+ * mode already ranks capability, and power mode must not be overridden by a
+ * local row. The architect's work is context-heavy — a 256k local coder beats
+ * a swept remote row whose served window retires the session after one turn —
+ * so the architect leads with its big-window local and the rest of the chain
+ * (gemini, qwen3.5, the remote free sweep) serves the smaller tasks.
+ */
+export const AGENT_LEADS: Partial<Record<AgentKind, readonly string[]>> = {
+  architect: ["ollama/qwen3-coder:30b"],
+}
+
 /** Rank rows for one task under one mode. Pure and deterministic. */
 export function rankForMode(
   cat: Catalogue,
@@ -108,7 +124,7 @@ export function rankForMode(
 
   switch (mode) {
     case "free":
-      return rankFree(candidates, task)
+      return leadWithAgent(rankFree(candidates, task), candidates, task.kind)
     case "cheap":
       return rankCheap(candidates, task)
     case "local":
@@ -116,6 +132,23 @@ export function rankForMode(
     case "power":
       return rankPower(candidates, task)
   }
+}
+
+/**
+ * Prepend an agent kind's preferred rows to its ranked chain. Rows the
+ * catalogue does not carry are skipped; the rest of the ranking is untouched.
+ */
+function leadWithAgent(
+  ranked: CatalogueModel[],
+  candidates: CatalogueModel[],
+  kind: AgentKind,
+): CatalogueModel[] {
+  const leads = (AGENT_LEADS[kind] ?? [])
+    .map((key) => candidates.find((m) => m.key === key))
+    .filter((m): m is CatalogueModel => m !== undefined)
+  if (leads.length === 0) return ranked
+  const rest = ranked.filter((m) => !leads.includes(m))
+  return [...leads, ...rest]
 }
 
 /**
