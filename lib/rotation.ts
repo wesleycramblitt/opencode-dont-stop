@@ -256,6 +256,8 @@ export interface RotationResult {
   newSessionID?: string
   /** Whether the retired session was deleted after a successful rotation. */
   deletedOld?: boolean
+  /** The deletion error when the retired session could not be removed. */
+  deleteError?: string
 }
 
 /**
@@ -309,16 +311,19 @@ export async function rotate(
 
   // The retired session is deleted once its successor is seeded. Failure is
   // non-fatal: the loop is already on the successor, and the old session
-  // (left intact and idle) is what stays.
+  // (left intact and idle) is what stays. The reason is reported so the
+  // engine can log it where the user can see it.
   let deletedOld = false
+  let deleteError: string | undefined
   try {
     await ctx.session.remove({ sessionID: input.sessionID })
     deletedOld = true
   } catch (error) {
-    console.warn(`[dont-stop] could not delete retired session ${input.sessionID}: ${messageOf(error)}`)
+    deleteError = messageOf(error)
+    console.warn(`[dont-stop] could not delete retired session ${input.sessionID}: ${deleteError}`)
   }
 
-  return { rotated: true, newSessionID, deletedOld }
+  return { rotated: true, newSessionID, deletedOld, deleteError }
 }
 
 /* ------------------------------------------------------------------- helpers */

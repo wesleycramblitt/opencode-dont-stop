@@ -1899,7 +1899,10 @@ private rotationTitle(loop: LoopState): string {
     }
     this.state.loops[newSessionID] = next
     if (result.deletedOld === false) {
-      this.log.warn(`retired session ${sessionID} could not be deleted; it stays idle`)
+      this.log.warn(
+        `retired session ${sessionID} could not be deleted; it stays idle` +
+          (result.deleteError ? `: ${result.deleteError}` : ""),
+      )
     }
     // The seed prompt is the successor's opening turn, so arm it here, or the
     // first turn-end event would be a duplicate ending and the loop would

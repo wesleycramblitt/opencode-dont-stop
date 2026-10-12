@@ -977,6 +977,22 @@ test("a session rotates at the turn budget, carrying the loop", async () => {
   assert.deepEqual(fakes.removed, ["ses_loop"], "the retired session is deleted after rotation")
 })
 
+test("a failed delete of the retired session is non-fatal", async () => {
+  const { engine, state } = makeEngine("i1", { sessionSteps: 1, sessionMinSteps: 1 })
+  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
+  armLoop(engine, state, "i1", "ses_loop")
+  const broken = fakeContext()
+  ;(broken.context.session as unknown as { remove(input: { sessionID: string }): Promise<unknown> }).remove =
+    async () => {
+      throw new Error("remove rejected")
+    }
+  ;(engine as unknown as { ctx: unknown }).ctx = broken.context
+
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.ok(state.loops["ses_new"], "the rotation still lands on the successor")
+  assert.equal(state.loops["ses_loop"], undefined, "the loop record still moves to it")
+})
+
 test("a task-boundary signal rotates only after real work in the session", async () => {
   const { engine, state, fakes } = makeEngine("i1", { sessionMinSteps: 2, sessionSteps: 30 })
   injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
