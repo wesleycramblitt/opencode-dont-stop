@@ -592,6 +592,13 @@ while `sessionIterations` — the freshness metric in the footer — starts over
 The old session is left behind, intact and idle; nothing is deleted, and the
 TUI can still open it.
 
+The terminal follows the rotation: a TUI that was showing the loop's session
+switches to the successor (focused as a tab when tabs are enabled, a route
+change otherwise), so a watching terminal is never left staring at a retired
+conversation. Terminals on other sessions are untouched — only the terminal
+that was actually watching the loop moves, and the loop's `rotatedFrom`
+record is what says which session it left.
+
 ## Development
 
 ```

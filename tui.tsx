@@ -104,13 +104,31 @@ export default {
     let lastAnnounced = 0
     let lastMessage = ""
     let currentSessionID: string | null = null
+    // Whether the last observation had THIS terminal's session as an active
+    // loop's home. Only such a terminal follows a rotation — a tab opened on
+    // an already-retired session stays put instead of being yanked to the
+    // loop's current home.
+    let watchingLoop = false
     const announceInterval = setInterval(() => {
       const state = read()
       if (state.updated === lastAnnounced) return
       const previous = lastAnnounced
       lastAnnounced = state.updated
 
-      const primary = Object.values(state.loops).find((l) => l.status === "active")
+      const loops = Object.values(state.loops)
+      const primary = loops.find((l) => l.status === "active")
+      const here = currentSessionID ? state.loops[currentSessionID] : undefined
+
+      // The loop rotated away from this terminal's session: move the view to
+      // the successor so a terminal that was watching the loop keeps
+      // watching it. Chains follow naturally — once this terminal lands on
+      // the successor, the next rotation retires it the same way.
+      if (watchingLoop && !here && primary && primary.rotatedFrom === currentSessionID) {
+        watchingLoop = false
+        followSession(primary.sessionID!)
+      }
+      watchingLoop = here?.status === "active"
+
       if (primary && previous === 0) {
         toast(ctx, "info", "dont-stop", `loop running in ${primary.mode} mode`)
         return
@@ -118,9 +136,7 @@ export default {
       // Only loops this terminal can see are announced: the one on its own
       // session, or the one that just rotated away from it — so a retirement
       // is answered with where the loop went instead of a frozen-looking tab.
-      const loop =
-        (currentSessionID ? state.loops[currentSessionID] : undefined) ??
-        Object.values(state.loops).find((l) => l.status === "active" && l.rotatedFrom === currentSessionID)
+      const loop = here ?? loops.find((l) => l.status === "active" && l.rotatedFrom === currentSessionID)
       const message = loop?.lastResult
       if (previous === 0) {
         // First look at a settled state: this terminal never saw the stop
@@ -135,6 +151,26 @@ export default {
         toast(ctx, "info", "dont-stop", message)
       }
     }, 1000)
+
+    /**
+     * Move this terminal's view to the session the loop now lives on.
+     *
+     * Tabbed sessions focus the loop's tab (opening it when needed); the
+     * single-view layout navigates the router to the session directly.
+     */
+    function followSession(sessionID: string): void {
+      try {
+        const ui = ctx.ui as {
+          tabs?: { enabled(): boolean; focus(sessionID: string): void }
+          router?: { navigate(input: { type: "session"; sessionID: string }): void }
+        }
+        if (ui.tabs?.enabled()) ui.tabs.focus(sessionID)
+        else ui.router?.navigate({ type: "session", sessionID })
+      } catch {
+        // No terminal attached, or navigation unavailable here; the toast
+        // and the state file still say where the loop went.
+      }
+    }
 
     function toast(
       target: Parameters<NonNullable<Plugin.Definition["setup"]>>[0],
