@@ -149,11 +149,21 @@ export function eventSignals(event: SessionEvent): EventSignals {
         break
       case "session.usage.updated":
       case "session.usage.recorded":
-      case "session.retry.scheduled":
       case "session.compacted":
       case "session.compaction.started":
       case "session.compaction.ended":
         progress = "step"
+        break
+      case "session.retry.scheduled":
+        // A retry is the absence of progress, not a sign of it: the provider
+        // failed and the client is backing off. Counting it as progress would
+        // keep the hang clock disarmed while a session burns through retries
+        // on a model that is not answering — the "upstream request failed"
+        // storm where the model is never timed out. It still counts as
+        // *seen*, so the idle clock does not stand the session down. The
+        // event carries the error that caused the retry, which the engine
+        // uses to cut the storm short instead.
+        error = errorOf(data.error)
         break
       case "session.inbox.delivered":
         progress = "message"

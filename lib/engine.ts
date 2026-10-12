@@ -62,7 +62,7 @@ import { handoffDirectory } from "./state.ts"
 import { applyAgentDefaults, applySessionModels, sameSlot, slotFrom, type ApplyContext, type ModelPlan } from "./apply.ts"
 import type { Logger } from "./log.ts"
 import { bumpIntent, readState, type LoopState, type Mode, type ModelSlot, type PluginState } from "./state.ts"
-import { eventSignals, TURN_END_TYPES, type SessionEvent } from "./events.ts"
+import { eventSignals, TURN_END_TYPES, type EventError, type SessionEvent } from "./events.ts"
 
 /** A session the engine is tracking for the loop. */
 export interface TrackedSession {
@@ -132,6 +132,15 @@ export const DEFAULT_HANG_COOLDOWN_MS = 10 * 60_000
  * is a small recency window rather than an exact match.
  */
 export const HANG_INTERRUPT_RECENCY_MS = 5_000
+
+/**
+ * How long before a loop session may interrupt for a retry storm again.
+ *
+ * After one cut the turn is re-driven (the loop continues on a fresh model),
+ * so a window longer than the re-drive delay means the *next* turn's retry is
+ * a new failure, not the same storm being observed twice.
+ */
+export const RETRY_INTERRUPT_COOLDOWN_MS = 45_000
 
 /** Heartbeat intervals an owner may miss before its loop counts as orphaned. */
 export const LEASE_GRACE_BEATS = 3
@@ -214,6 +223,8 @@ export class LoopEngine {
    * re-drive own the next prompt instead of advancing immediately.
    */
   private hangInterrupts = new Map<string, number>()
+  /** When a retry storm was last cut short per loop session. */
+  private retryInterrupts = new Map<string, number>()
   /** Re-drive deadlines per loop session, or absent. */
   private redrives = new Map<string, number>()
 
@@ -858,6 +869,75 @@ export class LoopEngine {
     }
   }
 
+  /**
+   * A retry was scheduled on a loop's session: the endpoint already failed
+   * once and opencode is backing off to try again.
+   *
+   * In the free sweep the policy is one try per endpoint, and "retrying in
+   * Ns" is a sentence opencode would otherwise spend five attempts and about
+   * a minute on before the failure surfaced. So the engine cuts the storm
+   * short: the retry's own error is classified, the model goes on the same
+   * cooldown it would have earned once the attempts were spent, the turn is
+   * interrupted, and the chain rotates. The interrupted event that follows
+   * stands down (the hang marker), and the scheduled re-drive sends the
+   * continue prompt on the next model.
+   *
+   * Paid modes let opencode's retries finish: a blip on a model you are
+   * paying for usually recovers, and the paid chain is exactly where a
+   * same-model second chance belongs.
+   *
+   * The cooldown window (`RETRY_INTERRUPT_COOLDOWN_MS`) is how long before a
+   * loop session may interrupt for a retry storm again: after one cut the
+   * turn is re-driven on a fresh model, so a subsequent retry is a new
+   * failure, not the same storm observed twice.
+   */
+  async onRetryScheduled(sessionID: string, error: EventError | null): Promise<void> {
+    const loop = this.loopFor(sessionID)
+    if (!loop || !this.ownsLoop(sessionID)) return
+    if (loop.mode !== "free") return
+    const last = this.retryInterrupts.get(sessionID) ?? 0
+    if (Date.now() - last < RETRY_INTERRUPT_COOLDOWN_MS) return
+    this.retryInterrupts.set(sessionID, Date.now())
+
+    const record = this.tracked.get(sessionID)
+    const previous = record?.model ? modelKeyOf(record.model) : null
+
+    const classified = classify({
+      message: error?.message,
+      status: error?.status,
+      type: error?.type,
+    })
+    const action = actionFor(classified, loop.mode)
+    this.log.warn(
+      `model ${previous ?? "?"} is retrying after ${classified.kind}; interrupting the turn instead of burning the retries`,
+    )
+
+    // The interrupt is ours; mark it so the turn-end event it produces
+    // stands down instead of advancing.
+    this.hangInterrupts.set(sessionID, Date.now())
+    await this.interruptTree(sessionID)
+    this.clocks.clocksFor(sessionID).interrupted(Date.now())
+
+    // The await above yields the thread, and a halt may have landed in it.
+    const current = this.loopFor(sessionID)
+    if (!current || !this.ownsLoop(sessionID)) return
+
+    if (previous && action.cooldownMs > 0) {
+      this.putOnCooldown(previous, Date.now() + action.cooldownMs)
+    }
+
+    const outcome = this.rotate(sessionID, `retry-after-${classified.kind}`)
+    if (outcome !== "moved" && outcome !== "not-ours") {
+      this.log.warn(`no untried model left for ${sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
+      if (!this.redrives.has(sessionID)) this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
+      this.emit()
+      return
+    }
+    current.rotations += 1
+    this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
+    this.emit()
+  }
+
   /** Best-effort cancellation of an in-flight request. */
   private async interrupt(sessionID: string): Promise<void> {
     try {
@@ -881,21 +961,27 @@ export class LoopEngine {
    * `halt` binds every instance: everybody stops driving. `start` binds only
    * the instance that can see the session it names, which is how a loop is
    * never adopted by a process it does not belong to.
+   *
+   * Returns whether an intent was applied. The caller uses this to decide
+   * whether a reconcile changed anything — the file watcher's own writes must
+   * not re-trigger the watcher, which is the feedback loop that rewrote the
+   * state file every ~150ms while doing nothing.
    */
-  async applyIntent(onDisk: PluginState = readState()): Promise<void> {
+  async applyIntent(onDisk: PluginState = readState()): Promise<boolean> {
     const intent = onDisk.intent
-    if (!intent || intent.seq <= this.appliedIntent) return
+    if (!intent || intent.seq <= this.appliedIntent) return false
     this.appliedIntent = intent.seq
     this.state.intent = intent
 
     if (intent.action === "halt") {
-      if (this.loops().every((l) => l.status !== "active")) return
+      if (this.loops().every((l) => l.status !== "active")) return true
       this.log.info(`halt requested (intent ${intent.seq})`)
       // A halt is a verb without an owner: it stops every loop this instance
       // drives. Per-session halting goes through the command, which names its
       // session.
       await this.stop(`halted by intent ${intent.seq}`)
     }
+    return true
   }
 
   /**

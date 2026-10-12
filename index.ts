@@ -137,6 +137,19 @@ export default {
             }
           }
 
+          // A retry was scheduled for a turn: the endpoint already failed
+          // once and opencode is backing off. The free sweep cuts the storm
+          // short — classify the failure now, cool and rotate — instead of
+          // letting five attempts play out on a model that is not answering.
+          if (event.type === "session.retry.scheduled" && eventData(event).sessionID) {
+            const signals = eventSignals(event)
+            const sid = signals.sessionID
+            if (sid) {
+              await engine.onRetryScheduled(sid, signals.error)
+              persist()
+            }
+          }
+
           // A turn of a loop's session ended — this is the loop's driver.
           // The event names the ending, so a subagent ending its own turn, or
           // an ending in an instance that is not driving the loop, cannot
@@ -177,12 +190,13 @@ export default {
 
     async function reconcileFromFile(): Promise<void> {
       const incoming = readState()
+      let changed = false
 
       if (incoming.mode !== state.mode) {
         const mode = MODES.includes(incoming.mode) ? incoming.mode : state.mode
         log.info(`mode changed externally to ${mode}`)
         await engine.setMode(mode)
-        persist()
+        changed = true
       }
 
       // Loop control no longer comes from the status fields — those are the
@@ -190,8 +204,15 @@ export default {
       // last, which is how a halt could be lost within a heartbeat. It comes
       // from the intent, which is merged by sequence number and therefore
       // survives the race.
-      await engine.applyIntent()
-      persist()
+      if (await engine.applyIntent()) changed = true
+
+      // Persist only when the reconcile changed something. Writing on every
+      // pass is what made the watcher eat its own tail: each write re-triggered
+      // the watch event, the reconcile re-read an unchanged file and wrote it
+      // again — a feedback loop rewriting the state file ~twice a second,
+      // which re-rendered the TUI's app tree (the palette's "sections
+      // cycling") and kept toasts alive on a written-but-unchanged file.
+      if (changed) persist()
     }
 
     /* ------------------------------------------------------------- startup */

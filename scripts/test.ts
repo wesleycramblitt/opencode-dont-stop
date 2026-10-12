@@ -78,6 +78,13 @@ test("nested AI-SDK error shapes decode", () => {
   assert.equal(signals.error?.type, "provider.invalid-request")
 })
 
+test("a scheduled retry is not progress, but carries the failure that caused it", () => {
+  const signals = eventSignals({ type: "session.retry.scheduled", data: { sessionID: "s", attempt: 2, error: { message: "upstream request failed", type: "provider.error", status: 502 } } })
+  assert.equal(signals.progress, null)
+  assert.equal(signals.lifecycle, null)
+  assert.deepEqual(signals.error, { message: "upstream request failed", type: "provider.error", status: 502 })
+})
+
 test("session metadata events feed tracking without touching clocks", () => {
   const created = eventSignals({ type: "session.created", data: { sessionID: "ses_new", agent: "general", model: { providerID: "alibaba", id: "qwen3.7-flash" } } })
   assert.equal(created.lifecycle, null)
@@ -236,6 +243,83 @@ test("a mode degrades only when two different providers are both out of money", 
   tracked.model = { providerID: "opencode", id: "deepseek-v4-flash" }
   await engine.onError({ sessionID: "ses_loop", message: "insufficient funds" })
   assert.equal(state.loops["ses_loop"].mode, "cheap")
+})
+
+test("a retry scheduled on a free-mode loop cuts the storm: cooldown, rotate, redrive", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x", pricing: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    row({ key: "b/y", providerID: "b", id: "y", pricing: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!
+  tracked.model = { providerID: "a", id: "x" }
+
+  await engine.onRetryScheduled("ses_loop", { message: "upstream request failed", type: "provider.error" })
+
+  // The failing model is on the free sweep's one-day cooldown, the turn was
+  // interrupted, and the chain rotated to the next untried model.
+  assert.ok(state.cooldowns["a/x"] !== undefined)
+  assert.ok(state.cooldowns["a/x"]! > Date.now() + 23 * 60 * 60 * 1000)
+  assert.deepEqual(fakes.interrupted, ["ses_loop"])
+  assert.equal(state.loops["ses_loop"].lastResult, "rotated general to b/y (retry-after-network)")
+  // The re-drive owns the next prompt, exactly like a hang interrupt.
+  assert.ok((engine as unknown as { redrives: Map<string, number> }).redrives.has("ses_loop"))
+})
+
+test("paid-mode loops let opencode's own retries finish", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  const cat = catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "cheap")
+  const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!
+  tracked.model = { providerID: "a", id: "x" }
+
+  await engine.onRetryScheduled("ses_loop", { message: "upstream request failed" })
+
+  assert.equal(fakes.interrupted.length, 0)
+  assert.ok(state.cooldowns["a/x"] === undefined)
+})
+
+test("a second retry within the cut window is the same storm, not a new failure", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x", pricing: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    row({ key: "b/y", providerID: "b", id: "y", pricing: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!
+  tracked.model = { providerID: "a", id: "x" }
+
+  await engine.onRetryScheduled("ses_loop", { message: "upstream request failed" })
+  const interrupted = fakes.interrupted.length
+  const rotated = state.loops["ses_loop"].rotations
+  // The same turn's second retry event arrives milliseconds later: ignored.
+  await engine.onRetryScheduled("ses_loop", { message: "upstream request failed" })
+  assert.equal(fakes.interrupted.length, interrupted)
+  assert.equal(state.loops["ses_loop"].rotations, rotated)
+})
+
+test("a retry on a session we do not own is ignored", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  await engine.onRetryScheduled("ses_user", { message: "upstream request failed" })
+  assert.equal(fakes.interrupted.length, 0)
+})
+
+test("applying an already-seen intent reports no change", async () => {
+  const { engine, state } = makeEngine("i1")
+  state.intent = { seq: 7, action: "none", at: Date.now() }
+  // The engine's applied marker mirrors the state it was built with (all
+  // builds read state first), so advance it to the seeded seq.
+  ;(engine as unknown as { appliedIntent: number }).appliedIntent = 7
+  const applied = await engine.applyIntent({ ...state, intent: { seq: 7, action: "none", at: Date.now() } })
+  assert.equal(applied, false)
+  const fresh = await engine.applyIntent({ ...state, intent: { seq: 8, action: "halt", at: Date.now() } })
+  assert.equal(fresh, true)
+  assert.equal(Object.keys(state.loops).length, 0) // no loops to halt
 })
 
 /* -------------------------------------------------------------------- catalogue */

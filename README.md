@@ -265,6 +265,17 @@ of the sweep after any failure, and a spent promotional quota out **forever**.
 | `network` | timeout, reset, DNS | yes | cooldown 15s, retry | no retry, cooldown 24h |
 | `other` | unclassified | yes | cooldown 30s | no retry, cooldown 24h |
 
+**A retry storm is cut short, not watched.** opencode's own client retries a
+failed request ("retrying in 5s attempt 2…") — up to five attempts that can
+take a minute, during which the failing model stays in use and the hang
+clock was never disarmed, because a retry is activity, not progress. When
+the loop's session schedules a retry in `free` mode, the engine classifies
+the retry's own error, interrupts the turn (the storm never happens),
+cooldowns the model per the policy above, rotates, and re-drives on the
+next untried model. Paid modes let opencode's retries finish: a blip on a
+model you are paying for usually recovers, and a second chance belongs in
+the paid chain.
+
 `interrupted` leads the pattern list on purpose. The loop's own hang recovery
 produces exactly this error — "tool interrupted" — and scoring it as an
 unclassified failure is what sent recovery into a spin: one interrupt bought a

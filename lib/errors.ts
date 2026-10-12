@@ -52,8 +52,8 @@ export interface ErrorAction {
   /**
    * The *same* model could plausibly succeed on a second attempt, so the loop
    * retries it once before rotating. False for failures that are facts about
-   * the model — a capability miss, an exceeded context, a deleted model —
-   * where a second attempt would only cost time.
+   * the model or about the free sweep — capacity, context, and everything in
+   * `free` mode retry never.
    */
   retry: boolean
   /** Short explanation for status output. */
