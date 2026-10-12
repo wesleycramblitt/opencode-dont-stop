@@ -27,7 +27,7 @@ import {
   type Mode,
   type PluginState,
 } from "./lib/state.ts"
-import { exportSummary } from "./lib/catalogue.ts"
+import { exportSummary, hardwareFromEnv } from "./lib/catalogue.ts"
 import { describeMode } from "./lib/modes.ts"
 import { DEFAULT_CLOCKS } from "./lib/clocks.ts"
 
@@ -82,6 +82,7 @@ export default {
       {
         clocks: DEFAULT_CLOCKS,
         onStateChange: persist,
+        hardware: hardwareFromEnv(),
       },
     )
 

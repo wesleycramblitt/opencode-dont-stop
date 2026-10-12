@@ -18,7 +18,7 @@ import { join } from "node:path"
 import { eventSignals } from "../lib/events.ts"
 import { SessionClocks } from "../lib/clocks.ts"
 import { classify, actionFor, DEPRECATED_COOLDOWN_MS, PERMANENT_COOLDOWN_MS } from "../lib/errors.ts"
-import { clearCooldown, cooldown, meets, loadCatalogue, type Catalogue, type CatalogueModel } from "../lib/catalogue.ts"
+import { clearCooldown, cooldown, meets, loadCatalogue, type Catalogue, type CatalogueModel, type HardwareProfile } from "../lib/catalogue.ts"
 import { rankForMode, profileFor } from "../lib/modes.ts"
 import { measureContext, descendantIDs, effectiveContext, ollamaServedContext, shouldRotate } from "../lib/rotation.ts"
 import { catalogueRefreshDue, parseAlibabaInventory, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
@@ -484,6 +484,36 @@ test("the architect's free-mode chain leads with its preferred models", () => {
   assert.equal(general[0].key, "oller/zeta", "smaller tasks keep the remote-first sweep")
   const power = rankForMode(cat, "power", profileFor("architect"))
   assert.equal(power[0].key, "oller/zeta", "the lead does not leak into power mode")
+})
+
+test("an agent lead that cannot load on this card is skipped", () => {
+  const cat = catalogueOf([
+    row({ key: "oller/zeta", providerID: "oller", id: "zeta", local: false, context: 262144 }),
+    row({
+      key: "ollama/qwen3.5:9b-ctx256k", providerID: "ollama", id: "qwen3.5:9b-ctx256k", local: true,
+      context: 262144, weights: { total: 9, active: 9, moe: false, source: "tag" },
+    }),
+    row({
+      key: "ollama/qwen3-coder:30b-ctx256k", providerID: "ollama", id: "qwen3-coder:30b-ctx256k", local: true,
+      context: 262144, weights: { total: 30, active: 30, moe: false, source: "tag" },
+    }),
+  ])
+  const laptop: HardwareProfile = { name: "8gb", vramGB: 8, quant: "q4" }
+  const architect = rankForMode(cat, "free", profileFor("architect"), laptop)
+  assert.equal(architect[0].key, "oller/zeta", "leads that cannot load on 8GB fall through to the ranking")
+  const desktop = rankForMode(cat, "free", profileFor("architect"))
+  assert.equal(desktop[0].key, "ollama/qwen3.5:9b-ctx256k", "the same list leads on the 24GB desktop")
+})
+
+test("the hardware profile reaches the engine's plan", () => {
+  const { engine, state } = makeEngine("i1", { hardware: { name: "8gb", vramGB: 8, quant: "q4" } })
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x", local: true, cloud: false, weights: { total: 30, active: 30, moe: false, source: "tag" } }),
+    row({ key: "b/y", providerID: "b", id: "y", local: true, cloud: false, weights: { total: 3, active: 3, moe: false, source: "tag" } }),
+  ])
+  injectCatalogue(engine, cat)
+  const plan = engine.buildPlan("local")
+  assert.equal(plan.agents["general"]?.id, "y", "the plan picks the model that fits the machine")
 })
 
 test("unroutable and cooling models never satisfy a query", () => {

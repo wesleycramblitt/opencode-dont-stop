@@ -129,7 +129,7 @@ export function rankForMode(
 
   switch (mode) {
     case "free":
-      return leadWithAgent(rankFree(candidates, task), candidates, task.kind)
+      return leadWithAgent(rankFree(candidates, task), candidates, task.kind, hardware)
     case "cheap":
       return rankCheap(candidates, task)
     case "local":
@@ -141,16 +141,21 @@ export function rankForMode(
 
 /**
  * Prepend an agent kind's preferred rows to its ranked chain. Rows the
- * catalogue does not carry are skipped; the rest of the ranking is untouched.
+ * catalogue does not carry are skipped (a model absent from this machine);
+ * rows that cannot load on this machine's card are skipped too — one ordered
+ * list then serves machines of different sizes, with a small card falling
+ * through the big-window leads to the variants that fit it.
  */
 function leadWithAgent(
   ranked: CatalogueModel[],
   candidates: CatalogueModel[],
   kind: AgentKind,
+  hardware: HardwareProfile,
 ): CatalogueModel[] {
   const leads = (AGENT_LEADS[kind] ?? [])
     .map((key) => candidates.find((m) => m.key === key))
     .filter((m): m is CatalogueModel => m !== undefined)
+    .filter((m) => fitsLocally(m, hardware) !== false)
   if (leads.length === 0) return ranked
   const rest = ranked.filter((m) => !leads.includes(m))
   return [...leads, ...rest]

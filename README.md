@@ -617,6 +617,37 @@ conversation. Terminals on other sessions are untouched — only the terminal
 that was actually watching the loop moves, and the loop's `rotatedFrom`
 record is what says which session it left.
 
+## Context windows and hardware
+
+A local model's window is configured in three layers, and the plugin measures
+whatever the daemon actually serves:
+
+1. **Daemon default.** `OLLAMA_CONTEXT_LENGTH` (64,000 here, in the ollama
+   unit's environment) is the window every *plain* tag serves.
+2. **Per-model variants.** A Modelfile bakes a larger window into a model
+   (`PARAMETER num_ctx 262144`), installed as its own tag
+   (`ollama create qwen3.5:9b-ctx256k -f Modelfile`). The baked parameter
+   overrides the daemon env and is clamped at the model's native window — the
+   exact served figure shows up in `/api/ps`.
+3. **The plugin's rotation threshold.** `contextLimitFor` reads `/api/ps` for
+   the loaded model; the loop rotates at 0.8 × the served window. Whatever a
+   model actually serves is what the loop uses — no window guessing.
+
+Two per-machine knobs keep the same code right on different machines:
+
+- **`DONT_STOP_VRAM_GB`** (e.g. `DONT_STOP_VRAM_GB=8` in the service
+  environment) sizes the local fit checks to the card's VRAM — any GPU,
+  only the VRAM number matters. Agent leads and the local-mode ranking skip
+  rows that cannot load (weights + reserve > 0.88 × VRAM), and the default
+  falls back to 24 GB (a 4090-class card).
+- **The catalogue is per-machine**: `npx tsx scripts/update-catalogue.ts`
+  merges the local ollama daemon's installed tags, so each machine's
+  catalogue reflects its own models. Since `AGENT_LEADS` and the ranking skip
+  rows that are absent **or do not fit**, one ordered lead list works
+  everywhere: a small card falls through the big-window leads to the variants
+  that fit it. A variant that serves more than it should wastes a load
+  attempt at worst — the daemon refuses a window that does not fit.
+
 ## Development
 
 ```

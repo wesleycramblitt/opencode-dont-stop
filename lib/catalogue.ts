@@ -78,6 +78,20 @@ export interface HardwareProfile {
 /** An RTX 4090, the common local-first card. */
 export const HARDWARE_4090: HardwareProfile = { name: "rtx-4090", vramGB: 24, quant: "q4" }
 
+/**
+ * The hardware profile for THIS machine: `DONT_STOP_VRAM_GB` overrides the
+ * default 4090 figure (24GB), so an 8GB laptop card excludes models that
+ * cannot load there. Unknown or absent values fall back to the default.
+ * Follows the env-var config pattern of this plugin (`DONT_STOP_ALIBABA`).
+ */
+export function hardwareFromEnv(): HardwareProfile {
+  const raw = Number(process.env.DONT_STOP_VRAM_GB)
+  if (Number.isFinite(raw) && raw > 0) {
+    return { name: `custom-${raw}gb`, vramGB: raw, quant: "q4" }
+  }
+  return HARDWARE_4090
+}
+
 const QUANT_BYTES_PER_PARAM: Record<HardwareProfile["quant"], number> = {
   q4: 0.6,
   q5: 0.75,

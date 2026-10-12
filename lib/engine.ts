@@ -37,9 +37,11 @@ import {
   sortBy,
   sorts,
   exportSummary,
+  HARDWARE_4090,
   type AvailabilityPatch,
   type Catalogue,
   type CatalogueModel,
+  type HardwareProfile,
   type Requirements,
 } from "./catalogue.ts"
 import {
@@ -94,6 +96,12 @@ export interface EngineOptions {
   sessionMinSteps?: number
   /** Identifies this process as the loop's owner. Generated when omitted. */
   instanceID?: string
+  /**
+   * The machine's GPU profile for local fit checks. Defaults to the 4090
+   * figure; set `DONT_STOP_VRAM_GB` in the environment (index.ts builds this
+   * from it) so an 8GB laptop card excludes models that cannot load there.
+   */
+  hardware?: HardwareProfile
   /**
    * Delay before re-driving the loop: after cancelling a hung turn, and
    * before a second attempt on a model that just failed.
@@ -330,6 +338,8 @@ export class LoopEngine {
   private readonly redriveDelayMs: number
   private readonly hangCooldownMs: number
   private readonly leaseGraceMs: number
+  /** The machine's GPU profile for local fit checks. */
+  private readonly hardware: HardwareProfile
   /** Rotations a live subagent deferred, retried on the next turn end. */
   private readonly pendingRotation = new Map<string, string>()
   /**
@@ -365,6 +375,7 @@ export class LoopEngine {
     this.sessionMinSteps = options.sessionMinSteps ?? DEFAULT_SESSION_MIN_STEPS
     this.redriveDelayMs = options.redriveDelayMs ?? DEFAULT_REDRIVE_DELAY_MS
     this.hangCooldownMs = options.hangCooldownMs ?? DEFAULT_HANG_COOLDOWN_MS
+    this.hardware = options.hardware ?? HARDWARE_4090
     this.leaseGraceMs = clocks.intervalMs * LEASE_GRACE_BEATS
     for (const id of options.seedSessions ?? []) {
       this.track(id)
@@ -741,7 +752,7 @@ export class LoopEngine {
 
     for (const kind of AGENT_KINDS) {
       const task = this.taskFor(kind)
-      const ranked = rankForMode(this.catalogue, mode, task)
+      const ranked = rankForMode(this.catalogue, mode, task, this.hardware)
       if (ranked.length === 0) {
         notes.push(`${kind}: no model satisfies ${mode} requirements`)
         continue
@@ -1435,7 +1446,7 @@ export class LoopEngine {
     const agent = record.agent
 
     if (!this.catalogue) return "unavailable"
-    const ranked = rankForMode(this.catalogue, loop.mode, this.taskFor(agent))
+    const ranked = rankForMode(this.catalogue, loop.mode, this.taskFor(agent), this.hardware)
     if (ranked.length === 0) {
       this.log.warn(`no model left in the ${loop.mode} chain for ${agent}`)
       return "unavailable"
