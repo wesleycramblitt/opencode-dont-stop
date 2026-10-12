@@ -61,7 +61,7 @@ import {
 import { handoffDirectory } from "./state.ts"
 import { applyAgentDefaults, applySessionModels, sameSlot, slotFrom, type ApplyContext, type ModelPlan } from "./apply.ts"
 import type { Logger } from "./log.ts"
-import { bumpIntent, readState, type Mode, type ModelSlot, type PluginState } from "./state.ts"
+import { bumpIntent, readState, type LoopState, type Mode, type ModelSlot, type PluginState } from "./state.ts"
 import { eventSignals, TURN_END_TYPES, type SessionEvent } from "./events.ts"
 
 /** A session the engine is tracking for the loop. */
@@ -191,27 +191,31 @@ export class LoopEngine {
    */
   private retries: Record<string, number> = {}
   /**
-   * Whether the turn that just ended died of an error rather than completing.
-   * Cleared when a prompt is sent, so `advance` can tell a finished turn from
-   * an error that merely idled the session — only the former starts a fresh
-   * try budget, or a failing model would get an unlimited number of retries.
+   * Whether the turn that just ended died of an error rather than completing,
+   * per loop session (memory-only; on-disk loops carry no such flag). Cleared
+   * when a prompt is sent, so `advance` can tell a finished turn from an
+   * error that merely idled the session — only the former starts a fresh try
+   * budget, or a failing model would get an unlimited number of retries.
    */
-  private turnFailed = false
+  private failedTurns = new Set<string>()
   /**
-   * Whether a turn of the loop's session is in flight. Set when a prompt is
-   * sent and when an execution-start event arrives; cleared by the first
-   * turn-end event. Turn-end events come in pairs on the v2 bus (an execution
-   * result and a later idle/status), and without this flag each pair would
-   * advance the loop twice.
+   * Whether a turn of a LOOP'S session is in flight, per session. Set when a
+   * prompt is sent and when an execution-start event arrives; cleared by the
+   * first turn-end event. Turn-end events come in pairs on the v2 bus (an
+   * execution result and a later idle/status), and without this flag each pair
+   * would advance the loop twice. Per-session since 2026-10-12: several
+   * sessions may run loops of their own at once.
    */
-  private turnArmed = false
+  private armedSessions = new Set<string>()
   /**
-   * When the hang path last interrupted the loop session. The interrupt
+   * When the hang path last interrupted each session. The interrupt
    * produces a `session.execution.interrupted` event; distinguishing it from
    * a user escape is what lets the engine stand down and let the scheduled
    * re-drive own the next prompt instead of advancing immediately.
    */
-  private lastHangInterruptAt = 0
+  private hangInterrupts = new Map<string, number>()
+  /** Re-drive deadlines per loop session, or absent. */
+  private redrives = new Map<string, number>()
 
   /**
    * This process's identity. Written into the state file as the loop's owner,
@@ -221,12 +225,10 @@ export class LoopEngine {
   readonly instanceID: string
   /** Newest control intent this engine has acted on, so its own are not replayed. */
   private appliedIntent: number
-  /** Deadline for re-driving the loop after a cancelled turn, or null. */
-  private redriveAt: number | null = null
   /** Last announced reachability counts, so a re-check logs only on change. */
   private reachabilityCount: { reachable: number; unroutable: number } | null = null
-  /** Guards against sending two prompts for one idle event. */
-  private advancing = false
+  /** Guards against sending two prompts for one idle event, per loop session. */
+  private advancing = new Set<string>()
   /** Whether a foreign loop has already been reported, so it is said once. */
   private reportedForeignLoop = false
 
@@ -262,8 +264,24 @@ export class LoopEngine {
 
   /* ------------------------------------------------------------- accessors */
 
-  get status(): PluginState["loop"] {
-    return this.state.loop
+  /**
+   * The loop the whole-plugin surface reports: the newest ACTIVE loop, else
+   * the newest stopped one, else null. Per-session loops live in
+   * `state.loops`; this is only the one-line answer.
+   */
+  get status(): LoopState | null {
+    return this.primaryLoop()
+  }
+
+  /** The loop the global surfaces (footer, agent defaults) follow. */
+  primaryLoop(): LoopState | null {
+    const loops = Object.values(this.state.loops)
+    if (loops.length === 0) return null
+    const active = loops.filter((l) => l.status === "active")
+    const pool = active.length > 0 ? active : loops
+    return [...pool].sort(
+      (a, b) => (b.ownerBeatAt || b.startedAt || 0) - (a.ownerBeatAt || a.startedAt || 0),
+    )[0]
   }
 
   get mode(): Mode {
@@ -278,17 +296,28 @@ export class LoopEngine {
     return [...this.tracked.values()]
   }
 
+  /** Every loop record, in insertion order. */
+  loops(): LoopState[] {
+    return Object.values(this.state.loops)
+  }
+
+  /** The loop record of one session, when it has one. */
+  loopFor(sessionID: string): LoopState | undefined {
+    return this.state.loops[sessionID]
+  }
+
   /**
-   * May this instance drive the loop right now?
+   * May this instance drive THAT session's loop?
    *
-   * The single gate for every loop action — advancing, interrupting, rotating,
-   * re-driving. A loop is a live conversation with requests in flight, so it
-   * cannot be resumed by whoever reads the state file next; only its owner
-   * acts, and everyone else reports.
+   * The single gate for every loop action — advancing, interrupting,
+   * rotating, re-driving. A loop is a live conversation with requests in
+   * flight, so it cannot be resumed by whoever reads the state file next;
+   * only its owner acts, and everyone else reports.
    */
-  ownsLoop(): boolean {
-    const loop = this.state.loop
-    return loop.status === "active" && loop.sessionID !== null && loop.owner === this.instanceID
+  ownsLoop(sessionID: string): boolean {
+    const loop = this.state.loops[sessionID]
+    return !!loop && loop.status === "active" && loop.sessionID === sessionID &&
+      loop.owner === this.instanceID
   }
 
   /* ------------------------------------------------------------ attribution */
@@ -328,9 +357,9 @@ export class LoopEngine {
 
     if (signals.lifecycle === "start") {
       clocks.start(now)
-      // A started turn is a turn in flight: the first turn-end event for the
+      // A started turn is a turn in flight: the first turn-end event for a
       // loop's session is the one that gets to advance it.
-      if (sessionID === this.state.loop.sessionID) this.turnArmed = true
+      if (this.loopFor(sessionID)) this.armedSessions.add(sessionID)
       const record = this.tracked.get(sessionID)
       if (record) {
         if (signals.model) record.model = signals.model
@@ -365,9 +394,9 @@ export class LoopEngine {
    */
   async onTurnEnd(sessionID: string, eventType: string): Promise<void> {
     if (!TURN_END_TYPES.has(eventType)) return
-    if (!this.ownsLoop() || this.state.loop.sessionID !== sessionID) return
-    if (!this.turnArmed) return
-    this.turnArmed = false
+    if (!this.ownsLoop(sessionID)) return
+    if (!this.armedSessions.has(sessionID)) return
+    this.armedSessions.delete(sessionID)
 
     if (eventType === "session.execution.interrupted") {
       // An interrupt ends a turn without completing it. When it was ours —
@@ -375,9 +404,9 @@ export class LoopEngine {
       // owns the next prompt, and advancing now would double-drive. When it
       // was the user's escape, nothing else is scheduled, so the re-drive
       // gives the loop a moment before continuing it.
-      const ours = Date.now() - this.lastHangInterruptAt < HANG_INTERRUPT_RECENCY_MS
+      const ours = Date.now() - (this.hangInterrupts.get(sessionID) ?? 0) < HANG_INTERRUPT_RECENCY_MS
       if (ours) return
-      if (this.redriveAt === null) this.redriveAt = Date.now() + this.redriveDelayMs
+      if (!this.redrives.has(sessionID)) this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
       return
     }
 
@@ -581,15 +610,14 @@ export class LoopEngine {
     return profileFor(kind, wanted ? { vision: true } : {})
   }
 
-  /** Build the full plan for the current mode and catalogue. */
-  buildPlan(): ModelPlan {
+  /** Build the full plan for one mode and the current catalogue. */
+  buildPlan(mode: Mode = this.state.mode): ModelPlan {
     const notes: string[] = []
     const agents: Record<string, ModelSlot> = {}
     if (!this.catalogue) {
       return { main: null, agents, sessions: [], notes: ["no catalogue yet"] }
     }
 
-    const mode = this.state.mode
     for (const kind of AGENT_KINDS) {
       const task = this.taskFor(kind)
       const ranked = rankForMode(this.catalogue, mode, task)
@@ -618,9 +646,14 @@ export class LoopEngine {
   /* ---------------------------------------------------------------- applying */
 
   /**
-   * Push the current plan through both channels and record the result. Safe
+   * Push the current plans through both channels and record the result. Safe
    * to call on every heartbeat: the plan diff keeps it quiet when nothing
    * changed.
+   *
+   * Two plans exist per-session (2026-10-12): the agent-defaults channel is
+   * global, so it follows the PRIMARY loop's mode (the default mode when no
+   * loop is active), while the session-pin channel is one entry per owned
+   * loop, each planned in ITS OWN loop's mode.
    */
   async refresh(force = false): Promise<void> {
     if (!this.catalogue) {
@@ -628,20 +661,24 @@ export class LoopEngine {
       if (!this.catalogue) return
     }
 
-    const plan = this.buildPlan()
+    const primary = this.primaryLoop()
+    const primaryMode = primary?.mode ?? this.state.mode
+    const plan = this.buildPlan(primaryMode)
 
     await applyAgentDefaults(this.ctx as unknown as ApplyContext, () => plan)
 
-    // The session channel reaches the loop's own session ONLY. Tracking used
-    // to be incidental — `observe` records every session that emits an event —
-    // and the plan then switched the pinned model of *every* tracked session,
+    // The session channel reaches the LOOP sessions ONLY. Tracking used to be
+    // incidental — `observe` records every session that emits an event — and
+    // the plan then switched the pinned model of *every* tracked session,
     // which is how a free-sweep re-plan re-modelled a user's live session that
     // had nothing to do with the loop. Being tracked is not consent: this
-    // plugin drives the loop it was asked to start, and nothing else.
+    // plugin drives the loops it was asked to start, and nothing else.
     const needsSwitch: Array<{ sessionID: string; model: ModelSlot }> = []
-    if (this.state.loop.sessionID !== null && this.ownsLoop()) {
-      const target = this.tracked.get(this.state.loop.sessionID)
-      const entry = plan.sessions.find((e) => e.sessionID === this.state.loop.sessionID)
+    for (const loop of this.loops()) {
+      if (loop.status !== "active" || loop.owner !== this.instanceID || loop.sessionID === null) continue
+      const loopPlan = loop.mode === primaryMode ? plan : this.buildPlan(loop.mode)
+      const target = this.tracked.get(loop.sessionID)
+      const entry = loopPlan.sessions.find((e) => e.sessionID === loop.sessionID)
       if (entry && target) {
         if (force || !target.model || !sameSlot(target.model, entry.model)) needsSwitch.push(entry)
       }
@@ -658,7 +695,7 @@ export class LoopEngine {
       }
     }
 
-    // Mirror the plan into state so the TUI can render it.
+    // Mirror the primary plan into state so the TUI can render it.
     this.state.main = plan.main
     this.state.agentModels = plan.agents
     this.emit()
@@ -677,37 +714,42 @@ export class LoopEngine {
     // One read serves both: they are two views of the same file.
     const onDisk = readState()
     await this.applyIntent(onDisk)
-    await this.reapOrphanedLoop(onDisk)
+    await this.reapOrphanedLoops(onDisk)
 
     // Re-evaluate on the interval, per the power/free/cheap mode contracts.
     await this.refresh(false)
 
-    if (this.ownsLoop()) {
-      this.state.loop.ownerBeatAt = now
-      await this.maybeRedrive()
+    const now2 = Date.now()
+    for (const sessionID of Object.keys(this.state.loops)) {
+      const loop = this.state.loops[sessionID]
+      // One heartbeat per owned ACTIVE loop: the lease, and the re-drive only
+      // a cancelled turn owes. Stopped loops keep their history but beat
+      // nothing.
+      if (loop.status !== "active" || loop.owner !== this.instanceID) continue
+      loop.ownerBeatAt = now2
+      await this.maybeRedrive(sessionID)
     }
 
     const verdicts = this.clocks.evaluate(now)
     for (const { sessionID, verdict } of verdicts) {
       if (verdict.action === "idle") {
-        // A non-loop session going idle is simply untracked. The loop session
-        // is *not* stopped here: idle between turns is the loop's normal state,
-        // and the idle event handler (`advance`) is what decides whether the
-        // work is finished. Stopping on idle would end the loop on its first
-        // turn.
-        if (sessionID === this.state.loop.sessionID) continue
+        // A non-loop session going idle is simply untracked. A loop session
+        // is *not* stopped here: idle between turns is the loop's normal
+        // state, and the idle event handler (`advance`) is what decides
+        // whether the work is finished. Stopping on idle would end the loop
+        // on its first turn.
+        if (this.loopFor(sessionID)) continue
         this.log.info(`session ${sessionID} idle: ${verdict.reason}`)
         this.untrack(sessionID)
         continue
       }
 
       if (verdict.action === "hang") {
-        // Only the loop's own session is ours to rescue. Interrupting a
+        // Only a loop session we own is ours to rescue. Interrupting a
         // session nobody asked this plugin to manage is how a hang detector
         // becomes something that kills unrelated work — including the very
         // turn the user is watching.
-        if (sessionID !== this.state.loop.sessionID) continue
-        if (!this.ownsLoop()) continue
+        if (!this.ownsLoop(sessionID)) continue
         await this.handleHang(sessionID, verdict.reason)
       }
     }
@@ -745,15 +787,15 @@ export class LoopEngine {
 
     // The interrupt is ours; mark it so the turn-end event it produces stands
     // down instead of advancing.
-    this.lastHangInterruptAt = Date.now()
+    this.hangInterrupts.set(sessionID, Date.now())
     await this.interruptTree(sessionID)
     this.clocks.clocksFor(sessionID).interrupted(Date.now())
 
     // The await above yields the thread, and a halt may have landed in it.
     // Re-read the loop and re-check ownership rather than rotating a loop
     // that was stopped while the interrupt was in flight.
-    const current = this.state.loop
-    if (!this.ownsLoop() || current.sessionID !== sessionID) return
+    const current = this.loopFor(sessionID)
+    if (!current || !this.ownsLoop(sessionID)) return
 
     if (previous) {
       this.putOnCooldown(previous, Date.now() + this.hangCooldownMs)
@@ -768,7 +810,7 @@ export class LoopEngine {
       // local fallback is still the chain's tail, so this usually does not
       // happen at all.
       this.log.warn(`no untried model left for ${sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
-      if (this.redriveAt === null) this.redriveAt = Date.now() + this.redriveDelayMs
+      if (!this.redrives.has(sessionID)) this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
       this.emit()
       return
     }
@@ -778,12 +820,12 @@ export class LoopEngine {
     // without a scheduled re-drive the loop would go silent right here. The
     // heartbeat picks this up; `maybeRedrive` stands down if a real turn
     // started in the meantime.
-    this.redriveAt = Date.now() + this.redriveDelayMs
+    this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
     this.emit()
   }
 
   /**
-   * Re-drive the loop when its last turn was cancelled rather than completed.
+   * Re-drive one loop when its last turn was cancelled rather than completed.
    *
    * Deliberately conservative: it fires once, at the deadline, and only while
    * the session is genuinely idle — if anything started a turn in the
@@ -791,17 +833,16 @@ export class LoopEngine {
    * deadline is *kept* rather than consumed in that case, so a re-drive
    * scheduled behind a slow turn is not thrown away.
    */
-  private async maybeRedrive(): Promise<void> {
-    const at = this.redriveAt
-    if (at === null || Date.now() < at) return
+  private async maybeRedrive(sessionID: string): Promise<void> {
+    const at = this.redrives.get(sessionID)
+    if (at === undefined || Date.now() < at) return
 
-    const sessionID = this.state.loop.sessionID
-    if (!sessionID || !this.ownsLoop()) {
-      this.redriveAt = null
+    if (!this.ownsLoop(sessionID)) {
+      this.redrives.delete(sessionID)
       return
     }
     if (this.clocks.peek(sessionID)?.activity.running) return
-    this.redriveAt = null
+    this.redrives.delete(sessionID)
 
     try {
       this.log.info(`re-driving ${sessionID} after a cancelled turn`)
@@ -812,7 +853,7 @@ export class LoopEngine {
       // loop, it reschedules one — the session may be mid-teardown or the
       // provider briefly unreachable, and the error funnel reports either.
       this.log.warn(`re-drive failed on ${sessionID}: ${msg(error)}; will try again`)
-      this.redriveAt = Date.now() + this.redriveDelayMs
+      this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
       void this.onError({ sessionID, error, message: msg(error) }).catch(() => {})
     }
   }
@@ -848,25 +889,17 @@ export class LoopEngine {
     this.state.intent = intent
 
     if (intent.action === "halt") {
-      if (this.state.loop.status !== "active") return
+      if (this.loops().every((l) => l.status !== "active")) return
       this.log.info(`halt requested (intent ${intent.seq})`)
+      // A halt is a verb without an owner: it stops every loop this instance
+      // drives. Per-session halting goes through the command, which names its
+      // session.
       await this.stop(`halted by intent ${intent.seq}`)
-      return
-    }
-
-    if (intent.action === "start" && this.state.loop.status !== "active") {
-      const loop = onDisk.loop
-      if (!loop.sessionID || !loop.prompt) return
-      if (!this.tracked.has(loop.sessionID)) {
-        this.log.info(`ignoring start intent ${intent.seq}: ${loop.sessionID} is served by another instance`)
-        return
-      }
-      await this.start(loop.sessionID, loop.prompt)
     }
   }
 
   /**
-   * Halt a loop whose owner instance is gone, and otherwise report the loop
+   * Halt loops whose owner instance is gone, and otherwise report the loops
    * the owner actually has.
    *
    * A loop is a conversation in another process; when that process dies the
@@ -880,45 +913,34 @@ export class LoopEngine {
    * Ownership is the one field where memory wins — if either copy says this
    * instance owns the loop, the file is behind and the function stands down.
    */
-  async reapOrphanedLoop(onDisk: PluginState = readState()): Promise<void> {
-    const memory = this.state.loop
-    const disk = onDisk.loop
+  async reapOrphanedLoops(onDisk: PluginState = readState()): Promise<void> {
+    for (const [sessionID, disk] of Object.entries(onDisk.loops)) {
+      if (!disk || disk.status !== "active") continue
 
-    // Ours in either copy: this instance writes the lease, so memory is the
-    // fresher copy and a lagging file must never overwrite it.
-    if (memory.owner === this.instanceID || disk.owner === this.instanceID) return
+      // Ours in either copy: this instance writes the lease, so memory is the
+      // fresher copy and a lagging file must never overwrite it.
+      const memory = this.state.loops[sessionID]
+      if (memory?.owner === this.instanceID || disk.owner === this.instanceID) continue
 
-    // Not ours: the file is the truth to report — the owner writes it, and
-    // our copy only ages.
-    if (
-      disk.status !== memory.status ||
-      disk.sessionID !== memory.sessionID ||
-      disk.owner !== memory.owner ||
-      disk.ownerBeatAt !== memory.ownerBeatAt
-    ) {
-      this.state.loop = { ...memory, ...disk }
-    }
-
-    if (disk.status !== "active") return
-
-    const beatAt = disk.ownerBeatAt ?? 0
-    if (beatAt > 0 && Date.now() - beatAt <= this.leaseGraceMs) {
-      // Someone else's live loop. Say so once — a footer that reads "active"
-      // in a process doing nothing is otherwise a mystery.
-      if (!this.reportedForeignLoop) {
-        this.reportedForeignLoop = true
-        this.log.info(
-          `a loop is running on ${disk.sessionID} under instance ${disk.owner}; this instance reports but does not drive it`,
-        )
+      const beatAt = disk.ownerBeatAt ?? 0
+      if (beatAt > 0 && Date.now() - beatAt <= this.leaseGraceMs) {
+        // Someone else's live loop. Say so once — a footer that reads "active"
+        // in a process doing nothing is otherwise a mystery.
+        if (!this.reportedForeignLoop) {
+          this.reportedForeignLoop = true
+          this.log.info(
+            `a loop is running on ${sessionID} under instance ${disk.owner}; this instance reports but does not drive it`,
+          )
+        }
+        continue
       }
-      return
-    }
 
-    this.log.warn(
-      `loop on ${disk.sessionID ?? "unknown session"} is orphaned ` +
-        `(owner ${disk.owner ?? "none"} last beat ${beatAt > 0 ? `${Math.round((Date.now() - beatAt) / 1000)}s` : "never"} ago)`,
-    )
-    await this.stop("loop orphaned: the instance running it is gone")
+      this.log.warn(
+        `loop on ${sessionID} is orphaned ` +
+          `(owner ${disk.owner ?? "none"} last beat ${beatAt > 0 ? `${Math.round((Date.now() - beatAt) / 1000)}s` : "never"} ago)`,
+      )
+      await this.stop("loop orphaned: the instance running it is gone", sessionID)
+    }
   }
 
   /**
@@ -974,14 +996,14 @@ export class LoopEngine {
     if (classified.kind === "interrupted") this.log.quiet("info", line)
     else this.log.warn(line)
 
-    const ownsThis = this.ownsLoop() && input.sessionID !== undefined &&
-      this.state.loop.sessionID === input.sessionID
+    const ownsThis = input.sessionID !== undefined && this.ownsLoop(input.sessionID)
     const record = input.sessionID ? this.tracked.get(input.sessionID) : undefined
     const key = record?.model ? modelKeyOf(record.model) : null
+    const loop = ownsThis && input.sessionID ? this.loopFor(input.sessionID) : undefined
 
     // The loop's turn just died: however the session ends up idling, that turn
     // must not be counted as completed work.
-    if (ownsThis) this.turnFailed = true
+    if (ownsThis && input.sessionID) this.failedTurns.add(input.sessionID)
 
     // A retryable failure on the loop's own model is worth one more attempt
     // on that same model before we spend a rotation: a dropped connection or
@@ -1018,7 +1040,11 @@ export class LoopEngine {
       // bar. A funds failure from the loop's own model with no other provider
       // marked fresh keeps the mode and rotates instead.
       if (classified.kind !== "funds" || this.fundsShortfall()) {
-        await this.degradeMode(action.reason)
+        if (ownsThis && input.sessionID) {
+          await this.degradeMode(input.sessionID, action.reason)
+        } else {
+          this.log.info(`funds failure outside the loop; no mode moves (${action.reason})`)
+        }
       } else {
         const provider = record?.model?.providerID ?? "unknown"
         this.log.info(`funds failure on ${provider} only; not degrading until a second provider is out of money`)
@@ -1027,11 +1053,11 @@ export class LoopEngine {
 
     if (this.consecutive(classified)) {
       // Reported, not stopped (owner, 2026-10-11): the loop survives error
-      // streaks. The counter is in the state file, so a degenerate provider
+      // streaks. The counter sits on the loop, so a degenerate provider
       // run is visible before it becomes a wallpaper.
-      if (ownsThis) this.state.consecutiveErrors += 1
-    } else if (ownsThis) {
-      this.state.consecutiveErrors = 0
+      if (loop) loop.consecutiveErrors += 1
+    } else if (loop) {
+      loop.consecutiveErrors = 0
     }
 
     if (willRetry && key) {
@@ -1039,7 +1065,7 @@ export class LoopEngine {
       this.log.info(`retrying ${key} once after ${classified.kind} before rotating`)
       // Nothing has changed on the session, so nothing will prompt it: the
       // re-drive is what turns "retry" into an actual second attempt.
-      this.redriveAt = Date.now() + this.redriveDelayMs
+      if (input.sessionID) this.redrives.set(input.sessionID, Date.now() + this.redriveDelayMs)
     } else if (action.resweep && input.sessionID && ownsThis) {
       const outcome = this.rotate(input.sessionID, classified.kind)
       // Not a stop when the chain has nothing left (owner, 2026-10-11): the
@@ -1047,7 +1073,7 @@ export class LoopEngine {
       // that was never ours to make, and quietly does nothing.
       if (outcome !== "moved" && outcome !== "not-ours") {
         this.log.warn(`no untried model left for ${input.sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
-        if (this.redriveAt === null) this.redriveAt = Date.now() + this.redriveDelayMs
+        if (!this.redrives.has(input.sessionID)) this.redrives.set(input.sessionID, Date.now() + this.redriveDelayMs)
         this.emit()
         return action
       }
@@ -1108,16 +1134,17 @@ export class LoopEngine {
     // Only the loop's owner moves a session's model. Rotation from an error on
     // some other session — or from another instance watching the same file —
     // is this plugin reaching into work it was not asked to manage.
-    if (!this.ownsLoop() || this.state.loop.sessionID !== sessionID) return "not-ours"
+    const loop = this.loopFor(sessionID)
+    if (!loop || !this.ownsLoop(sessionID)) return "not-ours"
 
     const record = this.tracked.get(sessionID)
     if (!record) return "not-ours"
     const agent = record.agent
 
     if (!this.catalogue) return "unavailable"
-    const ranked = rankForMode(this.catalogue, this.state.mode, this.taskFor(agent))
+    const ranked = rankForMode(this.catalogue, loop.mode, this.taskFor(agent))
     if (ranked.length === 0) {
-      this.log.warn(`no model left in the ${this.state.mode} chain for ${agent}`)
+      this.log.warn(`no model left in the ${loop.mode} chain for ${agent}`)
       return "unavailable"
     }
 
@@ -1136,16 +1163,16 @@ export class LoopEngine {
       break
     }
     if (!pick) {
-      this.state.loop.lastResult =
-        `every model in the ${this.state.mode} chain for ${agent} has had its try (${ranked.length} models)`
-      this.log.warn(this.state.loop.lastResult)
+      loop.lastResult =
+        `every model in the ${loop.mode} chain for ${agent} has had its try (${ranked.length} models)`
+      this.log.warn(loop.lastResult)
       return "exhausted"
     }
 
     record.model = slotFrom(pick)
     this.tried.add(modelKeyOf(pick))
-    this.state.loop.lastResult = `rotated ${agent} to ${pick.providerID}/${pick.id} (${cause})`
-    this.log.info(this.state.loop.lastResult)
+    loop.lastResult = `rotated ${agent} to ${pick.providerID}/${pick.id} (${cause})`
+    this.log.info(loop.lastResult)
 
     void applySessionModels(
       this.ctx as unknown as ApplyContext,
@@ -1157,13 +1184,44 @@ export class LoopEngine {
 
   /* ----------------------------------------------------------- mode changes */
 
-  /** Switch mode, reset per-mode state, and re-plan. */
-  async setMode(mode: Mode): Promise<void> {
-    if (this.state.mode === mode) return
-    this.state.mode = mode
-    this.state.degraded = false
-    this.state.preferredMode = null
-    this.state.consecutiveErrors = 0
+  /**
+   * Switch a loop's mode — or the default mode when no session is named.
+   *
+   * Per-session (owner, 2026-10-12): a mode belongs to the loop it runs in,
+   * so `setMode(mode, sessionID)` changes THAT session's loop and nothing
+   * else. Without a session, it changes the DEFAULT mode for new loops and,
+   * as a convenience for the single-loop case, the primary active loop too.
+   */
+  async setMode(mode: Mode, sessionID?: string): Promise<void> {
+    if (sessionID) {
+      // One session's loop only: the other loops keep their own modes.
+      const loop = this.loopFor(sessionID)
+      if (!loop) {
+        this.log.warn(`no loop on session ${sessionID}; mode unchanged`)
+        return
+      }
+      if (loop.mode !== mode) this.applyLoopMode(loop, mode)
+      await this.refresh(true)
+      return
+    }
+    // No session named: the default mode changes, and — the single-loop
+    // convenience — the primary active loop follows it. Two sessions running
+    // loops of their own are untouched by this call.
+    const primary = this.primaryLoop()
+    if (primary && primary.mode !== mode) this.applyLoopMode(primary, mode)
+    if (this.state.mode !== mode || !primary) {
+      this.state.mode = mode
+      if (!primary) this.resetEpisode()
+    }
+    await this.refresh(true)
+  }
+
+  /** Put one loop on a mode: reset its per-mode state and re-plan. */
+  private applyLoopMode(loop: LoopState, mode: Mode): void {
+    loop.mode = mode
+    loop.degraded = false
+    loop.preferredMode = null
+    loop.consecutiveErrors = 0
     // A permanent free-quota exclusion belongs to the free sweep, and only to
     // it: in `cheap` the same model is a paid row and is selectable again. So
     // leaving free mode lifts every permanent cooldown; ordinary timed
@@ -1171,8 +1229,7 @@ export class LoopEngine {
     if (mode !== "free") this.liftPermanentCooldowns()
     // A new chain is a new bet, so the episode's try budget starts over.
     this.resetEpisode()
-    this.log.info(`mode set to ${mode}`)
-    await this.refresh(true)
+    this.log.info(`mode set to ${mode}${loop.sessionID ? ` on ${loop.sessionID}` : ""}`)
   }
 
   /** Clear the cooldowns a spent free quota earned. */
@@ -1190,18 +1247,20 @@ export class LoopEngine {
     this.log.info(`mode left the free sweep; lifted ${keys.length} permanent quota exclusions`)
   }
 
-  /** Drop to a cheaper mode, recording where we degraded from. */
-  private async degradeMode(reason: string): Promise<void> {
-    const chain = degradeChainOf(this.state.mode)
+  /** Drop one loop to a cheaper mode, recording where it degraded from. */
+  private async degradeMode(sessionID: string, reason: string): Promise<void> {
+    const loop = this.loopFor(sessionID)
+    if (!loop) return
+    const chain = degradeChainOf(loop.mode)
     if (chain.length <= 1) {
-      this.log.warn(`cannot degrade below ${this.state.mode}: ${reason}`)
+      this.log.warn(`cannot degrade below ${loop.mode}: ${reason}`)
       return
     }
     const next = chain[1]
-    if (!this.state.degraded) this.state.preferredMode = this.state.mode
-    this.state.degraded = true
-    this.log.warn(`degrading ${this.state.mode} -> ${next}: ${reason}`)
-    this.state.mode = next
+    if (!loop.degraded) loop.preferredMode = loop.mode
+    loop.degraded = true
+    this.log.warn(`degrading ${loop.mode} -> ${next} on ${sessionID}: ${reason}`)
+    loop.mode = next
     // A cheaper chain is a different set of models, so the episode's try budget
     // starts over rather than inheriting the previous chain's verdicts.
     this.resetEpisode()
@@ -1233,24 +1292,24 @@ export class LoopEngine {
    * desynchronise the counters.
    */
   async advance(sessionID: string): Promise<void> {
-    if (this.advancing) return
-    if (!this.ownsLoop()) return
-    if (this.state.loop.sessionID !== sessionID) return
+    if (this.advancing.has(sessionID)) return
+    if (!this.ownsLoop(sessionID)) return
+    const loop = this.loopFor(sessionID)!
 
-    this.advancing = true
+    this.advancing.add(sessionID)
     // A real turn completed, so any pending re-drive of a cancelled one is
     // stale: this idle event is the driver now.
-    this.redriveAt = null
+    this.redrives.delete(sessionID)
     try {
-      this.state.loop.iterations += 1
+      loop.iterations += 1
       // Finished work is the evidence that the model was not the problem, so
       // the episode's try budget starts over. A turn that merely *errored* into
       // idleness does not count as finished — otherwise a failing model would
       // clear its own failure count every time it gave up, and earn an
       // unlimited number of retries.
-      if (!this.turnFailed) this.resetEpisode()
-      const iteration = this.state.loop.iterations
-      this.state.loop.lastResult = `iteration ${iteration} complete`
+      if (!this.failedTurns.has(sessionID)) this.resetEpisode()
+      const iteration = loop.iterations
+      loop.lastResult = `iteration ${iteration} complete`
       this.emit()
 
       if (iteration >= this.maxIterations) {
@@ -1262,14 +1321,14 @@ export class LoopEngine {
 
       const lastText = await this.lastAssistantText(sessionID)
       if (lastText.includes(this.sentinel)) {
-        await this.stop(`task complete after ${iteration} iterations`)
+        await this.stop(`task complete after ${iteration} iterations`, sessionID)
         return
       }
 
-      if (this.state.consecutiveErrors >= 5) {
+      if (loop.consecutiveErrors >= 5) {
         // Not a stop (owner, 2026-10-11): the loop survives its own error
         // streaks. The count is reported so the condition is visible.
-        this.log.warn(`${this.state.consecutiveErrors} consecutive errors and continuing`)
+        this.log.warn(`${loop.consecutiveErrors} consecutive errors and continuing`)
       }
 
       // Hand off before continuing when the context window is spent. This is
@@ -1289,16 +1348,16 @@ export class LoopEngine {
       // A deferred handoff is worth surfacing: the loop is continuing on a
       // window that is already past its threshold, and the reason (usually a
       // live subagent) is the thing a user would want to know.
-      const deferred = handoff === "deferred" ? ` (handoff deferred: ${this.state.loop.lastResult ?? "unknown"})` : ""
-      this.state.loop.lastResult = `iteration ${iteration} done; continuing${deferred}`
+      const deferred = handoff === "deferred" ? ` (handoff deferred: ${loop.lastResult ?? "unknown"})` : ""
+      loop.lastResult = `iteration ${iteration} done; continuing${deferred}`
       this.log.info(`loop iteration ${iteration} complete; continuing`)
       this.emit()
     } catch (error) {
       this.log.error(`advance failed on ${sessionID}: ${msg(error)}`)
-      this.state.consecutiveErrors += 1
+      loop.consecutiveErrors += 1
       this.emit()
     } finally {
-      this.advancing = false
+      this.advancing.delete(sessionID)
     }
   }
 
@@ -1309,8 +1368,8 @@ export class LoopEngine {
     // errored into idleness". Arming the turn here also guards against the
     // pair of turn-end events an ending produces: the first one advances, the
     // second is a duplicate that must not.
-    this.turnFailed = false
-    this.turnArmed = true
+    this.failedTurns.delete(sessionID)
+    this.armedSessions.add(sessionID)
     const session = this.ctx as unknown as {
       session: { prompt(input: { sessionID: string; text: string }): Promise<unknown> }
     }
@@ -1327,7 +1386,7 @@ export class LoopEngine {
   private resetEpisode(): void {
     this.tried.clear()
     this.retries = {}
-    this.state.loop.rotations = 0
+    for (const loop of this.loops()) loop.rotations = 0
   }
 
   /**
@@ -1361,6 +1420,8 @@ export class LoopEngine {
    * delays the handoff rather than losing it.
    */
   private async checkHandoff(sessionID: string): Promise<"handed-off" | "deferred" | "not-needed"> {
+    const loop = this.loopFor(sessionID)
+    if (!loop) return "not-needed"
     const limit = this.contextLimitFor(sessionID)
     if (limit <= 0) return "not-needed"
 
@@ -1377,37 +1438,43 @@ export class LoopEngine {
 
       const result = await handoff(this.ctx as unknown as HandoffContext, {
         sessionID,
-        task: this.state.loop.prompt,
-        iterations: this.state.loop.iterations,
+        task: loop.prompt,
+        iterations: loop.iterations,
         reason: `Context reached ${Math.round((used / limit) * 100)}% of a ${limit}-token window.`,
         transcript: turns,
         files,
       }, { directory: this.handoffDirectory, agent: record?.agent })
 
       if (!result.handed) {
-        this.state.loop.lastResult = result.deferred ?? "unknown"
+        loop.lastResult = result.deferred ?? "unknown"
         this.log.warn(`handoff deferred: ${result.deferred ?? "unknown"}`)
         this.emit()
         return "deferred"
       }
 
       // The successor session carries the loop forward; the old one is done.
+      // The loop record MOVES to the new key: per-session loops are keyed by
+      // session, and the loop's identity is the work, not the session id.
       const newSessionID = result.newSessionID!
       this.untrack(sessionID)
       this.track(newSessionID, record?.agent ?? "general")
-      this.state.loop.sessionID = newSessionID
+      const moved = this.loopFor(sessionID)
+      if (!moved) return "deferred"
+      delete this.state.loops[sessionID]
+      const next = { ...moved, sessionID: newSessionID }
+      this.state.loops[newSessionID] = next
       // The handoff seeds the successor with its own prompt, so its opening
       // turn is a turn of the loop: arm it here, or the first turn-end event
       // would be a duplicate ending and the loop would stand down.
-      this.turnArmed = true
-      this.state.loop.lastResult = `handed off to ${newSessionID} (summary: ${result.summaryFile})`
+      this.armedSessions.add(newSessionID)
+      next.lastResult = `handed off to ${newSessionID} (summary: ${result.summaryFile})`
       this.log.info(`handed off to ${newSessionID}; summary at ${result.summaryFile}`)
       this.clocks.clocksFor(newSessionID).start(Date.now())
       this.emit()
       return "handed-off"
     } catch (error) {
       this.log.warn(`handoff failed: ${msg(error)}`)
-      this.state.loop.lastResult = `handoff failed: ${msg(error)}`
+      loop.lastResult = `handoff failed: ${msg(error)}`
       this.emit()
       return "deferred"
     }
@@ -1441,36 +1508,44 @@ export class LoopEngine {
 
   /* -------------------------------------------------------- loop lifecycle */
 
-  async start(sessionID: string, prompt: string): Promise<void> {
-    const loop = this.state.loop
-    if (loop.status === "active" && loop.owner !== this.instanceID) {
+  async start(sessionID: string, prompt: string, mode?: Mode): Promise<void> {
+    const existing = this.state.loops[sessionID]
+    if (existing?.status === "active" && existing.owner !== this.instanceID) {
       this.log.warn(
-        `a loop is already running on ${loop.sessionID} under instance ${loop.owner ?? "none"}; ` +
+        `a loop is already running on ${sessionID} under instance ${existing.owner ?? "none"}; ` +
           `stop it before starting another`,
       )
       return
     }
 
     this.track(sessionID)
-    this.state.loop = {
+    this.state.loops[sessionID] = {
       status: "active",
       sessionID,
       prompt,
+      // A start is a fresh run: the iteration counter belongs to the run,
+      // not to the session's earlier loops. The mode comes from the caller,
+      // else the session's previous mode, else the default.
       iterations: 0,
       startedAt: Date.now(),
-      lastResult: null,
+      lastResult: "loop started",
       owner: this.instanceID,
       ownerBeatAt: Date.now(),
       rotations: 0,
+      mode: mode ?? existing?.mode ?? this.state.mode,
+      degraded: false,
+      preferredMode: null,
+      consecutiveErrors: 0,
     }
-    this.state.consecutiveErrors = 0
-    this.redriveAt = null
+    const loop = this.state.loops[sessionID]
+    this.failedTurns.delete(sessionID)
+    this.redrives.delete(sessionID)
     this.resetEpisode()
     // Announce ownership in the control plane, so every other instance reads
     // this loop as somebody else's and leaves it alone.
     this.appliedIntent = bumpIntent(this.state, "start").seq
     this.clocks.clocksFor(sessionID).start(Date.now())
-    this.log.info(`loop started on ${sessionID}: ${prompt.slice(0, 80)}`)
+    this.log.info(`loop started on ${sessionID} (${loop.mode}): ${prompt.slice(0, 80)}`)
 
     // Plan first so the opening turn already runs on the right model.
     await this.refresh(true)
@@ -1483,14 +1558,18 @@ export class LoopEngine {
       this.clocks.clocksFor(sessionID).start(Date.now())
     } catch (error) {
       this.log.error(`could not send the opening prompt: ${msg(error)}`)
-      await this.stop(`failed to send the opening prompt: ${msg(error)}`)
+      await this.stop(`failed to send the opening prompt: ${msg(error)}`, sessionID)
       return
     }
     this.emit()
   }
 
   /**
-   * Disarm the loop and clean up after it, whether or not it was running.
+   * Disarm loops and clean up after them, whether or not they were running.
+   *
+   * Without a session id, EVERY loop this instance drives is halted — a halt
+   * is a verb without an owner (a teardown, a palette stop, an intent). With
+   * one, only that session's loop is.
    *
    * The cleanup is the point. The old form returned early when the status was
    * already "stopped", which silently dropped the two things that actually end
@@ -1499,50 +1578,55 @@ export class LoopEngine {
    * waiting on. Halting appeared to work — the status flipped — while the
    * interrupt-and-rotate cycle it was meant to end kept firing.
    */
-  async stop(reason: string): Promise<void> {
-    const loop = this.state.loop
-    // Nothing is running: an idle stop — a plugin teardown, a second halt for
-    // a loop that already ended, a duplicate command — must not overwrite the
-    // last real result. `loop.lastResult` is what the terminal announces, and
-    // one teardown writing "plugin unloaded" over it is how a single unload
-    // became an endless toast.
-    if (loop.status !== "active") return
-    const sessionID = loop.sessionID
+  async stop(reason: string, sessionID?: string): Promise<void> {
+    const targets = sessionID ? (this.state.loops[sessionID] ? [sessionID] : []) : Object.keys(this.state.loops)
+    for (const sid of targets) {
+      const loop = this.state.loops[sid]
+      // Nothing is running: an idle stop — a plugin teardown, a second halt
+      // for a loop that already ended, a duplicate command — must not
+      // overwrite the last real result. `loop.lastResult` is what the terminal
+      // announces, and one teardown writing "plugin unloaded" over it is how a
+      // single unload became an endless toast.
+      if (loop.status !== "active") continue
 
-    loop.status = "stopped"
-    loop.lastResult = reason
-    loop.sessionID = null
-    loop.owner = null
-    loop.ownerBeatAt = 0
-    loop.rotations = 0
-    this.redriveAt = null
-    // The episode's try budget belongs to a loop that is over.
-    this.resetEpisode()
+      loop.status = "stopped"
+      loop.lastResult = reason
+      loop.owner = null
+      loop.ownerBeatAt = 0
+      loop.rotations = 0
+      this.redrives.delete(sid)
+      // The loop keeps its sessionID so a later `start` finds its home; the
+      // owner is what says nobody drives it right now.
+      this.failedTurns.delete(sid)
+      this.armedSessions.delete(sid)
+      this.hangInterrupts.delete(sid)
 
-    // Announce the halt on the control plane: bumping the sequence is what
-    // lets this survive a status write that raced it, and tells every other
-    // instance the loop is over rather than merely idle.
-    this.appliedIntent = bumpIntent(this.state, "halt").seq
-
-    if (sessionID) {
       // The halt applies to the whole tree, not just the root: subagents of
       // the loop's session were spawned by it, and a loop that is over must
       // not leave a fan-out writing into abandoned work. Only live members
       // are interrupted; the rest only lose their clocks.
-      await this.interruptTree(sessionID)
-      this.clocks.forget(sessionID)
-      const tree = await this.sessionTree(sessionID)
+      await this.interruptTree(sid)
+      this.clocks.forget(sid)
+      const tree = await this.sessionTree(sid)
       for (const id of tree) {
-        if (id === sessionID) continue
+        if (id === sid) continue
         this.untrack(id)
       }
       // The loop session itself is kept tracked: a dropped session would make
       // the next `start` fail with "no session to run the loop on" until the
       // user happened to talk to it again.
     }
+    // The episode's try budget belongs to a loop that is over.
+    if (targets.length > 0) this.resetEpisode()
 
-    this.log.info(`loop stopped: ${reason}`)
-    this.emit()
+    if (targets.length > 0) {
+      // Announce the halt on the control plane: bumping the sequence is what
+      // lets this survive a status write that raced it, and tells every other
+      // instance the loop is over rather than merely idle.
+      this.appliedIntent = bumpIntent(this.state, "halt").seq
+      this.log.info(`loop${targets.length > 1 ? "s" : ""} stopped: ${reason}`)
+      this.emit()
+    }
   }
 
   /** Persist and notify. */

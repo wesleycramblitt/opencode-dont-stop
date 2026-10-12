@@ -16,8 +16,9 @@ import { join } from "node:path"
 import { homedir } from "node:os"
 import { Plugin } from "@opencode/plugin/tui"
 import type { JSX } from "@opentui/solid"
+import { createSignal, onCleanup } from "solid-js"
 
-import { MODES, dontStopDisabled, readState, writeState, type Mode, type PluginState } from "./lib/state.ts"
+import { MODES, dontStopDisabled, readState, writeState, type LoopState, type Mode, type PluginState } from "./lib/state.ts"
 import { describeMode } from "./lib/modes.ts"
 
 const statePath = join(homedir(), ".config", "opencode", "dont-stop-state.json")
@@ -49,17 +50,22 @@ export default {
 
     // The state file is the bridge. Watch its mtime rather than polling its
     // contents: the server half writes atomically via rename, so an mtime
-    // change is a reliable, cheap signal.
+    // change is a reliable, cheap signal. The signal reaches the footer
+    // through a Solid `createSignal` (the slot render mounts it; the timer
+    // pushes into it), so the footer re-renders on every actual change —
+    // including a mode change while nothing else moves, which the old
+    // non-reactive read missed.
     let snapshot: PluginState = readState()
     let stamp = mtimeOf(statePath)
-    const listeners = new Set<() => void>()
+    let push: ((state: PluginState) => void) | null = null
+    let slotVersion = 0
 
     const timer = setInterval(() => {
       const next = mtimeOf(statePath)
       if (next === stamp) return
       stamp = next
       snapshot = readState()
-      for (const listener of listeners) listener()
+      push?.(snapshot)
     }, 500)
 
     function read(): PluginState {
@@ -68,18 +74,22 @@ export default {
 
     /* ---------------------------------------------------------------- footer */
 
-    // A reactive read of the state file. Solid re-runs the claim whenever a
-    // listener fires, which is what makes the footer live.
-    function useLoopState(): PluginState {
-      // Solid's tracking works through the renderer's own reactivity, so a
-      // plain read here re-evaluates when the claim re-renders.
-      void listeners.size
-      return read()
-    }
-
+    // The footer shows the loop of the session the prompt belongs to when
+    // that session has one — per-session since 2026-10-12 — and falls back to
+    // the newest loop otherwise, so the plugin's state is never a mystery.
     const disposeFooter = ctx.ui.slot({
       replace: "prompt.footer.status",
-      render: () => <DontStopFooter state={useLoopState()} />,
+      render: (props: { sessionID?: string }) => {
+        const [snap, setSnap] = createSignal<PluginState>(read())
+        const version = ++slotVersion
+        push = (state) => {
+          if (version === slotVersion) setSnap(state)
+        }
+        onCleanup(() => {
+          if (version === slotVersion) push = null
+        })
+        return <DontStopFooter state={snap()} sessionID={props.sessionID ?? null} />
+      },
     })
 
     /* ---------------------------------------------------------------- toasts */
@@ -96,11 +106,13 @@ export default {
       const previous = lastAnnounced
       lastAnnounced = state.updated
 
-      if (state.loop.status === "active" && previous === 0) {
-        toast(ctx, "info", "dont-stop", `loop running in ${state.mode} mode`)
+      const primary = Object.values(state.loops).find((l) => l.status === "active")
+      if (primary && previous === 0) {
+        toast(ctx, "info", "dont-stop", `loop running in ${primary.mode} mode`)
         return
       }
-      const message = state.loop.lastResult
+      const loop = primary ?? Object.values(state.loops)[0]
+      const message = loop?.lastResult
       if (message && message !== lastMessage) {
         lastMessage = message
         toast(ctx, "info", "dont-stop", message)
@@ -212,7 +224,7 @@ export default {
       writeState(state)
       snapshot = state
       stamp = mtimeOf(statePath)
-      for (const listener of listeners) listener()
+      push?.(snapshot)
     }
 
     /**
@@ -241,7 +253,7 @@ export default {
       writeState(state)
       snapshot = state
       stamp = mtimeOf(statePath)
-      for (const listener of listeners) listener()
+      push?.(snapshot)
     }
 
     return () => {
@@ -258,22 +270,27 @@ export default {
 
 /* ------------------------------------------------------------------- render */
 
-interface FooterProps {
-  state: PluginState
-}
-
 /**
- * The footer. Always visible, so the loop's state is never a mystery: mode,
- * iterations while running, a pending halt, and the model. Kept to two short
- * segments so it never crowds the composer it sits beside.
+ * The footer. Always visible, so the loop's state is never a mystery. Shows
+ * the loop of the CURRENT session when it has one (per-session, 2026-10-12),
+ * else the newest loop anywhere: mode, iterations while running, a pending
+ * halt, the model, and the cooling count. Kept to two short segments so it
+ * never crowds the composer it sits beside.
  */
-function DontStopFooter(props: FooterProps): JSX.Element {
+function DontStopFooter(props: { state: PluginState; sessionID: string | null }): JSX.Element {
   const state = props.state
-  const mode = state.mode
-  const loop = state.loop
+  const loop = loopForFooter(state, props.sessionID)
 
-  const iterations = loop.iterations
-  const degraded = state.degraded ? "!" : ""
+  if (!loop) {
+    return (
+      <box flexDirection="row" gap={1}>
+        <text fg="magenta">◍</text>
+        <text fg="gray">idle</text>
+      </box>
+    )
+  }
+
+  const degraded = loop.degraded ? "!" : ""
   // A halt is a request, not an event: the status keeps reading "active" until
   // the owning instance applies it, so the pending request is what the footer
   // shows in the meantime — otherwise a halt looks like it did nothing.
@@ -285,13 +302,13 @@ function DontStopFooter(props: FooterProps): JSX.Element {
   return (
     <box flexDirection="row" gap={1}>
       <text fg="magenta">◍</text>
-      <text fg="cyan">{mode}{degraded}</text>
+      <text fg="cyan">{loop.mode}{degraded}</text>
       {loop.status === "active" ? (
         halting ? (
           <text fg="yellow">halting…</text>
         ) : (
           <>
-            <text fg="green">⟳ {iterations}</text>
+            <text fg="green">⟳ {loop.iterations}</text>
             {state.main ? <text fg="gray">{state.main.providerID}/{state.main.id}</text> : null}
           </>
         )
@@ -305,14 +322,33 @@ function DontStopFooter(props: FooterProps): JSX.Element {
   )
 }
 
-/** One-line status, for the palette command and status toasts. */
+/** Which loop a footer shows: the current session's, else the newest. */
+function loopForFooter(state: PluginState, sessionID: string | null): LoopState | null {
+  if (sessionID && state.loops[sessionID]) return state.loops[sessionID]
+  const loops = Object.values(state.loops)
+  if (loops.length === 0) return null
+  const active = loops.filter((l) => l.status === "active")
+  const pool = active.length > 0 ? active : loops
+  return [...pool].sort(
+    (a, b) => (b.ownerBeatAt || b.startedAt || 0) - (a.ownerBeatAt || a.startedAt || 0),
+  )[0]
+}
+
+/** One line per loop, for the palette command and status toasts. */
 function statusLine(state: PluginState): string {
-  const loop = state.loop
-  const parts = [
-    `mode ${state.mode}${state.degraded ? " (degraded)" : ""}`,
-    `loop ${loop.status}${loop.iterations > 0 ? `, ${loop.iterations} iteration${loop.iterations === 1 ? "" : "s"}` : ""}`,
-  ]
-  if (state.main) parts.push(`model ${state.main.providerID}/${state.main.id}`)
+  const loops = Object.values(state.loops)
+  const parts = [`default mode ${state.mode}`]
+  if (loops.length === 0) {
+    parts.push("no loops")
+  } else {
+    for (const loop of loops) {
+      const where = loop.sessionID ? loop.sessionID.slice(0, 12) : "?"
+      parts.push(
+        `${where} ${loop.status}${loop.iterations > 0 ? ` ${loop.iterations}it` : ""} ` +
+          `${loop.mode}${loop.degraded ? "!" : ""}`,
+      )
+    }
+  }
   const cooling = Object.keys(state.cooldowns).length
   if (cooling > 0) parts.push(`${cooling} model${cooling === 1 ? "" : "s"} cooling`)
   return parts.join(" · ")

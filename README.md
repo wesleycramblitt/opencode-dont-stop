@@ -299,15 +299,21 @@ model down, because the miss is a fact about the task, not a flake.
 
 ```
 /dont-stop-set status
-/dont-stop-set mode free|cheap|local|power
+/dont-stop-set mode free|cheap|local|power [sessionID]
 /dont-stop-set start <prompt>
 /dont-stop-set start --prompt-file <path>
-/dont-stop-set stop
+/dont-stop-set stop [sessionID]
 /dont-stop-set probe
 /dont-stop-set best-for <agent>
 /dont-stop-set update-model-catalogue
 /dont-stop-set track <sessionID>
 ```
+
+`status` lists one block per loop — session, status, owner, iterations,
+rotations, its own mode (and the mode it degraded from), prompt and last
+result. `stop` without a session halts every loop this instance drives; with
+a session id it halts that one. `mode` without a session changes the default
+mode and the primary loop; with a session id it changes that loop only.
 
 `--prompt-file` reads the prompt from disk and errors clearly when the path is
 missing or empty. Any inline text is prepended to the file's contents.
@@ -350,8 +356,11 @@ Three switches, from strongest to weakest:
 The state file (`~/.config/opencode/dont-stop-state.json`, written
 atomically and only when content actually changed — identical writes are
 skipped, because a write that feeds its own watcher churns the UI) reports
-what the plugin is doing at any moment; the footer is always visible, so a
-stopped loop reads `◍ free idle` instead of vanishing.
+what the plugin is doing at any moment; the footer is always visible and
+**reactive** (a Solid signal re-renders it on every state change, including a
+quiet mode switch), and it shows the loop of the session you are in when that
+session has one, else the newest loop. A stopped loop reads `◍ free idle`
+instead of vanishing.
 
 ## Layout
 
@@ -386,9 +395,14 @@ instruction survives the race with the status writes around it.
 
 ## The loop
 
-`dont-stop-set start <prompt>` arms a loop on a session. It is driven by the
-session's own turn boundaries — the v2 `session.execution.*` events — not by
-a timer: a turn finishes, and `advance()` decides what happens next.
+`dont-stop-set start <prompt>` arms a loop on a session. Loops are **per
+session** (owner, 2026-10-12): several sessions can run their own loops at
+once, each with its own mode, iterations and model chain, and one session's
+halt or mode change never touches another's. The state file keys them by
+session (`state.loops`); a `start` on a session that already has a loop merely
+restarts it. A loop is driven by <p>its</p> session's own turn boundaries — the
+v2 `session.execution.*` events — not by a timer: a turn finishes, and
+`advance()` decides what happens next.
 
 ```
 start                      -> plan, switch model, send opening prompt
@@ -397,9 +411,7 @@ session.execution.*        -> advance()  (only in the owning instance)
   if the turn completed    -> reset the try budget (models tried, failures)
   if the turn merely errored into idleness, the budget survives it
   read the last assistant turn
-  if completion sentinel   -> stop("task complete after N iterations")
-  if iteration budget spent -> stop("iteration budget reached")
-  if error budget spent     -> stop("stopping after N consecutive errors")
+  if completion sentinel   -> stop that loop ("task complete after N iterations")
   otherwise:
     re-plan                 -> re-rank, sweep for a better/available model, switch
     send the continue prompt -> session goes busy, hang clock re-arms
@@ -408,16 +420,16 @@ session.execution.*        -> advance()  (only in the owning instance)
 ### Ownership and halting
 
 Several opencode processes can be open at once, and each loads this plugin.
-So a loop records the **instance** that started it and only that instance
+So every loop records the **instance** that started it and only that instance
 advances, interrupts or rotates it. Everywhere else the loop is reported, not
 driven — which is why opening a new opencode no longer resumes a loop that was
 running somewhere else.
 
 Two mechanisms enforce it:
 
-- **Owner heartbeat.** The owning instance stamps `loop.ownerBeatAt` every
-  beat. Three missed beats means the owner is gone, and an orphaned loop is
-  halted on the spot rather than inherited: a loop is a conversation with
+- **Owner heartbeat.** The owning instance stamps each loop's `ownerBeatAt`
+  every beat. Three missed beats means the owner is gone, and an orphaned loop
+  is halted on the spot rather than inherited: a loop is a conversation with
   requests in flight in another process, and it cannot be resumed by whoever
   reads the file next.
 - **Intent, not status.** Halting goes through `state.intent`, a control
@@ -426,6 +438,12 @@ Two mechanisms enforce it:
   lost update that used to make `/dont-stop-halt` announce a stop that never
   took. The heartbeat also re-reads the intent, so the worst case for "stop
   now" is one 30s beat even when the file watcher loses the race.
+- **Halts bound the named session.** `stop <sessionID>` ends that one loop;
+  a halt with no session (the palette command, a teardown, an intent) ends
+  every loop the instance drives. Modes are per loop too: `mode <name>
+  [sessionID]` changes one session's loop mode (or, without a session, the
+  default mode plus the primary loop), and degradation after insufficient
+  funds moves only the loop that failed.
 
 `stop()` always cancels the in-flight turn and drops the session's clocks,
 even when the status already reads "stopped": that cleanup is what actually

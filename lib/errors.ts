@@ -135,7 +135,7 @@ const PATTERNS: Pattern[] = [
   { kind: "capability", test: /does not support|unsupported|not support|capability|vision|image input|tool (call|use)|function call|invalid (model|modality)|modality|cannot process|no such tool/i, transient: false },
   { kind: "notfound", test: /not found|404|does not exist|no such model|unknown model|model .* not available|deleted|deprecated model/i, transient: false },
   { kind: "auth", test: /unauthori[sz]ed|401|403|invalid api key|forbidden|authentication|permission denied/i, transient: false },
-  { kind: "network", test: /network|econnreset|econnrefused|etimedout|timeout|socket|fetch failed|dns|unreachable|connection (reset|closed|error)/i, transient: true },
+  { kind: "network", test: /network|econnreset|econnrefused|etimedout|timeout|socket|fetch failed|dns|unreachable|connection (reset|closed|error)|endpoint is unavailable|upstream request failed|upstream (connect|connection|request)/i, transient: true },
 ]
 
 /** Status codes that imply a kind even when the message is unhelpful. */

@@ -23,7 +23,7 @@ import { rankForMode, profileFor } from "../lib/modes.ts"
 import { measureContext, transcriptFrom, descendantIDs, buildSummary } from "../lib/handoff.ts"
 import { catalogueRefreshDue, parseAlibabaInventory, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
 import { LoopEngine, COMPLETION_SENTINEL } from "../lib/engine.ts"
-import { initialState, readState, type PluginState } from "../lib/state.ts"
+import { initialState, readState, type Mode, type PluginState } from "../lib/state.ts"
 import { FREE_TIERS } from "../data/free-tiers.ts"
 
 /* ------------------------------------------------------- v2 event vocabulary */
@@ -198,9 +198,11 @@ test("leaving free mode lifts spent quotas but never deprecated models", async (
     row({ key: "b/y", providerID: "b", id: "y" }),
   ])
   injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "free")
   state.cooldowns["a/x"] = PERMANENT_COOLDOWN_MS     // spent promotional quota
   state.cooldowns["b/y"] = DEPRECATED_COOLDOWN_MS    // deprecated model
-  await engine.setMode("cheap")
+  await engine.setMode("cheap", "ses_loop")
+  assert.equal(state.loops["ses_loop"].mode, "cheap")
   assert.ok(state.cooldowns["a/x"] === undefined)
   assert.equal(state.cooldowns["b/y"], DEPRECATED_COOLDOWN_MS)
 })
@@ -212,29 +214,28 @@ test("a mode degrades only when two different providers are both out of money", 
     row({ key: "opencode/deepseek-v4-flash", providerID: "opencode", id: "deepseek-v4-flash" }),
   ])
   injectCatalogue(engine, cat)
-  state.mode = "cheap"
-  armLoop(engine, state, "i1", "ses_loop")
+  armLoop(engine, state, "i1", "ses_loop", "cheap")
   const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!
 
-  // One provider out: rotate, but the mode stays put.
+  // One provider out: rotate, but the loop's mode stays put.
   tracked.model = { providerID: "alibaba", id: "qwen3.7-flash" }
   await engine.onError({ sessionID: "ses_loop", message: "insufficient funds" })
-  assert.equal(state.mode, "cheap")
-  assert.equal(state.degraded, false)
+  assert.equal(state.loops["ses_loop"].mode, "cheap")
+  assert.equal(state.loops["ses_loop"].degraded, false)
 
-  // The second provider runs out: cheap -> free, and it stays there.
+  // The second provider runs out: cheap -> free on THIS loop, and it stays.
   tracked.model = { providerID: "opencode", id: "deepseek-v4-flash" }
   await engine.onError({ sessionID: "ses_loop", message: "insufficient funds" })
-  assert.equal(state.mode, "free")
-  assert.equal(state.degraded, true)
+  assert.equal(state.loops["ses_loop"].mode, "free")
+  assert.equal(state.loops["ses_loop"].degraded, true)
 
   // A stale mark from a resettled account no longer counts: alibaba's mark
   // aged out, so one provider being out is a rotation, not a mode change.
   state.fundsProviders.alibaba = Date.now() - 25 * 60 * 60 * 1000
-  await engine.setMode("cheap")
+  await engine.setMode("cheap", "ses_loop")
   tracked.model = { providerID: "opencode", id: "deepseek-v4-flash" }
   await engine.onError({ sessionID: "ses_loop", message: "insufficient funds" })
-  assert.equal(state.mode, "cheap")
+  assert.equal(state.loops["ses_loop"].mode, "cheap")
 })
 
 /* -------------------------------------------------------------------- catalogue */
@@ -529,11 +530,12 @@ function makeEngine(instanceID: string) {
   return { engine, state, fakes }
 }
 
-function armLoop(engine: LoopEngine, state: PluginState, instanceID: string, sessionID: string) {
-  state.loop = {
+function armLoop(engine: LoopEngine, state: PluginState, instanceID: string, sessionID: string, mode: Mode = "free") {
+  state.loops[sessionID] = {
     status: "active", sessionID, prompt: "task", iterations: 0,
     startedAt: Date.now(), lastResult: null, owner: instanceID,
     ownerBeatAt: Date.now(), rotations: 0,
+    mode, degraded: false, preferredMode: null, consecutiveErrors: 0,
   }
   engine.track(sessionID, "general")
   // A live turn: the server's own execution-started event is what arms the
@@ -553,7 +555,7 @@ test("rotation walks the chain once and then stops instead of cycling", () => {
   armLoop(engine, state, "i1", "ses_loop")
 
   assert.equal(engine.rotate("ses_loop", "rate"), "moved")
-  assert.equal(engine.status.lastResult, "rotated general to a/x (rate)")
+  assert.equal(engine.status!.lastResult, "rotated general to a/x (rate)")
   assert.equal(engine.rotate("ses_loop", "rate"), "moved")
   assert.equal(engine.rotate("ses_loop", "rate"), "exhausted")
   // A foreign session is not ours to move.
@@ -565,16 +567,16 @@ test("a turn-end pair advances once", async () => {
   armLoop(engine, state, "i1", "ses_loop")
 
   await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
-  const iterations = state.loop.iterations
+  const iterations = state.loops["ses_loop"].iterations
   assert.equal(iterations, 1)
   // The trailing idle/status ending that follows an execution result must
   // not advance again: the continue prompt is not a second turn's result.
   await engine.onTurnEnd("ses_loop", "session.idle")
-  assert.equal(state.loop.iterations, iterations)
+  assert.equal(state.loops["ses_loop"].iterations, iterations)
 
   // A subagent ending its own turn does not advance the loop.
   await engine.onTurnEnd("ses_child", "session.execution.succeeded")
-  assert.equal(state.loop.iterations, iterations)
+  assert.equal(state.loops["ses_loop"].iterations, iterations)
 })
 
 test("our own interrupt defers to the re-drive instead of advancing", async () => {
@@ -586,14 +588,14 @@ test("our own interrupt defers to the re-drive instead of advancing", async () =
   const priv = engine as unknown as { lastHangInterruptAt: number }
   priv.lastHangInterruptAt = Date.now()
   await engine.onTurnEnd("ses_loop", "session.execution.interrupted")
-  assert.equal(state.loop.iterations, 0)
+  assert.equal(state.loops["ses_loop"].iterations, 0)
 
   // A user escape well after the hang path's interrupt schedules the
   // re-drive instead of stopping: the loop waits its beat and continues.
   engine.observe({ type: "session.execution.started", data: { sessionID: "ses_loop" } })
   priv.lastHangInterruptAt = 0
   await engine.onTurnEnd("ses_loop", "session.execution.interrupted")
-  assert.equal(state.loop.iterations, 0)
+  assert.equal(state.loops["ses_loop"].iterations, 0)
   assert.ok((engine as unknown as { redriveAt: number | null }).redriveAt !== null)
 })
 
@@ -612,8 +614,8 @@ test("the completion sentinel stops the loop", async () => {
   }
   ;(engine as unknown as { ctx: unknown }).ctx = { session: withMessages.session }
   await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
-  assert.equal(state.loop.status, "stopped")
-  assert.match(state.loop.lastResult ?? "", /task complete/)
+  assert.equal(state.loops["ses_loop"].status, "stopped")
+  assert.match(state.loops["ses_loop"].lastResult ?? "", /task complete/)
 })
 
 test("halt interrupts the whole tree, drops clocks, and keeps the loop session tracked", async () => {
@@ -627,7 +629,7 @@ test("halt interrupts the whole tree, drops clocks, and keeps the loop session t
 
   await engine.stop("halted by test")
 
-  assert.equal(state.loop.status, "stopped")
+  assert.equal(state.loops["ses_loop"].status, "stopped")
   assert.deepEqual(fakes.interrupted.sort(), ["ses_child", "ses_loop"])
   // The loop session stays tracked so a later start can find it.
   assert.ok(engine.trackedSessions().some((s) => s.sessionID === "ses_loop"))
@@ -638,10 +640,46 @@ test("halt interrupts the whole tree, drops clocks, and keeps the loop session t
 test("a foreign owner's loop is not driven", async () => {
   const { engine, state } = makeEngine("i2")
   armLoop(engine, state, "someone-else", "ses_loop")
-  assert.equal(engine.ownsLoop(), false)
+  assert.equal(engine.ownsLoop("ses_loop"), false)
   assert.equal(engine.rotate("ses_loop", "test"), "not-ours")
   await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
-  assert.equal(state.loop.iterations, 0)
+  assert.equal(state.loops["ses_loop"].iterations, 0)
+})
+
+test("two sessions run their own loops, each with its own mode", async () => {
+  const { engine, state } = makeEngine("i1")
+  injectCatalogue(engine, catalogueOf([
+    row({ key: "a/free", providerID: "a", id: "free", pricing: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    row({ key: "b/paid", providerID: "b", id: "paid", pricing: { input: 0.03, output: 0.13, cacheRead: 0, cacheWrite: 0 } }),
+  ]))
+  armLoop(engine, state, "i1", "ses_a", "free")
+  armLoop(engine, state, "i1", "ses_b", "cheap")
+
+  // Each loop advances on its own session's turn endings.
+  await engine.onTurnEnd("ses_a", "session.execution.succeeded")
+  await engine.onTurnEnd("ses_b", "session.execution.succeeded")
+  assert.equal(state.loops["ses_a"].iterations, 1)
+  assert.equal(state.loops["ses_b"].iterations, 1)
+
+  // A mode change on one session leaves the other's loop alone.
+  assert.equal(state.loops["ses_a"].mode, "free")
+  await engine.setMode("cheap", "ses_a")
+  assert.equal(state.loops["ses_a"].mode, "cheap")
+  assert.equal(state.loops["ses_b"].mode, "cheap")
+
+  // Halting ONE loop leaves the other running.
+  await engine.stop("halted by test", "ses_a")
+  assert.equal(state.loops["ses_a"].status, "stopped")
+  assert.equal(state.loops["ses_b"].status, "active")
+})
+
+test("a halt with no session stops every loop this instance drives", async () => {
+  const { engine, state } = makeEngine("i1")
+  armLoop(engine, state, "i1", "ses_a", "free")
+  armLoop(engine, state, "i1", "ses_b", "free")
+  await engine.stop("stopped by command")
+  assert.equal(state.loops["ses_a"].status, "stopped")
+  assert.equal(state.loops["ses_b"].status, "stopped")
 })
 
 test("consecutive errors from foreign sessions never stop the loop", async () => {
@@ -651,7 +689,7 @@ test("consecutive errors from foreign sessions never stop the loop", async () =>
   for (let i = 0; i < 6; i++) {
     await engine.onError({ sessionID: "ses_user", agent: "general", message: "boom", type: "provider.unknown" })
   }
-  assert.equal(state.loop.status, "active")
+  assert.equal(state.loops["ses_loop"].status, "active")
 })
 
 /* -------------------------------------------------------------------- helpers */

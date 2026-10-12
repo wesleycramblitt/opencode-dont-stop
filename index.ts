@@ -137,14 +137,16 @@ export default {
             }
           }
 
-          // A turn of the loop's session ended — this is the loop's driver.
+          // A turn of a loop's session ended — this is the loop's driver.
           // The event names the ending, so a subagent ending its own turn, or
           // an ending in an instance that is not driving the loop, cannot
           // touch the counter. `onTurnEnd` also stands down after the hang
           // path's own interrupts, so the scheduled re-drive owns those.
+          // Per-session since 2026-10-12: the engine decides which loop (if
+          // any) this session's ending belongs to.
           if (TURN_END_TYPES.has(event.type)) {
             const sid = eventData(event).sessionID
-            if (typeof sid === "string" && sid === state.loop.sessionID) {
+            if (typeof sid === "string" && engine.loopFor(sid)) {
               await engine.onTurnEnd(sid, event.type)
               persist()
             }
@@ -259,7 +261,7 @@ export default {
       // A loop left active in the state file belongs to an instance that is
       // gone. It is halted here rather than resumed: a loop is a live
       // conversation in another process, and this one never started it.
-      .then(() => engine.reapOrphanedLoop())
+      .then(() => engine.reapOrphanedLoops())
       .then(() => engine.refresh(true))
       .catch((error) => log.warn(`startup discovery failed: ${messageOf(error)}`))
 
@@ -310,8 +312,16 @@ export function runCommand(raw: string, env: CommandEnv): string {
   else if ((MODES as readonly string[]).includes(verb) && verb !== "stop") modeName = verb
 
   if (modeName) {
-    void engine.setMode(modeName as Mode).then(persist)
-    return `mode set to ${modeName} — ${describeMode(modeName as Mode)}`
+    // `mode <name> [sessionID]` — a session names the SESSION's loop; without
+    // one, the default mode changes and the primary loop follows it.
+    const mode: Mode = modeName as Mode
+    const targetSession = rest[1]
+    void (async () => {
+      await engine.setMode(mode, targetSession && (MODES as readonly string[]).includes(targetSession) ? undefined : targetSession)
+      persist()
+    })()
+    const where = targetSession ? ` on ${targetSession}` : " (default + primary loop)"
+    return `mode set to ${modeName}${where} — ${describeMode(mode)}`
   }
 
   if (verb === "start") {
@@ -345,8 +355,13 @@ export function runCommand(raw: string, env: CommandEnv): string {
   }
 
   if (verb === "stop") {
-    void engine.stop(rest.join(" ").trim() || "stopped by command").then(persist)
-    return "halting the loop: its in-flight turn is cancelled and every instance stops driving it"
+    // `stop [sessionID]`: a session id halts that one loop, nothing else
+    // halts every loop this instance drives.
+    const target = rest[0] && rest[0].startsWith("ses") ? rest[0] : undefined
+    void engine.stop("stopped by command", target).then(persist)
+    return target
+      ? `halting the loop on ${target}: its in-flight turn is cancelled`
+      : "halting every loop: in-flight turns are cancelled and every instance stops driving them"
   }
 
   if (verb === "probe" || verb === "discover") {
@@ -400,20 +415,29 @@ export function runCommand(raw: string, env: CommandEnv): string {
 }
 
 function formatStatus(state: PluginState, engine: LoopEngine): string {
+  const loops = Object.values(state.loops)
   const lines = [
-    `dont-stop — mode ${state.mode}${state.degraded ? ` (degraded from ${state.preferredMode})` : ""}`,
+    `dont-stop — default mode ${state.mode}`,
     `  ${describeMode(state.mode)}`,
-    `  loop: ${state.loop.status}${state.loop.sessionID ? ` on ${state.loop.sessionID}` : ""}${state.loop.owner ? ` (owner ${state.loop.owner})` : ""}`,
-    `  iterations: ${state.loop.iterations}`,
   ]
-  if (state.loop.rotations > 0) {
-    lines.push(`  rotations without a completed turn: ${state.loop.rotations}`)
+  if (loops.length === 0) {
+    lines.push("  loops: none")
+  } else {
+    for (const loop of loops) {
+      lines.push(
+        `  loop: ${loop.status}${loop.sessionID ? ` on ${loop.sessionID}` : ""}${loop.owner ? ` (owner ${loop.owner})` : ""} — mode ${loop.mode}${loop.degraded ? ` (degraded from ${loop.preferredMode})` : ""}`,
+      )
+      lines.push(`    iterations: ${loop.iterations}`)
+      if (loop.rotations > 0) {
+        lines.push(`    rotations without a completed turn: ${loop.rotations}`)
+      }
+      if (loop.prompt) lines.push(`    prompt: ${truncate(loop.prompt, 60)}`)
+      if (loop.lastResult) lines.push(`    last: ${loop.lastResult}`)
+    }
   }
   if (state.intent && state.intent.action !== "none") {
     lines.push(`  intent: ${state.intent.action} #${state.intent.seq}`)
   }
-  if (state.loop.prompt) lines.push(`  prompt: ${truncate(state.loop.prompt, 60)}`)
-  if (state.loop.lastResult) lines.push(`  last: ${state.loop.lastResult}`)
   if (state.main) lines.push(`  main model: ${state.main.providerID}/${state.main.id}`)
 
   const agents = Object.entries(state.agentModels)

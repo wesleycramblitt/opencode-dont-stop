@@ -48,6 +48,23 @@ export interface LoopState {
   ownerBeatAt: number
   /** Model rotations bought since the last completed turn. */
   rotations: number
+  /**
+   * The mode THIS loop runs in. Per-session (owner, 2026-10-12): two sessions
+   * may want different things — free for one, cheap for another — and the
+   * state file is shared, so the mode lives with the loop, not above it.
+   */
+  mode: Mode
+  /** Whether this loop's mode was degraded away and waits for the user. */
+  degraded: boolean
+  /** The mode this loop degraded from, for the status line. */
+  preferredMode: Mode | null
+  /** Consecutive errors this loop's session survived (reported, never fatal). */
+  consecutiveErrors: number
+}
+
+/** One loop per session, keyed by session id. */
+export interface Loops {
+  [sessionID: string]: LoopState
 }
 
 /**
@@ -85,10 +102,13 @@ export interface FundsProviders {
 
 export interface PluginState {
   version: number
+  /**
+   * The default mode: what a NEW loop starts in, and what the agent-defaults
+   * plan uses while no loop is active. A running loop's mode lives on the
+   * loop itself (per-session, owner 2026-10-12).
+   */
   mode: Mode
-  degraded: boolean
-  preferredMode: Mode | null
-  loop: LoopState
+  loops: Loops
   /** The newest control instruction. Written by any half, applied by the owner. */
   intent: Intent
   /** The main session's model. */
@@ -98,7 +118,6 @@ export interface PluginState {
   cooldowns: Cooldowns
   /** Which providers are known to be out of money, and when (see FundsProviders). */
   fundsProviders: FundsProviders
-  consecutiveErrors: number
   lastEvent: string | null
   log: LogEntry[]
   updated: number
@@ -131,28 +150,34 @@ export function initialState(): PluginState {
   return {
     version: 1,
     mode: "free",
-    degraded: false,
-    preferredMode: null,
-    loop: {
-      status: "stopped",
-      sessionID: null,
-      prompt: "",
-      iterations: 0,
-      startedAt: null,
-      lastResult: null,
-      owner: null,
-      ownerBeatAt: 0,
-      rotations: 0,
-    },
+    loops: {},
     intent: { seq: 0, action: "none", at: 0 },
     main: null,
     agentModels: {},
     cooldowns: {},
     fundsProviders: {},
-    consecutiveErrors: 0,
     lastEvent: null,
     log: [],
     updated: Date.now(),
+  }
+}
+
+/** One loop, from the pieces the rest of the file can carry. */
+function loopState(mode: Mode): LoopState {
+  return {
+    status: "stopped",
+    sessionID: null,
+    prompt: "",
+    iterations: 0,
+    startedAt: null,
+    lastResult: null,
+    owner: null,
+    ownerBeatAt: 0,
+    rotations: 0,
+    mode,
+    degraded: false,
+    preferredMode: null,
+    consecutiveErrors: 0,
   }
 }
 
@@ -172,10 +197,38 @@ export function readState(): PluginState {
  * Merge a partial over the defaults. Arrays and nested objects are replaced,
  * not deep-merged, because a partial write should mean "this is the truth"
  * for the fields it names.
+ *
+ * One migration rides along: files written by a pre-per-session plugin carry
+ * a single `loop` and global `degraded`/`preferredMode`/`consecutiveErrors`
+ * instead of the `loops` map. They are folded into a per-session entry when
+ * the map is empty, so the loop that was running survives the upgrade.
  */
 function mergeState(base: PluginState, patch: Partial<PluginState>): PluginState {
   const next: PluginState = { ...base, ...patch }
-  next.loop = { ...base.loop, ...(patch.loop ?? {}) }
+  next.loops = { ...patch.loops }
+  if (Object.keys(next.loops).length === 0) {
+    // The pre-per-session file carried a single `loop` plus global
+    // degraded/preferredMode/consecutiveErrors; that shape is not in the
+    // type anymore, so the read is typed loosely on purpose.
+    const legacyPatch = patch as unknown as {
+      loop?: Partial<LoopState>
+      degraded?: boolean
+      preferredMode?: Mode | null
+      consecutiveErrors?: number
+    }
+    const legacy = legacyPatch.loop
+    if (legacy && typeof legacy.sessionID === "string" && legacy.sessionID !== "") {
+      const mode = patch.mode ?? base.mode
+      next.loops[legacy.sessionID] = {
+        ...loopState(mode),
+        ...legacy,
+        mode: legacy.mode ?? mode,
+        degraded: legacy.degraded ?? legacyPatch.degraded === true,
+        preferredMode: legacy.preferredMode ?? legacyPatch.preferredMode ?? null,
+        consecutiveErrors: legacy.consecutiveErrors ?? legacyPatch.consecutiveErrors ?? 0,
+      }
+    }
+  }
   next.intent = { ...base.intent, ...(patch.intent ?? {}) }
   next.agentModels = { ...patch.agentModels }
   next.cooldowns = { ...patch.cooldowns }

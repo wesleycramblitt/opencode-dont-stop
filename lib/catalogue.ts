@@ -17,7 +17,7 @@ import { existsSync, readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
 
-import { CATALOGUE_FILE } from "./fetch.ts"
+import { ALIBABA_ENABLED, CATALOGUE_FILE } from "./fetch.ts"
 import { FREE_TIERS } from "../data/free-tiers.ts"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -230,11 +230,21 @@ export function loadCatalogue(path: string = CATALOGUE_FILE): Catalogue | null {
   if (!existsSync(file)) return null
   try {
     const document = JSON.parse(readFileSync(file, "utf8")) as PersistedDocument
-    return index(toModels(document.models ?? []), {
-      version: document.version ?? 1,
-      generatedAt: document.generatedAt ?? "",
-      sources: document.sources ?? [],
-    })
+    // The persisted file is a snapshot and keeps whatever sources built it.
+    // Drop a disabled provider here rather than rewriting the file: a rebuild
+    // would otherwise need network access to take effect, and a mode must
+    // never plan a provider the owner asked to remove.
+    const models = document.models ?? []
+    const keep = (providerID: unknown) =>
+      ALIBABA_ENABLED ? true : (typeof providerID === "string" ? providerID !== "alibaba" : true)
+    return index(
+      toModels(models.filter((raw) => keep(raw.providerID))),
+      {
+        version: document.version ?? 1,
+        generatedAt: document.generatedAt ?? "",
+        sources: (document.sources ?? []).filter((source) => ALIBABA_ENABLED || source.id !== "alibaba"),
+      },
+    )
   } catch {
     return null
   }
