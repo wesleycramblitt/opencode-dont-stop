@@ -37,6 +37,15 @@ export interface LoopState {
   prompt: string
   /** Loop iterations completed. */
   iterations: number
+  /**
+   * Turns completed in the CURRENT session.
+   *
+   * The loop's identity is the work and `iterations` counts all of it, but a
+   * session is retired after a budget of turns — a long conversation degrades
+   * the model at the work — so the freshness metric is per session and resets
+   * when the loop rotates.
+   */
+  sessionIterations: number
   startedAt: number | null
   lastResult: string | null
   /**
@@ -125,11 +134,6 @@ export interface PluginState {
   updated: number
 }
 
-/** Where handoff summaries are written, beside the state file. */
-export function handoffDirectory(): string {
-  return join(homedir(), ".config", "opencode", "dont-stop", "handoffs")
-}
-
 /**
  * The hard switch, honored by both halves with no restart.
  *
@@ -171,6 +175,7 @@ function loopState(mode: Mode): LoopState {
     sessionID: null,
     prompt: "",
     iterations: 0,
+    sessionIterations: 0,
     startedAt: null,
     lastResult: null,
     owner: null,

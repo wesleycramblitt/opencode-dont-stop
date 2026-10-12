@@ -244,7 +244,8 @@ it are where the old design spun:
 - **The loop does not stop itself** (owner, 2026-10-11). The iteration budget,
   the consecutive-error budget, an exhausted chain, repeated interrupts and a
   completion claim are all *reported*, never terminal: the loop waits for
-  cooldowns, keeps re-driving, and ends only on a halt.
+  cooldowns, keeps re-driving, rotates to a fresh session when due, and ends
+  only on a halt.
 
 Hang recovery only ever touches the session the loop is driving. Any other
 session — including the user's own — is never interrupted or re-modelled by
@@ -396,7 +397,7 @@ lib/errors.ts       error classification and recovery actions
 lib/clocks.ts       interval / idle / hang clocks
 lib/apply.ts        the two channels that reach running sessions
 lib/engine.ts       loop orchestration: discover, plan, apply, rotate
-lib/handoff.ts      context handoff: measure, summarise, re-seed
+lib/rotation.ts     session rotation: measure context, walk the tree, seed the successor
 lib/state.ts        durable state bridging both halves
 lib/log.ts          structured logging
 lib/fetch.ts        source fetching (models.dev, ollama, alibaba) and scoring
@@ -429,11 +430,13 @@ v2 `session.execution.*` events — not by a timer: a turn finishes, and
 ```
 start                      -> plan, switch model, send opening prompt
 session.execution.*        -> advance()  (only in the owning instance)
-  count the iteration
+  count the iteration and the session's turn
   if the turn completed    -> reset the try budget (models tried, failures)
   if the turn merely errored into idleness, the budget survives it
   read the last assistant turn
-  if completion sentinel   -> report the claim, keep working (never a stop)
+  if checkpoint / complete -> a boundary: rotate a fresh session when due
+  rotate when due          -> boundary after real work, step budget, or context
+                              pressure; defers while subagents are live
   otherwise:
     re-plan                 -> re-rank, sweep for a better/available model, switch
     send the continue prompt -> session goes busy, hang clock re-arms
@@ -481,24 +484,26 @@ Only running sessions are interrupted; the rest only lose their clocks.
 Descendants are then untracked, so no later beat re-kindles them, while the
 loop's own session stays tracked so a later `start` can find it.
 
-### Completion
+### Completion and boundaries
 
 The loop cannot know on its own whether a task is finished — that is a judgement
 about the work, and only the entity doing it has the context. So the loop asks:
-every prompt is appended with an instruction to reply with exactly
-`<loop-complete/>` when, and only when, the task is genuinely done. Reading for
-it is deterministic and costs no extra model call, which an "is it done?" probe
-would.
+every session's opening prompt is appended with two instructions — reply with
+exactly `<loop-checkpoint/>` when a task packet or a batch of related tasks is
+finished, and exactly `<loop-complete/>` when the whole task is genuinely done.
+Reading for them is deterministic and costs no extra model call, which an
+"is it done?" probe would.
 
-**But a sentinel never stops the loop.** The plan is that a loop ends only when
-its owner halts it (owner, 2026-10-12) — the sentinel is a *report*, and models
-get completion judgements wrong (one declared a review-and-build sweep complete
-after compiling task files but before building anything). So a claim is logged,
-surfaced through the loop's `lastResult`, and answered with
-`AFTER_COMPLETE_PROMPT`, which tells the model the policy plainly and turns the
-claim back into work: re-verify the final state, fix what is wrong or
-unverified, continue. A model that wants to stop the loop cannot; only the
-owner can.
+**Neither sentinel stops the loop.** The plan is that a loop ends only when its
+owner halts it (owner, 2026-10-12) — they are *reports*, and models get
+completion judgements wrong (one declared a review-and-build sweep complete
+after compiling task files but before building anything). A boundary signal
+rotates the session when the session has done real work (see Session rotation);
+otherwise it is logged and surfaced through the loop's `lastResult` — a
+completion claim answered with `AFTER_COMPLETE_PROMPT`, which tells the model
+the policy plainly and turns the claim back into work (re-verify the final
+state, fix what is wrong or unverified, continue), and a checkpoint with the
+plain continue. A model that wants to stop the loop cannot; only the owner can.
 
 Nothing else is terminal either: the iteration budget, the consecutive-error
 budget, an exhausted chain and three interrupts are all reported but never stop
@@ -519,45 +524,58 @@ Idle between turns is the loop's normal state, not its end: the heartbeat stops
 killing the loop session on idle, and only untracks sessions that are not the
 loop's.
 
-## Context handoff
+## Session rotation
 
-Replaces a compaction plugin. When a session has consumed enough of its model's
-context window, the loop closes it and starts a fresh session seeded from a
-written summary, so work continues instead of erroring out mid-prompt.
+A loop that runs for hours degrades: a long conversation makes the model worse
+at the work, not just slower, and a fresh session with the same prompt cures it.
+So the loop retires its session and starts a new one — an empty conversation
+with no carried-over history, no tool calls, and no summary. The repository is
+the state (plans, task files, the codebase index), and the seed prompt says so.
+This replaces the summary-based handoff, which existed only to bridge the two
+sessions; a session that already wrote its work to disk does not need bridging.
 
-Three properties make it safe where a compaction plugin was not:
+Three things trigger a rotation:
+
+1. **A task boundary.** The model signals a finished unit of work — a task
+   packet or a batch (`<loop-checkpoint/>`), or everything (`<loop-complete/>`).
+   Either rotates, but only once the session has done real work (8 turns by
+   default): a claim on a just-started session is noise, and that session is
+   already fresh.
+2. **A session step budget.** 30 turns in one session, whatever the model says.
+   This is the backstop for a model that never signals a boundary.
+3. **Context pressure.** Usage at 80% of the effective window. This is not the
+   emergency mechanism — OpenCode's own auto-compaction is the backstop for
+   that — it is what keeps the backstop theoretical. It matters most for the
+   local fallback, where OpenCode's model metadata (a 3.5M native window) does
+   not match what the daemon serves (64k), so auto-compaction would not fire.
+
+Three properties make rotation safe:
 
 1. **Between turns, never during one.** The only entry point is the completion
-   path — after the task is judged finished, before the next prompt. A handoff
-   mid-turn would destroy the work in flight.
+   path — the turn has ended, its work is on disk, and no request is in flight.
 2. **It refuses while subagents are live.** A subagent is a child session;
-   handing the parent off under one orphans the child's context and leaves it
+   rotating the parent under one orphans the child's context and leaves it
    writing into a session that no longer exists. The walk is transitive —
-   grandchildren count — and a deferral delays the handoff rather than losing
-   it; the next turn retries.
+   grandchildren count — and a deferral is remembered and retried on the next
+   turn rather than losing the boundary.
 3. **The threshold is the window the session can actually use.** A 128k model
-   and a 1M model do not hand off at the same token count, so the fraction
-   (default 0.5) is applied to the context size of the model actually in use.
+   and a 1M model do not rotate at the same token count, so the fraction
+   (default 0.8) is applied to the context size of the model actually in use.
    For a local model that size is asked of the ollama daemon (`/api/ps`)
    rather than taken from the catalogue: the catalogue records the
    architecture's native window, while the daemon serves whatever
    `OLLAMA_CONTEXT_LENGTH` says and truncates the prompt to fit. Measuring
    against the native figure is how a loop stalls — every turn comes back cut
-   off and the native-size threshold never arrives.
+   off and the threshold never arrives.
 
 Context usage is read from the last assistant message's reported `tokens.input`
 plus cache reads — the prompt size the provider actually measured. It is never
 estimated from text length, which would be wrong by a factor of several.
 
-The summary is written *before* the new session is created, so a write failure
-leaves the original session untouched and the loop continues in place. The new
-session is seeded with a pointer to the file rather than its contents, because
-the point is to start with a small window.
-
-The summary is deterministic rather than model-written: the task verbatim, the
-recent turns verbatim, older turns condensed to one line each, and the files
-touched (read from tool-call parts). A model-written summary would be better
-prose and would have a failure mode that loses the session.
+The loop record moves to the successor: `iterations` is the loop's and carries,
+while `sessionIterations` — the freshness metric in the footer — starts over.
+The old session is left behind, intact and idle; nothing is deleted, and the
+TUI can still open it.
 
 ## Development
 

@@ -449,6 +449,7 @@ function formatStatus(state: PluginState, engine: LoopEngine): string {
         `  loop: ${loop.status}${loop.sessionID ? ` on ${loop.sessionID}` : ""}${loop.owner ? ` (owner ${loop.owner})` : ""} — mode ${loop.mode}${loop.degraded ? ` (degraded from ${loop.preferredMode})` : ""}`,
       )
       lines.push(`    iterations: ${loop.iterations}`)
+      lines.push(`    session turns: ${loop.sessionIterations}`)
       if (loop.rotations > 0) {
         lines.push(`    rotations without a completed turn: ${loop.rotations}`)
       }

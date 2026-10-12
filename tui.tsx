@@ -306,6 +306,7 @@ function DontStopFooter(props: { state: PluginState; sessionID: string | null })
         ) : (
           <>
             <text fg="green">⟳ {loop!.iterations}</text>
+            <text fg="gray">s{loop!.sessionIterations}</text>
             {state.main ? <text fg="gray">{state.main.providerID}/{state.main.id}</text> : null}
           </>
         )

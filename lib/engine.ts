@@ -50,17 +50,15 @@ import {
 import { actionFor, classify, DEPRECATED_COOLDOWN_MS, FUNDS_PROVIDER_WINDOW_MS, PERMANENT_COOLDOWN_MS, type ClassifiedError, type ErrorAction } from "./errors.ts"
 import { ClockSet, DEFAULT_CLOCKS, type ClockOptions } from "./clocks.ts"
 import {
-  DEFAULT_HANDOFF_THRESHOLD,
+  DEFAULT_ROTATION_THRESHOLD,
   effectiveContext,
-  handoff,
   measureContext,
   ollamaServedContext,
-  shouldHandoff,
+  rotate,
+  shouldRotate,
   sessionTree as fetchSessionTree,
-  transcriptFrom,
-  type HandoffContext,
-} from "./handoff.ts"
-import { handoffDirectory } from "./state.ts"
+  type RotationContext,
+} from "./rotation.ts"
 import { applyAgentDefaults, applySessionModels, sameSlot, slotFrom, type ApplyContext, type ModelPlan } from "./apply.ts"
 import type { Logger } from "./log.ts"
 import { bumpIntent, readState, type LoopState, type Mode, type ModelSlot, type PluginState } from "./state.ts"
@@ -86,10 +84,12 @@ export interface EngineOptions {
   maxIterations?: number
   /** Token the model emits to declare the task finished. */
   completionSentinel?: string
-  /** Fraction of the context window at which to start a fresh session. */
-  handoffThreshold?: number
-  /** Where handoff summaries are written. */
-  handoffDirectory?: string
+  /** Fraction of the effective context window at which to rotate. */
+  rotationThreshold?: number
+  /** Turns in one session before a fresh one is started. */
+  sessionSteps?: number
+  /** Turns a session must have done before a boundary signal rotates it. */
+  sessionMinSteps?: number
   /** Identifies this process as the loop's owner. Generated when omitted. */
   instanceID?: string
   /**
@@ -109,6 +109,23 @@ export interface EngineOptions {
  * counter exists so a runaway is visible in the footer, not so it can stop.
  */
 export const DEFAULT_MAX_ITERATIONS = 100
+
+/**
+ * Turns in one session before the loop rotates to a fresh one.
+ *
+ * A long conversation degrades the model at the work, not just its speed, and
+ * a new session with the same prompt cures it. This budget is the backstop for
+ * models that never signal a task boundary; a boundary rotates sooner.
+ */
+export const DEFAULT_SESSION_STEPS = 30
+
+/**
+ * Turns a session must complete before a boundary signal rotates it.
+ *
+ * A boundary claimed on a just-started session is noise — that session is
+ * already fresh — so only a claim reached after real work counts.
+ */
+export const DEFAULT_SESSION_MIN_STEPS = 8
 
 /**
  * How long to wait before re-driving the loop — after cancelling a hung turn,
@@ -167,6 +184,24 @@ export const COMPLETION_SENTINEL = "<loop-complete/>"
 export const SENTINEL_INSTRUCTION =
   `\n\nWhen the task above is fully complete, reply with exactly ${COMPLETION_SENTINEL} ` +
   `and nothing else. Do not emit it while work remains.`
+
+/**
+ * The task-boundary sentinel.
+ *
+ * The completion sentinel means "the whole task is done"; in a loop whose task
+ * is an ongoing sweep, that signal is rare. This one is the finer boundary: the
+ * prompt asks for it when a task packet, or a batch of related tasks, is
+ * finished. The loop answers it by rotating to a fresh session — the work is on
+ * disk, and the new session re-reads it — which is the natural point to shed a
+ * long conversation.
+ */
+export const CHECKPOINT_SENTINEL = "<loop-checkpoint/>"
+
+/** Asked for at the same time as the completion sentinel, in every session. */
+export const CHECKPOINT_INSTRUCTION =
+  `\n\nWhen you finish a task packet, or a batch of related tasks, reply with exactly ` +
+  `${CHECKPOINT_SENTINEL} and nothing else. The loop continues in a fresh session from there; ` +
+  `do not emit it while work remains in the current unit.`
 
 /**
  * Sent to advance a loop that has not finished. Deliberately short: the session
@@ -268,11 +303,14 @@ export class LoopEngine {
 
   private readonly maxIterations: number
   private readonly sentinel: string
-  private readonly handoffThreshold: number
-  private readonly handoffDirectory: string
+  private readonly rotationThreshold: number
+  private readonly sessionSteps: number
+  private readonly sessionMinSteps: number
   private readonly redriveDelayMs: number
   private readonly hangCooldownMs: number
   private readonly leaseGraceMs: number
+  /** Rotations a live subagent deferred, retried on the next turn end. */
+  private readonly pendingRotation = new Map<string, string>()
 
   constructor(
     private readonly ctx: ApplyContext,
@@ -286,8 +324,9 @@ export class LoopEngine {
     this.appliedIntent = state.intent?.seq ?? 0
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS
     this.sentinel = options.completionSentinel ?? COMPLETION_SENTINEL
-    this.handoffThreshold = options.handoffThreshold ?? DEFAULT_HANDOFF_THRESHOLD
-    this.handoffDirectory = options.handoffDirectory ?? handoffDirectory()
+    this.rotationThreshold = options.rotationThreshold ?? DEFAULT_ROTATION_THRESHOLD
+    this.sessionSteps = options.sessionSteps ?? DEFAULT_SESSION_STEPS
+    this.sessionMinSteps = options.sessionMinSteps ?? DEFAULT_SESSION_MIN_STEPS
     this.redriveDelayMs = options.redriveDelayMs ?? DEFAULT_REDRIVE_DELAY_MS
     this.hangCooldownMs = options.hangCooldownMs ?? DEFAULT_HANG_COOLDOWN_MS
     this.leaseGraceMs = clocks.intervalMs * LEASE_GRACE_BEATS
@@ -451,7 +490,7 @@ export class LoopEngine {
 
   /** The loop session and every descendant session, at any depth. */
   private async sessionTree(rootID: string): Promise<string[]> {
-    const ctx = this.ctx as unknown as Pick<HandoffContext, "session">
+    const ctx = this.ctx as unknown as Pick<RotationContext, "session">
     try {
       return [rootID, ...(await fetchSessionTree(ctx, rootID))]
     } catch {
@@ -1384,18 +1423,21 @@ export class LoopEngine {
    * This is the piece that makes the loop a loop. When the session finishes a
    * turn it goes idle; rather than treating that as the end, the loop decides:
    *
-   * 1. Count the completed iteration.
-   * 2. Read the last assistant turn and look for the completion sentinel. Its
-   *    presence is *reported*, never acted on: a loop ends only when its owner
-   *    halts it, so the claim is logged and answered with a prompt that turns
-   *    it back into work.
-   * 3. Report (but never act on) a spent iteration budget or error budget.
-   * 4. Otherwise **re-plan** — re-rank the catalogue, sweep for a model that
+   * 1. Count the completed iteration and the session's turn.
+   * 2. Read the last assistant turn for a boundary signal — the task
+   *    checkpoint or the completion sentinel. Both are *reported*, never
+   *    acted on as stops: a loop ends only when its owner halts it.
+   * 3. Rotate to a fresh session when one is due: a boundary signal after
+   *    real work in this session, the session step budget, or context
+   *    pressure. The successor carries no history — the repository is the
+   *    state — and the rotation defers while subagents are live.
+   * 4. Report (but never act on) a spent iteration budget or error budget.
+   * 5. Otherwise **re-plan** — re-rank the catalogue, sweep for a model that
    *    has become available or a better one for the task, and switch the
    *    session if the answer changed. This is the "continually evaluate on each
    *    turn" contract, and it runs before the prompt so the next turn is already
    *    on the current best model.
-   * 5. Send the next prompt, which makes the session busy again and re-arms the
+   * 6. Send the next prompt, which makes the session busy again and re-arms the
    *    hang clock.
    *
    * `advancing` guards the re-entrancy: an idle event can arrive while a prompt
@@ -1413,6 +1455,7 @@ export class LoopEngine {
     this.redrives.delete(sessionID)
     try {
       loop.iterations += 1
+      loop.sessionIterations += 1
       // Finished work is the evidence that the model was not the problem, so
       // the episode's try budget starts over. A turn that merely *errored* into
       // idleness does not count as finished — otherwise a failing model would
@@ -1432,14 +1475,16 @@ export class LoopEngine {
 
       const lastText = await this.lastAssistantText(sessionID)
       const claimed = lastText.includes(this.sentinel)
-      if (claimed) {
-        // A completion claim is a report, never a stop: the loop only ends
-        // when its owner halts it (owner policy). It is logged and surfaced
-        // through lastResult so the owner can see the model believes the task
-        // is done — and then the loop continues with a prompt that turns the
-        // claim back into work instead of inviting a sentinel echo.
-        this.log.info(`completion claimed on ${sessionID} at iteration ${iteration}; continuing (loops end only by halt)`)
-        loop.lastResult = `completion claimed at iteration ${iteration}; continuing`
+      const checkpointed = lastText.includes(CHECKPOINT_SENTINEL)
+      const boundary = claimed || checkpointed
+      if (boundary) {
+        // A boundary claim is a report, never a stop: the loop only ends when
+        // its owner halts it (owner policy). It is logged so the owner can
+        // see it — and then either a rotation starts a fresh session from the
+        // boundary, or the loop continues with a prompt that turns a
+        // completion claim back into work.
+        const what = claimed ? "completion" : "task boundary"
+        this.log.info(`${what} claimed on ${sessionID} at iteration ${iteration}; continuing (loops end only by halt)`)
       }
 
       if (loop.consecutiveErrors >= 5) {
@@ -1448,13 +1493,17 @@ export class LoopEngine {
         this.log.warn(`${loop.consecutiveErrors} consecutive errors and continuing`)
       }
 
-      // Hand off before continuing when the context window is spent. This is
-      // deliberately after the completion check and before the next prompt: a
-      // handoff mid-turn would destroy the work in flight, and doing it at all
-      // is only safe once the session has been idle long enough to know no
-      // subagent is still writing into it.
-      const handoff = await this.checkHandoff(sessionID)
-      if (handoff === "handed-off") return
+      // Rotate when one is due — a boundary signal after real work, the
+      // session's turn budget, or context pressure. This is deliberately after
+      // the boundary read and before the next prompt: rotating mid-turn would
+      // destroy the work in flight, and it is only safe once the session has
+      // been idle long enough to know no subagent is still writing into it.
+      const pending = this.pendingRotation.get(sessionID)
+      const reason = pending ?? (await this.rotationReason(sessionID, loop, boundary))
+      if (reason) {
+        const rotated = await this.rotateSession(sessionID, reason)
+        if (rotated) return
+      }
 
       // Re-plan before continuing, so the next turn runs on the current best
       // model rather than whatever happened to be selected earlier.
@@ -1464,13 +1513,16 @@ export class LoopEngine {
       // gets the plain continue.
       await this.sendPrompt(sessionID, claimed ? AFTER_COMPLETE_PROMPT : CONTINUE_PROMPT)
       this.clocks.clocksFor(sessionID).start(Date.now())
-      // A deferred handoff is worth surfacing: the loop is continuing on a
-      // window that is already past its threshold, and the reason (usually a
-      // live subagent) is the thing a user would want to know.
-      const deferred = handoff === "deferred" ? ` (handoff deferred: ${loop.lastResult ?? "unknown"})` : ""
-      loop.lastResult = claimed
-        ? `iteration ${iteration} done; completion claimed, continuing${deferred}`
-        : `iteration ${iteration} done; continuing${deferred}`
+      // A deferred rotation is worth surfacing: the loop is continuing in a
+      // session that wanted a fresh one, and the reason (usually a live
+      // subagent) is the thing a user would want to know. The boundary note
+      // rides along too, so a claim is visible in the status after the turn
+      // settles rather than only in the log.
+      const note = claimed ? "completion claimed, " : checkpointed ? "task boundary claimed, " : ""
+      const deferred = this.pendingRotation.has(sessionID)
+        ? ` (rotation deferred: ${this.pendingRotation.get(sessionID)})`
+        : ""
+      loop.lastResult = `iteration ${iteration} done; ${note}continuing${deferred}`
       this.log.info(`loop iteration ${iteration} complete; continuing`)
       this.emit()
     } catch (error) {
@@ -1531,74 +1583,86 @@ export class LoopEngine {
   }
 
   /**
-   * Hand off to a fresh session when this one has spent enough of its context.
+   * Why this session should rotate now, or null.
    *
-   * Returns "handed-off" when the loop now runs on a new session, "deferred"
-   * when a handoff was wanted but unsafe (a subagent is still live, or the
-   * summary could not be written), and "not-needed" when the window still has
-   * room. A deferral is not an error: the caller continues in the current
-   * session and the next turn tries again, which is why a busy subagent merely
-   * delays the handoff rather than losing it.
+   * A boundary signal is one-shot — the model will not repeat it on the next
+   * turn — so a rotation deferred by a live subagent is retried first, before
+   * any fresh reason is considered.
    */
-  private async checkHandoff(sessionID: string): Promise<"handed-off" | "deferred" | "not-needed"> {
-    const loop = this.loopFor(sessionID)
-    if (!loop) return "not-needed"
+  private async rotationReason(sessionID: string, loop: LoopState, boundary: boolean): Promise<string | null> {
+    if (boundary && loop.sessionIterations >= this.sessionMinSteps) return "task boundary"
+    if (loop.sessionIterations >= this.sessionSteps) return "session budget"
     const limit = await this.contextLimitFor(sessionID)
-    if (limit <= 0) return "not-needed"
-
+    if (limit <= 0) return null
     const used = await this.contextUsed(sessionID)
-    if (used <= 0) return "not-needed"
-    if (!shouldHandoff(used, limit, this.handoffThreshold)) return "not-needed"
+    if (used <= 0 || !shouldRotate(used, limit, this.rotationThreshold)) return null
+    return `context ${Math.round((used / limit) * 100)}%`
+  }
 
-    this.log.info(`context ${used}/${limit} (${Math.round((used / limit) * 100)}%); handing off`)
+  /** The seed for a rotated session: the loop's own prompt, plus the protocol. */
+  private rotationSeed(prompt: string): string {
+    return (
+      `A previous session finished a stretch of work and was retired to keep context fresh. ` +
+      `Nothing was carried over: the repository is the state. Re-read the plans, the task files, ` +
+      `and the codebase index to re-establish where the work stands before continuing.\n\n` +
+      `Original task: ${prompt.trim() || "(none recorded)"}` +
+      SENTINEL_INSTRUCTION +
+      CHECKPOINT_INSTRUCTION
+    )
+  }
 
-    try {
-      const messages = await this.readMessages(sessionID)
-      const { turns, files } = transcriptFrom(messages)
-      const record = this.tracked.get(sessionID)
+  /**
+   * Start the loop's successor session and move the loop record to it.
+   *
+   * The successor is empty — no history, no tool calls, no summary — because
+   * the work is on disk and the seed says so. A deferral is remembered and
+   * retried on the next turn end.
+   */
+  private async rotateSession(sessionID: string, reason: string): Promise<boolean> {
+    const loop = this.loopFor(sessionID)
+    if (!loop) return false
+    const record = this.tracked.get(sessionID)
 
-      const result = await handoff(this.ctx as unknown as HandoffContext, {
-        sessionID,
-        task: loop.prompt,
-        iterations: loop.iterations,
-        reason: `Context reached ${Math.round((used / limit) * 100)}% of a ${limit}-token window.`,
-        transcript: turns,
-        files,
-      }, { directory: this.handoffDirectory, agent: record?.agent })
+    const result = await rotate(this.ctx as unknown as RotationContext, {
+      sessionID,
+      seed: this.rotationSeed(loop.prompt),
+      agent: record?.agent,
+    })
 
-      if (!result.handed) {
-        loop.lastResult = result.deferred ?? "unknown"
-        this.log.warn(`handoff deferred: ${result.deferred ?? "unknown"}`)
-        this.emit()
-        return "deferred"
-      }
-
-      // The successor session carries the loop forward; the old one is done.
-      // The loop record MOVES to the new key: per-session loops are keyed by
-      // session, and the loop's identity is the work, not the session id.
-      const newSessionID = result.newSessionID!
-      this.untrack(sessionID)
-      this.track(newSessionID, record?.agent ?? "general")
-      const moved = this.loopFor(sessionID)
-      if (!moved) return "deferred"
-      delete this.state.loops[sessionID]
-      const next = { ...moved, sessionID: newSessionID }
-      this.state.loops[newSessionID] = next
-      // The handoff seeds the successor with its own prompt, so its opening
-      // turn is a turn of the loop: arm it here, or the first turn-end event
-      // would be a duplicate ending and the loop would stand down.
-      this.armedSessions.add(newSessionID)
-      next.lastResult = `handed off to ${newSessionID} (summary: ${result.summaryFile})`
-      this.log.info(`handed off to ${newSessionID}; summary at ${result.summaryFile}`)
-      this.clocks.clocksFor(newSessionID).start(Date.now())
+    if (!result.rotated) {
+      this.pendingRotation.set(sessionID, reason)
+      loop.lastResult = `rotation deferred (${reason}): ${result.deferred ?? "unknown"}`
+      this.log.warn(`rotation deferred on ${sessionID} (${reason}): ${result.deferred ?? "unknown"}`)
       this.emit()
-      return "handed-off"
-    } catch (error) {
-      this.log.warn(`handoff failed: ${msg(error)}`)
-      loop.lastResult = `handoff failed: ${msg(error)}`
-      this.emit()
-      return "deferred"
+      return false
     }
+
+    // The loop record MOVES to the new key: per-session loops are keyed by
+    // session, and the loop's identity is the work, not the session id.
+    // `iterations` is the loop's and carries; per-session metrics start over.
+    const turns = loop.sessionIterations
+    const newSessionID = result.newSessionID!
+    this.untrack(sessionID)
+    this.track(newSessionID, record?.agent ?? "general")
+    delete this.state.loops[sessionID]
+    const next: LoopState = {
+      ...loop,
+      sessionID: newSessionID,
+      sessionIterations: 0,
+      lastResult: `rotated to ${newSessionID} after ${turns} turns (${reason})`,
+    }
+    this.state.loops[newSessionID] = next
+    // The seed prompt is the successor's opening turn, so arm it here, or the
+    // first turn-end event would be a duplicate ending and the loop would
+    // stand down.
+    this.armedSessions.add(newSessionID)
+    this.redrives.delete(sessionID)
+    this.failedTurns.delete(sessionID)
+    this.pendingRotation.delete(sessionID)
+    this.clocks.clocksFor(newSessionID).start(Date.now())
+    this.log.info(`session rotated on ${sessionID} after ${turns} turns (${reason}) -> ${newSessionID}`)
+    this.emit()
+    return true
   }
 
   /** The context window of the session's current model, or 0 when unknown. */
@@ -1655,6 +1719,7 @@ export class LoopEngine {
       // not to the session's earlier loops. The mode comes from the caller,
       // else the session's previous mode, else the default.
       iterations: 0,
+      sessionIterations: 0,
       startedAt: Date.now(),
       lastResult: "loop started",
       owner: this.instanceID,
@@ -1678,11 +1743,11 @@ export class LoopEngine {
     // Plan first so the opening turn already runs on the right model.
     await this.refresh(true)
 
-    // Then send the opening prompt. The sentinel instruction is appended so the
-    // model knows how to declare the task finished; without it the loop could
-    // only ever stop on its budget.
+    // Then send the opening prompt. The protocol instructions are appended so
+    // the model knows how to declare a finished unit (which rotates the
+    // session) and a finished task (which is reported, never a stop).
     try {
-      await this.sendPrompt(sessionID, `${prompt}${SENTINEL_INSTRUCTION}`)
+      await this.sendPrompt(sessionID, `${prompt}${SENTINEL_INSTRUCTION}${CHECKPOINT_INSTRUCTION}`)
       this.clocks.clocksFor(sessionID).start(Date.now())
     } catch (error) {
       this.log.error(`could not send the opening prompt: ${msg(error)}`)
@@ -1723,6 +1788,7 @@ export class LoopEngine {
       loop.ownerBeatAt = 0
       loop.rotations = 0
       this.redrives.delete(sid)
+      this.pendingRotation.delete(sid)
       // The loop keeps its sessionID so a later `start` finds its home; the
       // owner is what says nobody drives it right now.
       this.failedTurns.delete(sid)

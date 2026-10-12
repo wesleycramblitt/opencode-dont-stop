@@ -2,7 +2,7 @@
 /**
  * dont-stop unit tests.
  *
- * Pure modules first (events, clocks, errors, catalogue, handoff, the alibaba
+ * Pure modules first (events, clocks, errors, catalogue, rotation, the alibaba
  * shape), then the engine's loop logic through a fake plugin context — no
  * network, no server, and nothing that can touch a live session.
  *
@@ -20,9 +20,9 @@ import { SessionClocks } from "../lib/clocks.ts"
 import { classify, actionFor, DEPRECATED_COOLDOWN_MS, PERMANENT_COOLDOWN_MS } from "../lib/errors.ts"
 import { meets, loadCatalogue, type Catalogue, type CatalogueModel } from "../lib/catalogue.ts"
 import { rankForMode, profileFor } from "../lib/modes.ts"
-import { measureContext, transcriptFrom, descendantIDs, buildSummary, effectiveContext, ollamaServedContext } from "../lib/handoff.ts"
+import { measureContext, descendantIDs, effectiveContext, ollamaServedContext, shouldRotate } from "../lib/rotation.ts"
 import { catalogueRefreshDue, parseAlibabaInventory, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
-import { LoopEngine, COMPLETION_SENTINEL } from "../lib/engine.ts"
+import { LoopEngine, COMPLETION_SENTINEL, CHECKPOINT_SENTINEL, type EngineOptions } from "../lib/engine.ts"
 import { initialState, readState, type Mode, type PluginState } from "../lib/state.ts"
 import { FREE_TIERS } from "../data/free-tiers.ts"
 
@@ -453,7 +453,7 @@ test("cheap ranking leads with the cheapest capable model, free tail after", () 
   assert.equal(ranked[ranked.length - 1].id, "c")
 })
 
-/* -------------------------------------------------------------------- handoff */
+/* ------------------------------------------------------------------ rotation */
 
 test("context usage is read from v2 message tokens", () => {
   const used = measureContext({ data: [
@@ -465,7 +465,7 @@ test("context usage is read from v2 message tokens", () => {
 
 test("a local model's window is what the daemon serves, not the native size", () => {
   // ollama's OLLAMA_CONTEXT_LENGTH=64000 against a 3.5M native claim: the
-  // session truncates at 64k, so that is the limit the handoff must use.
+  // session truncates at 64k, so that is the limit rotation must use.
   assert.equal(effectiveContext(3_500_000, 64_000), 64_000)
   assert.equal(effectiveContext(3_500_000, 0), 3_500_000)
   assert.equal(effectiveContext(0, 64_000), 64_000)
@@ -488,17 +488,11 @@ test("the ollama probe reads the served context and tolerates junk", async () =>
   assert.equal(await ollamaServedContext("qwen3.8:latest", down), 0)
 })
 
-test("transcripts read v2 content parts and files from tool state", () => {
-  const { turns, files } = transcriptFrom({ data: [
-    { type: "user", text: "fix the parser" },
-    { type: "assistant", content: [
-      { type: "text", text: "checking now" },
-      { type: "reasoning", text: "private thought" },
-      { type: "tool", id: "call_1", state: { status: "success", input: { filePath: "src/parser.ts" } } },
-    ]},
-  ]})
-  assert.deepEqual(turns, [{ role: "user", text: "fix the parser" }, { role: "assistant", text: "checking now" }])
-  assert.deepEqual(files, ["src/parser.ts"])
+test("context pressure is a threshold on the effective window", () => {
+  assert.equal(shouldRotate(80_000, 100_000), true)
+  assert.equal(shouldRotate(79_000, 100_000), false)
+  // An unknown window is not pressure.
+  assert.equal(shouldRotate(50, 0), false)
 })
 
 test("descendant walks reach grandchildren", () => {
@@ -509,20 +503,6 @@ test("descendant walks reach grandchildren", () => {
     { id: "other", parentID: null },
   ], "root")
   assert.deepEqual([...ids].sort(), ["child", "grand"])
-})
-
-test("the summary is deterministic and bounded", () => {
-  const text = buildSummary({
-    sessionID: "ses_x",
-    task: "ship it",
-    iterations: 3,
-    reason: "test",
-    transcript: [{ role: "user", text: "one" }, { role: "assistant", text: "two" }],
-    files: ["a.ts"],
-  })
-  assert.match(text, /ship it/)
-  assert.match(text, /a\.ts/)
-  assert.ok(!text.includes("private"))
 })
 
 /* ----------------------------------------------------------- alibaba shaping */
@@ -641,17 +621,17 @@ function fakeContext() {
   }
 }
 
-function makeEngine(instanceID: string) {
+function makeEngine(instanceID: string, options: Partial<EngineOptions> = {}) {
   const fakes = fakeContext()
   const state: PluginState = initialState()
   const log = { info: () => {}, warn: () => {}, error: () => {}, quiet: () => {} }
-  const engine = new LoopEngine(fakes.context, state, log, { instanceID })
+  const engine = new LoopEngine(fakes.context, state, log, { instanceID, ...options })
   return { engine, state, fakes }
 }
 
 function armLoop(engine: LoopEngine, state: PluginState, instanceID: string, sessionID: string, mode: Mode = "free") {
   state.loops[sessionID] = {
-    status: "active", sessionID, prompt: "task", iterations: 0,
+    status: "active", sessionID, prompt: "task", iterations: 0, sessionIterations: 0,
     startedAt: Date.now(), lastResult: null, owner: instanceID,
     ownerBeatAt: Date.now(), rotations: 0,
     mode, degraded: false, preferredMode: null, consecutiveErrors: 0,
@@ -774,6 +754,126 @@ test("only a halt ends the loop", async () => {
   await engine.stop("halted by the owner", "ses_loop")
   assert.equal(state.loops["ses_loop"].status, "stopped")
   assert.match(state.loops["ses_loop"].lastResult ?? "", /halted by the owner/)
+})
+
+/* --------------------------------------------------------------- rotation */
+
+test("a session rotates at the turn budget, carrying the loop", async () => {
+  const { engine, state, fakes } = makeEngine("i1", { sessionSteps: 3, sessionMinSteps: 2 })
+  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
+  armLoop(engine, state, "i1", "ses_loop", "free")
+
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(state.loops["ses_loop"].sessionIterations, 2)
+
+  // The third turn hits the budget: the loop moves to the successor, whose
+  // per-session count starts over while the loop's iteration count carries.
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(state.loops["ses_loop"], undefined)
+  const next = state.loops["ses_new"]
+  assert.ok(next, "the loop moved to the new session")
+  assert.equal(next.sessionID, "ses_new")
+  assert.equal(next.iterations, 3)
+  assert.equal(next.sessionIterations, 0)
+  assert.match(next.lastResult ?? "", /rotated to ses_new after 3 turns \(session budget\)/)
+  const prompt = fakes.prompts[fakes.prompts.length - 1]
+  assert.equal(prompt.sessionID, "ses_new")
+  assert.match(prompt.text, /Original task: task/)
+  assert.match(prompt.text, /loop-checkpoint/)
+})
+
+test("a task-boundary signal rotates only after real work in the session", async () => {
+  const { engine, state, fakes } = makeEngine("i1", { sessionMinSteps: 2, sessionSteps: 30 })
+  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  const canned = (text: string) => ({
+    session: {
+      ...fakeContext().context.session,
+      prompt: async (input: { sessionID: string; text: string }) => {
+        fakes.prompts.push(input)
+      },
+      context: async () => ({ data: [
+        { type: "user", text: "task" },
+        { type: "assistant", content: [{ type: "text", text }] },
+      ]}),
+    },
+  })
+
+  // First turn: the checkpoint is below the floor, so it is reported and the
+  // loop continues in place.
+  ;(engine as unknown as { ctx: unknown }).ctx = canned(`packet done ${CHECKPOINT_SENTINEL}`)
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.ok(state.loops["ses_loop"])
+  assert.match(state.loops["ses_loop"].lastResult ?? "", /task boundary claimed/)
+
+  // The second turn reaches the floor: the same signal now rotates.
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(state.loops["ses_loop"], undefined)
+  assert.ok(state.loops["ses_new"])
+  assert.match(state.loops["ses_new"].lastResult ?? "", /task boundary/)
+})
+
+test("a rotation defers under a live subagent and is retried after", async () => {
+  const { engine, state, fakes } = makeEngine("i1", { sessionSteps: 1, sessionMinSteps: 1 })
+  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
+  armLoop(engine, state, "i1", "ses_loop", "free")
+
+  const busy = {
+    session: {
+      ...fakeContext().context.session,
+      prompt: async (input: { sessionID: string; text: string }) => {
+        fakes.prompts.push(input)
+      },
+      list: async (input?: { parentID?: string | null }) => ({
+        data: input?.parentID === "ses_loop" ? [{ id: "ses_child", parentID: "ses_loop" }] : [],
+      }),
+      active: async () => ({ data: { ses_child: {} } }),
+      context: async () => ({ data: [] }),
+    },
+  }
+  ;(engine as unknown as { ctx: unknown }).ctx = busy
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.ok(state.loops["ses_loop"], "the loop stays put while the subagent works")
+  assert.match(state.loops["ses_loop"].lastResult ?? "", /rotation deferred/)
+
+  // The subagent finishes: the remembered rotation is retried and succeeds.
+  const clear = {
+    session: {
+      ...fakeContext().context.session,
+      prompt: async (input: { sessionID: string; text: string }) => {
+        fakes.prompts.push(input)
+      },
+      list: async () => ({ data: [] }),
+      active: async () => ({ data: {} }),
+      context: async () => ({ data: [] }),
+    },
+  }
+  ;(engine as unknown as { ctx: unknown }).ctx = clear
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(state.loops["ses_loop"], undefined)
+  assert.ok(state.loops["ses_new"])
+})
+
+test("context pressure rotates before the window fills", async () => {
+  const { engine, state } = makeEngine("i1", { sessionSteps: 100, sessionMinSteps: 100 })
+  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x", context: 1_000 })]))
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!
+  tracked.model = { providerID: "a", id: "x" }
+  ;(engine as unknown as { ctx: unknown }).ctx = {
+    session: {
+      ...fakeContext().context.session,
+      context: async () => ({ data: [
+        { type: "assistant", tokens: { input: 850, output: 10, cache: { read: 0, write: 0 } } },
+      ]}),
+    },
+  }
+
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(state.loops["ses_loop"], undefined)
+  assert.ok(state.loops["ses_new"])
+  assert.match(state.loops["ses_new"].lastResult ?? "", /context 85%/)
 })
 
 test("halt interrupts the whole tree, drops clocks, and keeps the loop session tracked", async () => {
