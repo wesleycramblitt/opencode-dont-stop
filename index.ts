@@ -367,10 +367,21 @@ export function runCommand(raw: string, env: CommandEnv): string {
       return `loop started from ${path} on ${target} (mode: ${state.mode})`
     }
 
-    const prompt = rest.join(" ").trim()
-    if (!prompt) return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
     const target = sessionID ?? newestTrackedFor(engine)
     if (!target) return "error: no session to run the loop on"
+    const prompt = rest.join(" ").trim()
+    if (!prompt) {
+      // Restarting a loop: with no text, the most recent loop's stored
+      // prompt is re-used — the same full /dont-stop command the original
+      // run opened with. This is what makes a restarted (or fresh) session
+      // land back on the loop with one verb instead of a re-paste.
+      const prior = engine.primaryLoop()
+      if (prior?.prompt) {
+        void engine.start(target, prior.prompt).then(persist)
+        return `loop restarted on ${target} with the stored prompt (mode: ${state.mode})`
+      }
+      return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
+    }
     void engine.start(target, prompt).then(persist)
     return `loop started on ${target} (mode: ${state.mode})`
   }
@@ -450,6 +461,9 @@ function formatStatus(state: PluginState, engine: LoopEngine): string {
       )
       lines.push(`    iterations: ${loop.iterations}`)
       lines.push(`    session turns: ${loop.sessionIterations}`)
+      if (loop.turnStartedAt && loop.status === "active") {
+        lines.push(`    in flight: turn working since ${new Date(loop.turnStartedAt).toLocaleTimeString()}`)
+      }
       if (loop.rotations > 0) {
         lines.push(`    rotations without a completed turn: ${loop.rotations}`)
       }

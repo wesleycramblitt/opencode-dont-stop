@@ -26,12 +26,14 @@
 
 import {
   applyAvailability,
+  applyCooldowns,
   loadCatalogue,
   markAvailable,
   markUnavailable,
   cooldown,
   clearCooldown,
   filter,
+  slotKey,
   sortBy,
   sorts,
   exportSummary,
@@ -61,7 +63,7 @@ import {
 } from "./rotation.ts"
 import { applyAgentDefaults, applySessionModels, sameSlot, slotFrom, type ApplyContext, type ModelPlan } from "./apply.ts"
 import type { Logger } from "./log.ts"
-import { bumpIntent, readState, type LoopState, type Mode, type ModelSlot, type PluginState } from "./state.ts"
+import { bumpIntent, MODES, readState, type LoopState, type Mode, type ModelSlot, type PluginState } from "./state.ts"
 import { eventSignals, TURN_END_TYPES, type EventError, type SessionEvent } from "./events.ts"
 
 /** A session the engine is tracking for the loop. */
@@ -143,6 +145,25 @@ export const DEFAULT_REDRIVE_DELAY_MS = 20_000
 
 /** How long a model that hung stays out of the chain (10 minutes). */
 export const DEFAULT_HANG_COOLDOWN_MS = 10 * 60_000
+
+/**
+ * How long a loop session waits before a second compaction request.
+ *
+ * Compaction is requested when no candidate model can hold the session's
+ * context, and the server compacts at the next step boundary. After one
+ * request the transcript is on its way down, so a second request within the
+ * window is a duplicate, not a new need.
+ */
+export const COMPACTION_REQUEST_COOLDOWN_MS = 5 * 60_000
+
+/**
+ * The served context assumed for a local model whose window the daemon does
+ * not report (it is not loaded). `OLLAMA_CONTEXT_LENGTH` on this machine is
+ * 64000, a fraction of the native figures in the catalogue — assuming the
+ * native window would let a 200k session land on a model that truncates
+ * every prompt it receives.
+ */
+export const LOCAL_WINDOW_UNKNOWN_GUARD = 64_000
 
 /**
  * How recent an interrupt must be to count as the hang path's own doing.
@@ -311,6 +332,21 @@ export class LoopEngine {
   private readonly leaseGraceMs: number
   /** Rotations a live subagent deferred, retried on the next turn end. */
   private readonly pendingRotation = new Map<string, string>()
+  /**
+   * When each loop session last compacted. Compaction removes messages, which
+   * otherwise reads as a session restart; the restart detector stands down
+   * within a window of a compaction because compaction preserves the work.
+   */
+  private readonly compactions = new Map<string, number>()
+  /**
+   * The last observed message count per LOOP session, used to detect a
+   * session that was restarted underneath the engine (the count drops when
+   * the conversation is cleared and the loop would otherwise wait forever).
+   * Baseline is set when a prompt is sent and refreshed on every beat.
+   */
+  private readonly messageCounts = new Map<string, number>()
+  /** When a compaction was last requested per loop session (epoch ms). */
+  private readonly compactionRequests = new Map<string, number>()
 
   constructor(
     private readonly ctx: ApplyContext,
@@ -451,6 +487,10 @@ export class LoopEngine {
     }
 
     this.state.lastEvent = event.type
+
+    // Compaction removes messages but preserves the work: remember it so the
+    // restart detector does not mistake a compacted session for a cleared one.
+    if (event.type === "session.compacted") this.compactions.set(sessionID, Date.now())
   }
 
   /* --------------------------------------------------------------- turn end */
@@ -478,6 +518,8 @@ export class LoopEngine {
       // was the user's escape, nothing else is scheduled, so the re-drive
       // gives the loop a moment before continuing it.
       const ours = Date.now() - (this.hangInterrupts.get(sessionID) ?? 0) < HANG_INTERRUPT_RECENCY_MS
+      const loop = this.loopFor(sessionID)
+      if (loop) loop.turnStartedAt = null
       if (ours) return
       if (!this.redrives.has(sessionID)) this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
       return
@@ -565,6 +607,12 @@ export class LoopEngine {
     }
     this.catalogue = next
     applyAvailability(next, patches)
+    // Persisted cooldowns decide eligibility in EVERY instance, not just the
+    // one that served the sentence: a fresh engine's rows carry no runtime
+    // state, and without this a cooling model is ranked and picked again
+    // (the "cooling models keep cycling" report). Availability patches cover
+    // this engine's own memory; the state file covers everyone else's.
+    applyCooldowns(next, this.state.cooldowns, Date.now())
     await this.applyReachability()
     this.log.info(`catalogue loaded: ${next.models.length} models from ${next.sources.length} sources`)
     this.emit()
@@ -753,7 +801,29 @@ export class LoopEngine {
       const target = this.tracked.get(loop.sessionID)
       const entry = loopPlan.sessions.find((e) => e.sessionID === loop.sessionID)
       if (entry && target) {
-        if (force || !target.model || !sameSlot(target.model, entry.model)) needsSwitch.push(entry)
+        if (force || !target.model || !sameSlot(target.model, entry.model)) {
+          // Context veto on the switch: a plan that now prefers a model whose
+          // window cannot hold the conversation must not yank the session down
+          // to it — the next turn would come back truncated. The rotation path
+          // handles the "nothing fits" case by compacting; here, keeping the
+          // current model is the safe answer, and the session-rotation path
+          // sheds the context when the current model itself is outgrown.
+          if (!force && target.model && !sameSlot(target.model, entry.model) && this.catalogue) {
+            const row = this.catalogueRowFor(entry.model)
+            if (row) {
+              const used = await this.contextUsed(loop.sessionID)
+              if (used > 0 && !(await this.canHoldContext(row, used))) {
+                this.log.quiet(
+                  "info",
+                  `keeping ${modelKeyOf(target.model)} on ${loop.sessionID}: ` +
+                    `${entry.model.providerID}/${entry.model.id} cannot hold ${used} tokens of context`,
+                )
+                continue
+              }
+            }
+          }
+          needsSwitch.push(entry)
+        }
       }
     }
 
@@ -801,6 +871,7 @@ export class LoopEngine {
       if (loop.status !== "active" || loop.owner !== this.instanceID) continue
       loop.ownerBeatAt = now2
       await this.maybeRedrive(sessionID)
+      await this.maybeReseedRestarted(sessionID)
     }
 
     const verdicts = this.clocks.evaluate(now)
@@ -874,7 +945,7 @@ export class LoopEngine {
       this.putOnCooldown(previous, Date.now() + this.hangCooldownMs)
     }
 
-    const outcome = this.rotate(sessionID, "hang")
+    const outcome = await this.rotate(sessionID, "hang")
     if (outcome !== "moved" && outcome !== "not-ours") {
       // Not a stop (owner, 2026-10-11): every model in the chain has had its
       // try and none is cooling down yet (or nothing is left at all). The
@@ -988,7 +1059,7 @@ export class LoopEngine {
       this.putOnCooldown(previous, cooldownDeadline(action.cooldownMs))
     }
 
-    const outcome = this.rotate(sessionID, `retry-after-${classified.kind}`)
+    const outcome = await this.rotate(sessionID, `retry-after-${classified.kind}`)
     if (outcome !== "moved" && outcome !== "not-ours") {
       this.log.warn(`no untried model left for ${sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
       if (!this.redrives.has(sessionID)) this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
@@ -998,6 +1069,55 @@ export class LoopEngine {
     current.rotations += 1
     this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
     this.emit()
+  }
+
+  /**
+   * Re-seed a loop session that was restarted underneath the engine.
+   *
+   * A session restart clears the conversation and starts fresh with whatever
+   * the user typed — not the loop prompt. The loop record is keyed to the
+   * session, so it survives, but nothing drives it anymore: the turn-end
+   * events belong to the user's new text, and the loop would wait forever.
+   * The restart is detected by the message count dropping below the last
+   * count the engine saw, and the recovery is to re-inject the FULL loop
+   * prompt — the same text the loop opened with, sentinel instructions and
+   * all — which is what "restart session" is supposed to do.
+   *
+   * Compaction also removes messages, but it preserves the work, so a recent
+   * compaction suppresses the check. An unreadable session keeps its old
+   * baseline (no reseed on a read error, and no false drop later).
+   */
+  private async maybeReseedRestarted(sessionID: string): Promise<void> {
+    const loop = this.loopFor(sessionID)
+    if (!loop || !this.ownsLoop(sessionID)) return
+    if (loop.prompt.trim().length === 0) return
+    // A running turn cannot have been restarted underneath us; the ending
+    // event will flow, and the next beat's read sees the drop.
+    if (this.clocks.peek(sessionID)?.activity.running) return
+    const compacted = this.compactions.get(sessionID) ?? 0
+    if (Date.now() - compacted < 90_000) return
+
+    const count = await this.messageCount(sessionID)
+    if (count < 0) return
+    const previous = this.messageCounts.get(sessionID)
+    this.messageCounts.set(sessionID, count)
+    if (previous === undefined || count >= previous) return
+
+    this.log.warn(`session ${sessionID} restarted (${previous} -> ${count} messages); re-injecting the loop prompt`)
+    await this.sendPrompt(sessionID, `${loop.prompt}${SENTINEL_INSTRUCTION}${CHECKPOINT_INSTRUCTION}`)
+    loop.lastResult = "session restarted; loop prompt re-injected"
+    this.emit()
+  }
+
+  /** Messages on a session, or -1 when the session cannot be read. */
+  private async messageCount(sessionID: string): Promise<number> {
+    try {
+      const raw: unknown = await this.readMessages(sessionID)
+      const list = Array.isArray(raw) ? raw : (raw as { data?: unknown } | null)?.data
+      return Array.isArray(list) ? list.length : 0
+    } catch {
+      return -1
+    }
   }
 
   /** Best-effort cancellation of an in-flight request. */
@@ -1043,7 +1163,32 @@ export class LoopEngine {
       // session.
       await this.stop(`halted by intent ${intent.seq}`)
     }
+
+    if (intent.action === "mode") {
+      // Mode changes ride the control plane so they survive every writer:
+      // a TUI or command that changed the mode bumps a mode intent, and each
+      // instance applies it to ITS memory before persisting, so no instance
+      // can rewrite the file with a stale mode (the "it stays on free" bug).
+      if (!intent.mode || !MODES.includes(intent.mode)) return true
+      await this.applyModeIntent(intent.mode as Mode, intent.seq)
+    }
     return true
+  }
+
+  /**
+   * Apply a mode to this instance: the default mode plus the primary loop's
+   * own mode, exactly what a `mode <name>` command means. Shared by the
+   * intent path and the command path so both change the same two things.
+   */
+  private async applyModeIntent(mode: Mode, seq: number): Promise<void> {
+    const primary = this.primaryLoop()
+    if (primary && primary.mode !== mode) this.applyLoopMode(primary, mode)
+    if (this.state.mode !== mode) {
+      this.state.mode = mode
+      if (!primary) this.resetEpisode()
+    }
+    this.log.info(`mode set to ${mode} by intent #${seq}`)
+    await this.refresh(true)
   }
 
   /**
@@ -1215,7 +1360,7 @@ export class LoopEngine {
       // re-drive is what turns "retry" into an actual second attempt.
       if (input.sessionID) this.redrives.set(input.sessionID, Date.now() + this.redriveDelayMs)
     } else if (action.resweep && input.sessionID && ownsThis) {
-      const outcome = this.rotate(input.sessionID, classified.kind)
+      const outcome = await this.rotate(input.sessionID, classified.kind)
       // Not a stop when the chain has nothing left (owner, 2026-10-11): the
       // loop waits for cooldowns to expire instead. `"not-ours"` is a rotation
       // that was never ours to make, and quietly does nothing.
@@ -1278,7 +1423,7 @@ export class LoopEngine {
    * `"exhausted"` and `"unavailable"` are the loop running out of models and
    * are the caller's signal to stop it.
    */
-  rotate(sessionID: string, cause: string): RotationOutcome {
+  async rotate(sessionID: string, cause: string): Promise<RotationOutcome> {
     // Only the loop's owner moves a session's model. Rotation from an error on
     // some other session — or from another instance watching the same file —
     // is this plugin reaching into work it was not asked to manage.
@@ -1304,11 +1449,29 @@ export class LoopEngine {
     // bounds the walk — a chain of N gives N turns and then stops, so there is
     // no rotation cap on top of it.
     if (record.model) this.tried.add(modelKeyOf(record.model))
+
+    // A model that cannot hold the conversation it is about to receive is not
+    // a candidate: a 200k session dropped onto a 64k local window comes back
+    // truncated every turn, which is how a rotation looks like a hang. The
+    // session's current usage is the bar, and candidates are walked twice —
+    // first those that can hold it, and if none can, the session is compacted
+    // (the transcript is state; the work is on disk) before the chain is
+    // walked again.
+    const used = await this.contextUsed(sessionID)
     let pick: CatalogueModel | null = null
     for (const candidate of ranked) {
       if (this.tried.has(`${candidate.providerID}/${candidate.id}`)) continue
+      if (used > 0 && !(await this.canHoldContext(candidate, used))) continue
       pick = candidate
       break
+    }
+    if (!pick && used > 0) {
+      await this.compactSession(sessionID)
+      for (const candidate of ranked) {
+        if (this.tried.has(`${candidate.providerID}/${candidate.id}`)) continue
+        pick = candidate
+        break
+      }
     }
     if (!pick) {
       loop.lastResult =
@@ -1328,6 +1491,58 @@ export class LoopEngine {
       this.log,
     )
     return "moved"
+  }
+
+  /**
+   * Whether a candidate can carry the session's current context.
+   *
+   * Remote rows are judged by their advertised window. Local rows are judged
+   * by what the daemon actually serves — `OLLAMA_CONTEXT_LENGTH` can be a
+   * fraction of the native window and truncates the prompt to fit, which is
+   * how a session on a "200k" local model gets every turn cut off. When the
+   * model is loaded the served figure is reported and wins; when it is not,
+   * the daemon says nothing, so the served window is assumed to be the
+   * observed local cap (`OLLAMA_CONTEXT_LENGTH=64000` here) rather than the
+   * native figure — a session past that cap on an unloaded local model does
+   * not get the switch, and the compact-first fallback in `rotate` runs.
+   */
+  private async canHoldContext(candidate: CatalogueModel, used: number): Promise<boolean> {
+    if (used <= 0) return true
+    if (!candidate.local) return candidate.context >= used
+    const served = await ollamaServedContext(candidate.id)
+    if (served > 0) return effectiveContext(candidate.context, served) >= used
+    return LOCAL_WINDOW_UNKNOWN_GUARD >= used
+  }
+
+  /** The catalogue row a plan slot names, or null when unknown. */
+  private catalogueRowFor(slot: ModelSlot): CatalogueModel | null {
+    if (!this.catalogue) return null
+    return this.catalogue.byKey.get(slotKey(slot.providerID, slot.id, slot.variant)) ?? null
+  }
+
+  /**
+   * Request compaction of a loop session no candidate can hold.
+   *
+   * Best-effort and rate-limited per session: the server admits the request
+   * and compacts at the next step boundary — the continue prompt that follows
+   * this rotation — so the next turn runs on a transcript small enough for
+   * any remaining candidate.
+   */
+  private async compactSession(sessionID: string): Promise<boolean> {
+    const last = this.compactionRequests.get(sessionID) ?? 0
+    if (Date.now() - last < COMPACTION_REQUEST_COOLDOWN_MS) return false
+    this.compactionRequests.set(sessionID, Date.now())
+    try {
+      const api = this.ctx as unknown as {
+        session?: { compact?(input: { sessionID: string }): Promise<unknown> }
+      }
+      await api.session?.compact?.({ sessionID })
+      this.log.info(`compacting ${sessionID}: no candidate model can hold its context`)
+      return true
+    } catch (error) {
+      this.log.warn(`compaction failed on ${sessionID}: ${msg(error)}`)
+      return false
+    }
   }
 
   /* ----------------------------------------------------------- mode changes */
@@ -1354,14 +1569,13 @@ export class LoopEngine {
     }
     // No session named: the default mode changes, and — the single-loop
     // convenience — the primary active loop follows it. Two sessions running
-    // loops of their own are untouched by this call.
-    const primary = this.primaryLoop()
-    if (primary && primary.mode !== mode) this.applyLoopMode(primary, mode)
-    if (this.state.mode !== mode || !primary) {
-      this.state.mode = mode
-      if (!primary) this.resetEpisode()
-    }
-    await this.refresh(true)
+    // loops of their own are untouched by this call. The change is announced
+    // on the control plane: a mode intent survives other instances' status
+    // writes — which is what turns "mode cheap" from a change that snapped
+    // back to free into one that sticks.
+    const intent = bumpIntent(this.state, "mode", mode)
+    this.appliedIntent = intent.seq
+    await this.applyModeIntent(mode, intent.seq)
   }
 
   /** Put one loop on a mode: reset its per-mode state and re-plan. */
@@ -1450,6 +1664,8 @@ export class LoopEngine {
     const loop = this.loopFor(sessionID)!
 
     this.advancing.add(sessionID)
+    // The turn that ended is over; a new one is marked by sendPrompt.
+    this.state.loops[sessionID]!.turnStartedAt = null
     // A real turn completed, so any pending re-drive of a cancelled one is
     // stale: this idle event is the driver now.
     this.redrives.delete(sessionID)
@@ -1543,6 +1759,14 @@ export class LoopEngine {
     // second is a duplicate that must not.
     this.failedTurns.delete(sessionID)
     this.armedSessions.add(sessionID)
+    const loop = this.loopFor(sessionID)
+    if (loop) {
+      // A turn is in flight from here until its first turn-end event. The
+      // status surfaces this as "working", so a slow turn — first token on a
+      // local model, a long generation — does not read as a hung loop.
+      loop.turnStartedAt = Date.now()
+      this.emit()
+    }
     const session = this.ctx as unknown as {
       session: { prompt(input: { sessionID: string; text: string }): Promise<unknown> }
     }
@@ -1654,8 +1878,12 @@ export class LoopEngine {
     this.state.loops[newSessionID] = next
     // The seed prompt is the successor's opening turn, so arm it here, or the
     // first turn-end event would be a duplicate ending and the loop would
-    // stand down.
+    // stand down. The seed is also a turn in flight, and its message count is
+    // the restart-detector's baseline for the new session.
     this.armedSessions.add(newSessionID)
+    next.turnStartedAt = Date.now()
+    const count = await this.messageCount(newSessionID)
+    if (count >= 0) this.messageCounts.set(newSessionID, count)
     this.redrives.delete(sessionID)
     this.failedTurns.delete(sessionID)
     this.pendingRotation.delete(sessionID)
@@ -1729,6 +1957,7 @@ export class LoopEngine {
       degraded: false,
       preferredMode: null,
       consecutiveErrors: 0,
+      turnStartedAt: null,
     }
     const loop = this.state.loops[sessionID]
     this.failedTurns.delete(sessionID)
@@ -1749,6 +1978,10 @@ export class LoopEngine {
     try {
       await this.sendPrompt(sessionID, `${prompt}${SENTINEL_INSTRUCTION}${CHECKPOINT_INSTRUCTION}`)
       this.clocks.clocksFor(sessionID).start(Date.now())
+      // The opening turn's message count is the restart detector's baseline:
+      // a session that later drops below it was restarted, not edited.
+      const count = await this.messageCount(sessionID)
+      if (count >= 0) this.messageCounts.set(sessionID, count)
     } catch (error) {
       this.log.error(`could not send the opening prompt: ${msg(error)}`)
       await this.stop(`failed to send the opening prompt: ${msg(error)}`, sessionID)
@@ -1787,6 +2020,7 @@ export class LoopEngine {
       loop.owner = null
       loop.ownerBeatAt = 0
       loop.rotations = 0
+      loop.turnStartedAt = null
       this.redrives.delete(sid)
       this.pendingRotation.delete(sid)
       // The loop keeps its sessionID so a later `start` finds its home; the

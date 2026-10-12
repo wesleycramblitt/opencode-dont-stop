@@ -18,7 +18,7 @@ import { join } from "node:path"
 import { eventSignals } from "../lib/events.ts"
 import { SessionClocks } from "../lib/clocks.ts"
 import { classify, actionFor, DEPRECATED_COOLDOWN_MS, PERMANENT_COOLDOWN_MS } from "../lib/errors.ts"
-import { meets, loadCatalogue, type Catalogue, type CatalogueModel } from "../lib/catalogue.ts"
+import { clearCooldown, cooldown, meets, loadCatalogue, type Catalogue, type CatalogueModel } from "../lib/catalogue.ts"
 import { rankForMode, profileFor } from "../lib/modes.ts"
 import { measureContext, descendantIDs, effectiveContext, ollamaServedContext, shouldRotate } from "../lib/rotation.ts"
 import { catalogueRefreshDue, parseAlibabaInventory, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
@@ -322,6 +322,91 @@ test("applying an already-seen intent reports no change", async () => {
   assert.equal(Object.keys(state.loops).length, 0) // no loops to halt
 })
 
+test("a mode intent moves the default mode and the primary loop", async () => {
+  const { engine, state } = makeEngine("i1")
+  const cat = catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "free")
+
+  const applied = await engine.applyIntent({
+    ...state,
+    intent: { seq: 9, action: "mode", mode: "cheap", at: Date.now() },
+  })
+  assert.equal(applied, true)
+  assert.equal(state.mode, "cheap")
+  assert.equal(state.loops["ses_loop"].mode, "cheap")
+  // A stale intent (lower seq) is ignored.
+  const replay = await engine.applyIntent({
+    ...state,
+    intent: { seq: 8, action: "mode", mode: "power", at: Date.now() },
+  })
+  assert.equal(replay, false)
+  assert.equal(state.mode, "cheap")
+})
+
+test("setMode announces a mode intent so other instances follow", async () => {
+  const { engine, state } = makeEngine("i1")
+  const cat = catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "free")
+
+  await engine.setMode("power")
+  assert.equal(state.intent.action, "mode")
+  assert.equal(state.intent.mode, "power")
+  assert.equal(state.loops["ses_loop"].mode, "power")
+})
+
+test("a provider/model cooldown excludes the variant row too", () => {
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x" }),
+    row({ key: "a/x#v1", providerID: "a", id: "x", variant: "v1" }),
+  ])
+  const until = Date.now() + 60_000
+  cooldown(cat, "a/x", until)
+  assert.equal(cat.byKey.get("a/x")!.cooldownUntil, until)
+  assert.equal(cat.byKey.get("a/x#v1")!.cooldownUntil, until)
+  clearCooldown(cat, "a/x")
+  assert.equal(cat.byKey.get("a/x")!.cooldownUntil, 0)
+  assert.equal(cat.byKey.get("a/x#v1")!.cooldownUntil, 0)
+})
+
+test("discover re-asserts persisted cooldowns on a fresh catalogue", async () => {
+  const { engine, state } = makeEngine("i1")
+  const until = Date.now() + 24 * 60 * 60 * 1000
+  state.cooldowns = { "opencode/step-5-preview-free": until }
+  await engine.discover()
+  const row = engine.model!.byKey.get("opencode/step-5-preview-free")
+  assert.ok(row, "the cooled model is in the catalogue")
+  assert.equal(row!.cooldownUntil, until)
+  // The cooling model is not selectable in the free chain after the reload.
+  const ranked = rankForMode(engine.model!, "free", profileFor("general"))
+  assert.ok(!ranked.some((m) => m.key === "opencode/step-5-preview-free"))
+})
+
+test("a restarted session is re-seeded with the full loop prompt", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  const cat = catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  // The armed turn ends: the loop is idle, waiting to be driven again.
+  engine.observe({ type: "session.execution.failed", data: { sessionID: "ses_loop" } })
+
+  // Baseline: the session holds three messages. A restart clears them.
+  fakes.messages.push({ id: 1 }, { id: 2 }, { id: 3 })
+  const reseed = engine as unknown as { maybeReseedRestarted(sessionID: string): Promise<void> }
+  await reseed.maybeReseedRestarted("ses_loop")
+  assert.equal(fakes.prompts.length, 0, "no restart yet: count unchanged")
+
+  fakes.messages.splice(0, fakes.messages.length)
+  fakes.messages.push({ id: 1 })
+  await reseed.maybeReseedRestarted("ses_loop")
+  const text = fakes.prompts.at(-1)?.text ?? ""
+  assert.match(text, /^task/, "the loop prompt is re-injected")
+  assert.ok(text.includes(COMPLETION_SENTINEL), "the protocol instructions ride along")
+  assert.equal(state.loops["ses_loop"].turnStartedAt !== null, true, "the reseed starts a turn")
+  assert.equal(state.loops["ses_loop"].lastResult, "session restarted; loop prompt re-injected")
+})
+
 /* -------------------------------------------------------------------- catalogue */
 
 function row(patch: Partial<CatalogueModel>): CatalogueModel {
@@ -594,6 +679,8 @@ function fakeContext() {
   const interrupted: string[] = []
   const prompts: Array<{ sessionID: string; text: string }> = []
   const sessions: Record<string, { id: string; parentID: string | null }> = {}
+  const messages: unknown[] = []
+  const compacted: string[] = []
   const context = {
     agent: { transform: async () => {}, reload: async () => {}, list: async () => ({ data: [] }) },
     session: {
@@ -603,6 +690,9 @@ function fakeContext() {
       interrupt: async (input: { sessionID: string }) => {
         interrupted.push(input.sessionID)
       },
+      compact: async (input: { sessionID: string }) => {
+        compacted.push(input.sessionID)
+      },
       prompt: async (input: { sessionID: string; text: string }) => {
         prompts.push(input)
       },
@@ -611,13 +701,13 @@ function fakeContext() {
         data: Object.values(sessions).filter((s) => (input?.parentID ?? null) === (s.parentID ?? null)),
       }),
       active: async () => ({ data: { ses_loop: {}, ses_child: {} } }),
-      context: async () => ({ data: [] }),
+      context: async () => ({ data: messages }),
     },
     model: { list: async () => ({ data: [{ providerID: "a", id: "x" }] }) },
   }
   return {
     context: context as unknown as ConstructorParameters<typeof LoopEngine>[0],
-    switched, interrupted, prompts, sessions,
+    switched, interrupted, prompts, sessions, messages, compacted,
   }
 }
 
@@ -635,6 +725,7 @@ function armLoop(engine: LoopEngine, state: PluginState, instanceID: string, ses
     startedAt: Date.now(), lastResult: null, owner: instanceID,
     ownerBeatAt: Date.now(), rotations: 0,
     mode, degraded: false, preferredMode: null, consecutiveErrors: 0,
+    turnStartedAt: null,
   }
   engine.track(sessionID, "general")
   // A live turn: the server's own execution-started event is what arms the
@@ -642,7 +733,83 @@ function armLoop(engine: LoopEngine, state: PluginState, instanceID: string, ses
   engine.observe({ type: "session.execution.started", data: { sessionID } })
 }
 
-test("rotation walks the chain once and then stops instead of cycling", () => {
+test("rotation prefers a model that can hold the session's context", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  // a/x ranks higher but its window (32k) cannot hold the 50k session;
+  // b/y is the larger-window candidate.
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x", context: 40_000, scores: { reasoning: 9, code: 9, agentic: 9, general: 9, capability: 9 } }),
+    row({ key: "b/y", providerID: "b", id: "y", context: 200_000, scores: { reasoning: 8, code: 8, agentic: 8, general: 8, capability: 8 } }),
+  ])
+  injectCatalogue(engine, cat)
+  state.mode = "free"
+  armLoop(engine, state, "i1", "ses_loop")
+  fakes.messages.push({ type: "assistant", tokens: { input: 50_000 } })
+
+  const outcome = await engine.rotate("ses_loop", "rate")
+  assert.equal(outcome, "moved")
+  assert.match(engine.status!.lastResult!, /rotated general to b\/y/)
+})
+
+test("an unloaded local model assumes the daemon cap, so a large session compacts before landing on the local tail", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  // ollama/q has a huge native window (3.5M) but is not loaded, so the served
+  // window is the unknown-cap guard (64k) — a 100k session must not switch
+  // to it without compacting.
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x", context: 40_000, scores: { reasoning: 8, code: 8, agentic: 8, general: 8, capability: 8 } }),
+    row({ key: "ollama/q", providerID: "ollama", id: "q", local: true, context: 3_500_000, scores: { reasoning: 9, code: 9, agentic: 9, general: 9, capability: 9 } }),
+  ])
+  injectCatalogue(engine, cat)
+  state.mode = "free"
+  armLoop(engine, state, "i1", "ses_loop")
+  fakes.messages.push({ type: "assistant", tokens: { input: 100_000 } })
+
+  const outcome = await engine.rotate("ses_loop", "rate")
+  assert.equal(outcome, "moved")
+  assert.deepEqual(fakes.compacted, ["ses_loop"], "the session is compacted before any local switch")
+})
+
+test("rotation compacts the session first when no candidate fits the context", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x", context: 40_000, scores: { reasoning: 7, code: 7, agentic: 7, general: 7, capability: 7 } }),
+    row({ key: "b/y", providerID: "b", id: "y", context: 48_000, scores: { reasoning: 6, code: 6, agentic: 6, general: 6, capability: 6 } }),
+  ])
+  injectCatalogue(engine, cat)
+  state.mode = "free"
+  armLoop(engine, state, "i1", "ses_loop")
+  fakes.messages.push({ type: "assistant", tokens: { input: 50_000 } })
+
+  const outcome = await engine.rotate("ses_loop", "rate")
+  assert.equal(outcome, "moved")
+  assert.deepEqual(fakes.compacted, ["ses_loop"], "the session is compacted before the switch")
+  assert.match(engine.status!.lastResult!, /rotated general to a\/x/)
+})
+
+test("refresh does not switch the loop session onto a window too small for it", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x", context: 40_000, scores: { reasoning: 9, code: 9, agentic: 9, general: 9, capability: 9 } }),
+    row({ key: "b/y", providerID: "b", id: "y", context: 200_000 }),
+  ])
+  injectCatalogue(engine, cat)
+  state.mode = "free"
+  armLoop(engine, state, "i1", "ses_loop")
+  // The session is on the big-window model and holds 50k tokens.
+  engine.observe({
+    type: "session.execution.started",
+    data: { sessionID: "ses_loop", model: { providerID: "b", id: "y" } },
+  })
+  fakes.messages.push({ type: "assistant", tokens: { input: 50_000 } })
+
+  // The plan prefers a/x (higher capability) but its 30k window cannot hold
+  // the conversation; the switch is vetoed and the session stays on b/y.
+  await engine.refresh(false)
+  assert.deepEqual(fakes.switched, [], "no switch to a model too small for the session")
+})
+
+test("rotation walks the chain once and then stops instead of cycling", async () => {
   const { engine, state } = makeEngine("i1")
   const cat = catalogueOf([
     row({ key: "a/x", providerID: "a", id: "x", scores: { reasoning: 7, code: 7, agentic: 7, general: 7, capability: 7 } }),
@@ -653,12 +820,12 @@ test("rotation walks the chain once and then stops instead of cycling", () => {
   state.mode = "free"
   armLoop(engine, state, "i1", "ses_loop")
 
-  assert.equal(engine.rotate("ses_loop", "rate"), "moved")
+  assert.equal(await engine.rotate("ses_loop", "rate"), "moved")
   assert.equal(engine.status!.lastResult, "rotated general to a/x (rate)")
-  assert.equal(engine.rotate("ses_loop", "rate"), "moved")
-  assert.equal(engine.rotate("ses_loop", "rate"), "exhausted")
+  assert.equal(await engine.rotate("ses_loop", "rate"), "moved")
+  assert.equal(await engine.rotate("ses_loop", "rate"), "exhausted")
   // A foreign session is not ours to move.
-  assert.equal(engine.rotate("ses_someone_else", "rate"), "not-ours")
+  assert.equal(await engine.rotate("ses_someone_else", "rate"), "not-ours")
 })
 
 test("a turn-end pair advances once", async () => {
@@ -899,7 +1066,7 @@ test("a foreign owner's loop is not driven", async () => {
   const { engine, state } = makeEngine("i2")
   armLoop(engine, state, "someone-else", "ses_loop")
   assert.equal(engine.ownsLoop("ses_loop"), false)
-  assert.equal(engine.rotate("ses_loop", "test"), "not-ours")
+  assert.equal(await engine.rotate("ses_loop", "test"), "not-ours")
   await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
   assert.equal(state.loops["ses_loop"].iterations, 0)
 })

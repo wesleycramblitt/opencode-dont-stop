@@ -341,6 +341,17 @@ mode and the primary loop; with a session id it changes that loop only.
 `--prompt-file` reads the prompt from disk and errors clearly when the path is
 missing or empty. Any inline text is prepended to the file's contents.
 
+`start` with no prompt restarts the most recent loop with its stored prompt —
+the same full /dont-stop command the original run opened with — so a restarted
+(or fresh) session lands back on the loop with one verb. A loop session that
+is restarted while active is detected on the heartbeat (its message count
+drops) and re-seeded with the full prompt automatically.
+
+Rotations and re-plans only move the loop onto a model whose context window
+can hold the conversation it is about to receive: a candidate too small for
+the session's current usage is skipped, and when nothing fits, the session is
+compacted first (transcript down, work untouched) before the switch.
+
 `update-model-catalogue` rebuilds the catalogue from the live sources —
 models.dev, the local ollama daemon, and Alibaba's inventory when a key is
 resolvable — writes `data/catalogue.json`, then reloads and re-plans. The

@@ -213,10 +213,24 @@ export default {
      * Write a mode request into the state file. The server half reconciles
      * this on its next watch tick, which is the one direction the terminal is
      * allowed to drive.
+     *
+     * A mode change is a control intent, not a status field: the engine that
+     * owns the loop rewrites the whole file on its beats, and a plain
+     * `state.mode` write was reverted by the next beat of any instance whose
+     * memory still said the old mode — "I set cheap and it stayed free". The
+     * sequential intent survives every status write and every instance
+     * applies it to its own memory before persisting again.
      */
     function writeMode(mode: Mode): void {
       const state = readState()
       if (state.mode === mode) return
+      const theirs = readState().intent
+      state.intent = {
+        seq: Math.max(theirs.seq, state.intent.seq) + 1,
+        action: "mode",
+        mode,
+        at: Date.now(),
+      }
       state.mode = mode
       // Bump `updated` so the server half sees the change even though the
       // loop fields are untouched.
@@ -308,6 +322,7 @@ function DontStopFooter(props: { state: PluginState; sessionID: string | null })
             <text fg="green">⟳ {loop!.iterations}</text>
             <text fg="gray">s{loop!.sessionIterations}</text>
             {state.main ? <text fg="gray">{state.main.providerID}/{state.main.id}</text> : null}
+            {loop!.turnStartedAt ? <text fg="brightBlack">working</text> : null}
           </>
         )
       ) : (

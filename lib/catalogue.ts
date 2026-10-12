@@ -447,10 +447,43 @@ export function isFree(m: CatalogueModel): boolean {
 
 /* -------------------------------------------------------- availability mut */
 
+/**
+ * Every catalogue row identified by a `provider/id` key, including variants.
+ *
+ * Cooldowns and availability are keyed `provider/id` with no variant (see the
+ * engine's `modelKeyOf`), while variant rows carry a `#variant` suffix in
+ * their catalogue key. A plain byKey lookup silently misses a variant row,
+ * which left a cooling model inside the ranked chain: the sentence was served
+ * in the state file but the row that matters never heard of it. Matching by
+ * provider/id covers the base row and every variant of it.
+ */
+export function rowsForKey(cat: Catalogue, key: string): CatalogueModel[] {
+  const direct = cat.byKey.get(key)
+  const slash = key.indexOf("/")
+  if (slash <= 0) return direct ? [direct] : []
+  const providerID = key.slice(0, slash)
+  const id = key.slice(slash + 1)
+  // A direct hit is the base row; the provider/id scan below picks it up too,
+  // so collect into a set to avoid returning the same row twice.
+  const out: CatalogueModel[] = []
+  const seen = new Set<string>()
+  if (direct) {
+    out.push(direct)
+    seen.add(direct.key)
+  }
+  const bucket = cat.byProvider.get(providerID)
+  const pool = bucket ?? cat.models
+  for (const m of pool) {
+    if (m.providerID !== providerID || m.id !== id || seen.has(m.key)) continue
+    out.push(m)
+    seen.add(m.key)
+  }
+  return out
+}
+
 /** Mark a model unavailable with a reason. Returns the same catalogue. */
 export function markUnavailable(cat: Catalogue, key: string, reason: string): Catalogue {
-  const model = cat.byKey.get(key)
-  if (model) {
+  for (const model of rowsForKey(cat, key)) {
     model.available = false
     model.availabilityReason = reason
   }
@@ -459,8 +492,7 @@ export function markUnavailable(cat: Catalogue, key: string, reason: string): Ca
 
 /** Restore a model to available. Returns the same catalogue. */
 export function markAvailable(cat: Catalogue, key: string): Catalogue {
-  const model = cat.byKey.get(key)
-  if (model) {
+  for (const model of rowsForKey(cat, key)) {
     model.available = true
     model.availabilityReason = null
   }
@@ -469,15 +501,32 @@ export function markAvailable(cat: Catalogue, key: string): Catalogue {
 
 /** Put a model on cooldown until `until` (epoch ms). */
 export function cooldown(cat: Catalogue, key: string, until: number): Catalogue {
-  const model = cat.byKey.get(key)
-  if (model) model.cooldownUntil = until
+  for (const model of rowsForKey(cat, key)) model.cooldownUntil = until
   return cat
 }
 
 /** Lift a model's cooldown, making it selectable again. */
 export function clearCooldown(cat: Catalogue, key: string): Catalogue {
-  const model = cat.byKey.get(key)
-  if (model) model.cooldownUntil = 0
+  for (const model of rowsForKey(cat, key)) model.cooldownUntil = 0
+  return cat
+}
+
+/**
+ * Re-assert persisted cooldowns onto a catalogue fresh from disk.
+ *
+ * A newly loaded engine knows nothing about runtime cooldowns — the rows on
+ * disk carry `cooldownUntil: 0` — so without this, a model that is still
+ * cooling (a 24h sentence, a spent free quota) is ranked and picked again by
+ * every instance that starts after the failure. That is exactly how "cooling"
+ * models kept cycling through the review loop: a fresh plugin instance
+ * planned against rows that had never heard of the sentence. Safe to call
+ * repeatedly; expired entries are ignored and `expireCooldowns` re-admits
+ * them the same way it always has.
+ */
+export function applyCooldowns(cat: Catalogue, cooldowns: Record<string, number>, now: number): Catalogue {
+  for (const [key, until] of Object.entries(cooldowns)) {
+    if (until > now) cooldown(cat, key, until)
+  }
   return cat
 }
 

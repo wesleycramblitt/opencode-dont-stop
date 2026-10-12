@@ -71,6 +71,13 @@ export interface LoopState {
   preferredMode: Mode | null
   /** Consecutive errors this loop's session survived (reported, never fatal). */
   consecutiveErrors: number
+  /**
+   * When the loop's in-flight turn started (epoch ms), or null when the loop
+   * is between turns. Set when a prompt is sent, cleared when its turn ends —
+   * so the status and footer can say "working" instead of looking hung while
+   * a slow turn (first token on a local model, a long generation) runs.
+   */
+  turnStartedAt: number | null
 }
 
 /** One loop per session, keyed by session id. */
@@ -91,7 +98,9 @@ export interface Loops {
 export interface Intent {
   /** Monotonic across every writer. The highest `seq` is the newest word. */
   seq: number
-  action: "none" | "start" | "halt"
+  action: "none" | "start" | "halt" | "mode"
+  /** The mode a "mode" intent names. */
+  mode?: Mode
   at: number
 }
 
@@ -185,6 +194,7 @@ function loopState(mode: Mode): LoopState {
     degraded: false,
     preferredMode: null,
     consecutiveErrors: 0,
+    turnStartedAt: null,
   }
 }
 
@@ -283,7 +293,14 @@ export function writeState(state: PluginState): void {
     mkdirSync(dirname(file), { recursive: true })
     const existing = readRaw(file)
     const theirs = existing ? parsedIntent(existing) : undefined
-    if (theirs && theirs.seq > state.intent.seq) state.intent = theirs
+    if (theirs && theirs.seq > state.intent.seq) {
+      state.intent = theirs
+      // A newer intent may name a mode this writer has not applied yet.
+      // Adopting the mode here keeps a writer with a stale copy from
+      // reverting the file to an older mode on its next persist — which is
+      // how a TUI mode change "stuck" for one beat and then snapped back.
+      if (theirs.action === "mode" && theirs.mode) state.mode = theirs.mode
+    }
     if (existing !== null && stableEqual(state, existing)) return
     state.updated = Date.now()
     const tmp = `${file}.tmp`
@@ -325,12 +342,15 @@ function stableEqual(state: PluginState, raw: string): boolean {
 /**
  * Issue the next control instruction. Reads the file first so a halt written
  * by another half raises the sequence above it rather than fighting it.
+ *
+ * `mode` is carried only by mode intents; every other action drops it.
  */
-export function bumpIntent(state: PluginState, action: Intent["action"]): Intent {
+export function bumpIntent(state: PluginState, action: Intent["action"], mode?: Mode): Intent {
   const theirs = readState().intent
   state.intent = {
     seq: Math.max(theirs.seq, state.intent.seq) + 1,
     action,
+    ...(action === "mode" && mode ? { mode } : {}),
     at: Date.now(),
   }
   return state.intent
