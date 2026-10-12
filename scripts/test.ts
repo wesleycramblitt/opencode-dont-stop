@@ -11,6 +11,9 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
+import { mkdtempSync, utimesSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 import { eventSignals } from "../lib/events.ts"
 import { SessionClocks } from "../lib/clocks.ts"
@@ -18,7 +21,7 @@ import { classify, actionFor, DEPRECATED_COOLDOWN_MS, PERMANENT_COOLDOWN_MS } fr
 import { meets, loadCatalogue, type Catalogue, type CatalogueModel } from "../lib/catalogue.ts"
 import { rankForMode, profileFor } from "../lib/modes.ts"
 import { measureContext, transcriptFrom, descendantIDs, buildSummary } from "../lib/handoff.ts"
-import { parseAlibabaInventory, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
+import { catalogueRefreshDue, parseAlibabaInventory, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
 import { LoopEngine, COMPLETION_SENTINEL } from "../lib/engine.ts"
 import { initialState, readState, type PluginState } from "../lib/state.ts"
 import { FREE_TIERS } from "../data/free-tiers.ts"
@@ -200,6 +203,38 @@ test("leaving free mode lifts spent quotas but never deprecated models", async (
   await engine.setMode("cheap")
   assert.ok(state.cooldowns["a/x"] === undefined)
   assert.equal(state.cooldowns["b/y"], DEPRECATED_COOLDOWN_MS)
+})
+
+test("a mode degrades only when two different providers are both out of money", async () => {
+  const { engine, state } = makeEngine("i1")
+  const cat = catalogueOf([
+    row({ key: "alibaba/qwen3.7-flash", providerID: "alibaba", id: "qwen3.7-flash" }),
+    row({ key: "opencode/deepseek-v4-flash", providerID: "opencode", id: "deepseek-v4-flash" }),
+  ])
+  injectCatalogue(engine, cat)
+  state.mode = "cheap"
+  armLoop(engine, state, "i1", "ses_loop")
+  const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!
+
+  // One provider out: rotate, but the mode stays put.
+  tracked.model = { providerID: "alibaba", id: "qwen3.7-flash" }
+  await engine.onError({ sessionID: "ses_loop", message: "insufficient funds" })
+  assert.equal(state.mode, "cheap")
+  assert.equal(state.degraded, false)
+
+  // The second provider runs out: cheap -> free, and it stays there.
+  tracked.model = { providerID: "opencode", id: "deepseek-v4-flash" }
+  await engine.onError({ sessionID: "ses_loop", message: "insufficient funds" })
+  assert.equal(state.mode, "free")
+  assert.equal(state.degraded, true)
+
+  // A stale mark from a resettled account no longer counts: alibaba's mark
+  // aged out, so one provider being out is a rotation, not a mode change.
+  state.fundsProviders.alibaba = Date.now() - 25 * 60 * 60 * 1000
+  await engine.setMode("cheap")
+  tracked.model = { providerID: "opencode", id: "deepseek-v4-flash" }
+  await engine.onError({ sessionID: "ses_loop", message: "insufficient funds" })
+  assert.equal(state.mode, "cheap")
 })
 
 /* -------------------------------------------------------------------- catalogue */
@@ -436,6 +471,19 @@ test("credential resolution prefers an override, then env, then the config", () 
   // real source, so this only asserts it does not throw.
   const resolved = resolveAlibabaKey(undefined, process.env.HOME ?? "")
   assert.ok(resolved === null || typeof resolved === "string")
+})
+
+test("the catalogue is refresh-due only after its window, and missing files are due", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dont-stop-cat-"))
+  const file = join(dir, "catalogue.json")
+  assert.equal(catalogueRefreshDue(file), true)              // absent => due
+  writeFileSync(file, "{}")
+  assert.equal(catalogueRefreshDue(file), false)             // fresh => not due
+  const now = Date.now()
+  const old = now - 25 * 60 * 60 * 1000
+  utimesSync(file, new Date(old), new Date(old))
+  assert.equal(catalogueRefreshDue(file), true)              // stale => due
+  assert.equal(catalogueRefreshDue(file, now, 48 * 60 * 60 * 1000), false)  // a wider window defers it
 })
 
 /* --------------------------------------------------------------------- engine */

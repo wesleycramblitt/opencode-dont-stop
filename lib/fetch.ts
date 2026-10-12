@@ -21,7 +21,7 @@
  */
 
 import { execFileSync } from "node:child_process"
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -30,6 +30,31 @@ import { FREE_TIERS } from "../data/free-tiers.ts"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 export const CATALOGUE_FILE = join(HERE, "..", "data", "catalogue.json")
+
+/**
+ * How old the persisted catalogue may be before a heartbeat refreshes it (24h).
+ *
+ * The owner asked (2026-10-12) for the catalogue to look after itself — new
+ * free rows, price changes, retirements — instead of waiting for a manual
+ * `update-model-catalogue`. Alibaba's inventory is the one source a refresh
+ * does not improve without a key; everything else (models.dev, ollama, the
+ * free-tier fold) is picked up on the cadence. The file's own mtime is the
+ * clock: a successful refresh rewrites it, so the check needs no extra state.
+ */
+export const CATALOGUE_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+/** Whether the persisted catalogue predates the refresh window. Missing = due. */
+export function catalogueRefreshDue(
+  file: string,
+  now: number = Date.now(),
+  intervalMs: number = CATALOGUE_REFRESH_INTERVAL_MS,
+): boolean {
+  try {
+    return now - statSync(file).mtimeMs > intervalMs
+  } catch {
+    return true
+  }
+}
 
 export const MODELS_DEV_URL = "https://models.dev/api.json"
 export const OLLAMA_SEARCH_URL = "https://ollama.com/search?o=popular&c=text"
@@ -52,6 +77,19 @@ export const OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
 export const ALIBABA_MODELS_URL =
   process.env.ALIBABA_MODELS_URL ?? "https://dashscope-intl.aliyuncs.com/api/v1/models"
 const ALIBABA_PAGE_SIZE = 100
+
+/**
+ * Whether the Alibaba Model Studio source is in play at all.
+ *
+ * The inventory smoke-tested green on 2026-10-11 (`qwen3.7-flash`,
+ * `qwen3.5-flash`, `deepseek-v4-flash-0731` all answered), and its quota-backed
+ * rows are legitimate `free`-mode candidates: the per-model console allowance
+ * is declared data in `data/free-tiers.ts`, not price, so it counts as a free
+ * sweep member — see `FreeTier` in `lib/catalogue.ts`. `DONT_STOP_ALIBABA=0`
+ * turns the whole source off without an edit; `=1` is the default.
+ */
+const ENV_OVERRIDE = process.env.DONT_STOP_ALIBABA
+export const ALIBABA_ENABLED = ENV_OVERRIDE === undefined ? true : ENV_OVERRIDE !== "0"
 
 /** How many popular ollama models to include. */
 export const TOP_OLLAMA = 100
@@ -1321,7 +1359,7 @@ export function toRow(raw: RawRow, ollamaRank?: number): CatalogueRow {
  */
 export async function fetchCatalogue(options: FetchOptions = {}): Promise<CatalogueDocument> {
   const sourceStats: CatalogueDocument["sources"] = []
-  const raw: RawRow[] = []
+  let raw: RawRow[] = []
   const ranks = new Map<string, number>()
 
   try {
@@ -1343,21 +1381,36 @@ export async function fetchCatalogue(options: FetchOptions = {}): Promise<Catalo
     console.error(`[catalogue] ollama search failed: ${messageOf(error)}`)
   }
 
-  // Alibaba's own inventory. Needs a key; without one the source is skipped
-  // with a note instead of failing the build — models.dev still covers the
-  // provider, just with its older snapshot.
-  try {
-    const entries = await fetchAlibabaInventory(options)
-    const rows = rowsFromAlibaba(entries)
-    raw.push(...rows)
-    if (resolveAlibabaKey(options.alibabaKey)) {
-      sourceStats.push({ id: "alibaba", url: ALIBABA_MODELS_URL, models: rows.length })
-    } else {
-      sourceStats.push({ id: "alibaba", url: ALIBABA_MODELS_URL, models: 0, note: "no ALIBABA_API_KEY configured; skipped" })
+  // Alibaba Model Studio's own inventory. The whole source is switchable
+  // (`ALIBABA_ENABLED`): `DONT_STOP_ALIBABA=0` skips it entirely. Without a
+  // key it is skipped with a note rather than failing the build — models.dev
+  // still covers the provider, just with its older snapshot.
+  if (ALIBABA_ENABLED) {
+    try {
+      const entries = await fetchAlibabaInventory(options)
+      const rows = rowsFromAlibaba(entries)
+      raw.push(...rows)
+      if (resolveAlibabaKey(options.alibabaKey)) {
+        sourceStats.push({ id: "alibaba", url: ALIBABA_MODELS_URL, models: rows.length })
+      } else {
+        sourceStats.push({ id: "alibaba", url: ALIBABA_MODELS_URL, models: 0, note: "no ALIBABA_API_KEY configured; skipped" })
+      }
+    } catch (error) {
+      sourceStats.push({ id: "alibaba", url: ALIBABA_MODELS_URL, models: 0 })
+      console.error(`[catalogue] alibaba inventory failed: ${messageOf(error)}`)
     }
-  } catch (error) {
-    sourceStats.push({ id: "alibaba", url: ALIBABA_MODELS_URL, models: 0 })
-    console.error(`[catalogue] alibaba inventory failed: ${messageOf(error)}`)
+  } else {
+    sourceStats.push({ id: "alibaba", url: ALIBABA_MODELS_URL, models: 0, note: "disabled" })
+  }
+
+  // models.dev carries alibaba/qwen rows too, so an off switch has to drop the
+  // provider rather than only its own inventory — otherwise the cheapest rows
+  // the free sweep picks first are still Alibaba's.
+  if (!ALIBABA_ENABLED) {
+    const before = raw.length
+    raw = raw.filter((row) => row.providerID !== "alibaba")
+    const stat = sourceStats.find((s) => s.id === "alibaba")
+    if (stat) stat.models = before - raw.length
   }
 
   const installed = await localOllama(options)

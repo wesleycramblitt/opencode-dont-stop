@@ -254,7 +254,7 @@ of the sweep after any failure, and a spent promotional quota out **forever**.
 | Kind | Trigger | Retry | Action (base) | In `free` mode |
 | --- | --- | --- | --- | --- |
 | `interrupted` | our own interrupt, a user escape, a cancelled request | — | nothing: not a failure, no cooldown, no rotation | same |
-| `funds` | insufficient balance / quota (opencode and alibaba phrasings), arrears | no | cooldown 1h, degrade to a cheaper mode | cooldown 24h, degrade is a no-op at the floor |
+| `funds` | insufficient balance / quota (opencode and alibaba phrasings), arrears | no | cooldown 1h; degrades a mode **only when two different providers are both out of money** (a single provider out rotates) | cooldown 24h, degrade is a no-op at the floor |
 | `freequota` | "The free quota has been exhausted…" (alibaba promotional allowance) | no | cooldown 1h, rotate | **permanent** exclusion from the sweep (lifted when the mode leaves `free`) |
 | `rate` | 429, rate limit, throttling | no | cooldown 1m, rotate, re-sweep | cooldown 24h |
 | `capability` | model lacks a required capability | no | cooldown 5m, restrict the pool | cooldown 24h |
@@ -285,7 +285,11 @@ In `cheap` mode the chain is the paid rows cheapest-first — today that is
 `alibaba/qwen3.7-flash` ($0.03 input) ahead of `qwen-turbo` / `qwen-flash`
 ($0.05), then `opencode/deepseek-v4-flash` ($0.14) — then the free tail, then
 local. A failure rotates to the next cheapest untried row; the mode itself
-only changes on insufficient funds.
+only changes on insufficient funds, and then only when **both** paid
+providers are out — `fundsProviders` in the state file records which
+providers reported it, and a mark older than 24h stops counting (an account
+that was topped up is not a second provider). Until the bar is met, a funds
+failure is a cooldown and a rotation like any other.
 
 A capability error pins the session to a pool that avoids the missing
 capability (`no-vision`, `no-tools`, `text-only`) rather than merely cooling the
@@ -313,6 +317,18 @@ models.dev, the local ollama daemon, and Alibaba's inventory when a key is
 resolvable — writes `data/catalogue.json`, then reloads and re-plans. The
 equivalent CLI step is `npx tsx scripts/update-catalogue.ts`, which adds
 `--dry-run`, `--table`, and `--alibaba-key`.
+
+**The catalogue also refreshes itself** (owner, 2026-10-12): when
+`data/catalogue.json` is older than 24 hours the heartbeat rebuilds it from
+the same sources, reloads it, and re-applies the plan — so new free rows,
+price changes and retirements reach the loop with no manual command. The
+file's mtime is the clock and a successful refresh rewrites the file, so the
+check needs no extra state; a failed fetch (network down, a source error)
+keeps the current catalogue and tries again on the next beat; one fetch runs
+at a time. `DONT_STOP_CATALOGUE_REFRESH_HOURS` overrides the 24h cadence.
+Alibaba's inventory is the one source a refresh does not improve without a
+key — the declared free-tier table (`data/free-tiers.ts`) is still the
+authority for quota-backed rows.
 
 ## Disabling
 

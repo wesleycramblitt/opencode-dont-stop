@@ -84,6 +84,15 @@ export const FREE_MODEL_TIMEOUT_MS = 24 * 60 * 60 * 1000
 export const PERMANENT_COOLDOWN_MS = Number.MAX_SAFE_INTEGER
 
 /**
+ * How long an insufficient-funds mark on one provider stays meaningful (24h).
+ *
+ * The rule for a mode change is two providers out at once; a mark older than
+ * this is a memory of an account that may have been topped up since, so it
+ * stops counting toward the second provider.
+ */
+export const FUNDS_PROVIDER_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/**
  * A model the provider says is deprecated is out everywhere, permanently.
  *
  * Distinct from the free-quota sentinel on purpose: a spent quota is a fact

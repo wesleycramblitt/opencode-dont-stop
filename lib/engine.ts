@@ -47,7 +47,7 @@ import {
   type AgentKind,
   type TaskProfile,
 } from "./modes.ts"
-import { actionFor, classify, PERMANENT_COOLDOWN_MS, type ClassifiedError, type ErrorAction } from "./errors.ts"
+import { actionFor, classify, FUNDS_PROVIDER_WINDOW_MS, PERMANENT_COOLDOWN_MS, type ClassifiedError, type ErrorAction } from "./errors.ts"
 import { ClockSet, DEFAULT_CLOCKS, type ClockOptions } from "./clocks.ts"
 import {
   DEFAULT_HANDOFF_THRESHOLD,
@@ -712,8 +712,10 @@ export class LoopEngine {
       }
     }
 
-    // Rotate past any model whose cooldown has expired and re-sweep.
+    // Rotate past any model whose cooldown has expired and re-sweep; stale
+    // funds marks age out the same way.
     this.expireCooldowns()
+    this.expireFundsMarks()
     this.emit()
   }
 
@@ -919,6 +921,35 @@ export class LoopEngine {
     await this.stop("loop orphaned: the instance running it is gone")
   }
 
+  /**
+   * Whether two different paid providers are both out of money, right now.
+   *
+   * Marks older than the window are stale — an account resettled is a mark
+   * that no longer means anything — and are dropped in the same pass.
+   */
+  private fundsShortfall(): boolean {
+    const now = Date.now()
+    const window = FUNDS_PROVIDER_WINDOW_MS
+    let distinct = 0
+    for (const [provider, at] of Object.entries(this.state.fundsProviders)) {
+      if (now - at > window) {
+        delete this.state.fundsProviders[provider]
+        continue
+      }
+      distinct += 1
+    }
+    return distinct >= 2
+  }
+
+  /** Drop insufficient-funds marks that have outlived their window. */
+  private expireFundsMarks(): void {
+    const now = Date.now()
+    const window = FUNDS_PROVIDER_WINDOW_MS
+    for (const [provider, at] of Object.entries(this.state.fundsProviders)) {
+      if (now - at > window) delete this.state.fundsProviders[provider]
+    }
+  }
+
   /* ---------------------------------------------------------------- errors */
 
   /**
@@ -974,8 +1005,24 @@ export class LoopEngine {
       this.log.info(`restricted pool for ${agent}: ${action.restrict}`)
     }
 
+    // An insufficient-funds failure is marked per PROVIDER (owner, 2026-10-12):
+    // the account may still be able to pay one of its paid providers, and a
+    // single provider being out of money is a rotation, not a mode change.
+    // The mode moves only when two different providers are both out.
+    if (classified.kind === "funds" && record?.model) {
+      this.state.fundsProviders[record.model.providerID] = Date.now()
+    }
+
     if (action.degrade) {
-      await this.degradeMode(action.reason)
+      // Only `funds` asks to degrade, and even it must clear the two-provider
+      // bar. A funds failure from the loop's own model with no other provider
+      // marked fresh keeps the mode and rotates instead.
+      if (classified.kind !== "funds" || this.fundsShortfall()) {
+        await this.degradeMode(action.reason)
+      } else {
+        const provider = record?.model?.providerID ?? "unknown"
+        this.log.info(`funds failure on ${provider} only; not degrading until a second provider is out of money`)
+      }
     }
 
     if (this.consecutive(classified)) {

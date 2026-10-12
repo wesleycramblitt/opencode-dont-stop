@@ -17,7 +17,7 @@ import { basename, dirname } from "node:path"
 import { LoopEngine } from "./lib/engine.ts"
 import { createLogger } from "./lib/log.ts"
 import { eventData, eventSignals, TURN_END_TYPES, type SessionEvent } from "./lib/events.ts"
-import { fetchCatalogue, writeCatalogue } from "./lib/fetch.ts"
+import { catalogueRefreshDue, CATALOGUE_FILE, fetchCatalogue, writeCatalogue } from "./lib/fetch.ts"
 import {
   MODES,
   dontStopDisabled,
@@ -219,8 +219,40 @@ export default {
     // Discovery must not hold up startup; the engine applies the plan the
     // moment it lands.
     const heartbeat = setInterval(() => {
+      void maybeRefreshCatalogue().catch((error) => log.warn(`catalogue refresh failed: ${messageOf(error)}`))
       void engine.beat().catch((error) => log.warn(`heartbeat failed: ${messageOf(error)}`))
     }, DEFAULT_CLOCKS.intervalMs)
+
+    // The catalogue refreshes itself on a cadence (owner, 2026-10-12): a stale
+    // file is rebuilt from the live sources, reloaded into the engine, and the
+    // plan re-applied — so new free rows, price changes and retirements reach
+    // the loop without a manual command. The file's mtime is the clock, a
+    // failed fetch keeps the current catalogue, and one fetch at a time.
+    let catalogueFetching = false
+    const refreshHours = Number(process.env.DONT_STOP_CATALOGUE_REFRESH_HOURS)
+    const refreshIntervalMs = Number.isFinite(refreshHours) && refreshHours > 0
+      ? refreshHours * 60 * 60 * 1000
+      : undefined
+    async function maybeRefreshCatalogue(): Promise<void> {
+      if (catalogueFetching) return
+      if (!catalogueRefreshDue(CATALOGUE_FILE, Date.now(), refreshIntervalMs)) return
+      catalogueFetching = true
+      try {
+        log.info("catalogue is stale; refreshing automatically")
+        const document = await fetchCatalogue()
+        writeCatalogue(document)
+        await engine.discover()
+        await engine.refresh(true)
+        log.info("automatic catalogue refresh applied")
+        persist()
+      } catch (error) {
+        // A failed refresh keeps the file it failed to replace: the loop
+        // plans against the old catalogue, which is stale but working.
+        log.warn(`automatic catalogue refresh failed: ${messageOf(error)}; keeping the current catalogue`)
+      } finally {
+        catalogueFetching = false
+      }
+    }
 
     void engine
       .discover()

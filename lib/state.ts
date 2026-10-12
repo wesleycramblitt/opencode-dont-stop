@@ -72,6 +72,17 @@ export interface Cooldowns {
   [key: string]: number
 }
 
+/**
+ * Per-provider insufficient-funds markers: providerID -> epoch ms of the
+ * newest funds failure seen on that provider's model. A mode degrades only
+ * when two *different* paid providers are both marked fresh — the owner's
+ * rule (2026-10-12) is that one provider being out of money is a rotation,
+ * not a mode change.
+ */
+export interface FundsProviders {
+  [providerID: string]: number
+}
+
 export interface PluginState {
   version: number
   mode: Mode
@@ -85,6 +96,8 @@ export interface PluginState {
   /** Per-agent-type model assignments, keyed by agent id. */
   agentModels: Record<string, ModelSlot>
   cooldowns: Cooldowns
+  /** Which providers are known to be out of money, and when (see FundsProviders). */
+  fundsProviders: FundsProviders
   consecutiveErrors: number
   lastEvent: string | null
   log: LogEntry[]
@@ -135,6 +148,7 @@ export function initialState(): PluginState {
     main: null,
     agentModels: {},
     cooldowns: {},
+    fundsProviders: {},
     consecutiveErrors: 0,
     lastEvent: null,
     log: [],
@@ -165,6 +179,7 @@ function mergeState(base: PluginState, patch: Partial<PluginState>): PluginState
   next.intent = { ...base.intent, ...(patch.intent ?? {}) }
   next.agentModels = { ...patch.agentModels }
   next.cooldowns = { ...patch.cooldowns }
+  next.fundsProviders = { ...patch.fundsProviders }
   next.log = [...(patch.log ?? [])]
   return next
 }
