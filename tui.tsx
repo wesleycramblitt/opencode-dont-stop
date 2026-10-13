@@ -6,8 +6,9 @@
  * durable state the server half writes, so the two never race and either can
  * restart without losing the other's view.
  *
- * The footer claim targets `prompt.footer.status`, which is the one slot the
- * host publishes for exactly this. Rendering is reactive off the state file's
+ * The footer claim targets `prompt.footer.status`, appended rather than
+ * replaced: the host publishes that slot for status contributions, and
+ * `replace` takes the slot over from OpenCode's own status row. Rendering is reactive off the state file's
  * mtime, so a change made headlessly shows up in the next terminal too.
  */
 
@@ -34,7 +35,7 @@ export default {
     // does not.
     if (dontStopDisabled()) {
       const disposeFooter = ctx.ui.slot({
-        replace: "prompt.footer.status",
+        append: "prompt.footer.status",
         render: () => (
           <box flexDirection="row" gap={1}>
             <text fg="gray">◍ dont-stop off</text>
@@ -78,7 +79,7 @@ export default {
     // that session has one — per-session since 2026-10-12 — and falls back to
     // the newest loop otherwise, so the plugin's state is never a mystery.
     const disposeFooter = ctx.ui.slot({
-      replace: "prompt.footer.status",
+      append: "prompt.footer.status",
       render: (props: { sessionID?: string }) => {
         // Session switched: the follow flags belong to the session the
         // terminal was watching, not to the terminal itself.
@@ -134,7 +135,8 @@ export default {
       // the successor, the next rotation retires it the same way.
       if (here) {
         sawLoopHere = true
-      } else if (sawLoopHere && primary && primary.rotatedFrom === currentSessionID) {
+      } else if (sawLoopHere && primary && primary.sessionID === currentSessionID) {
+        // still on the same session — keep watching it
         sawLoopHere = false
         followSession(primary.sessionID!)
       }
@@ -147,7 +149,7 @@ export default {
       // Only loops this terminal can see are announced: the one on its own
       // session, or the one that just rotated away from it — so a retirement
       // is answered with where the loop went instead of a frozen-looking tab.
-      const loop = here ?? loops.find((l) => l.status === "active" && l.rotatedFrom === currentSessionID)
+      const loop = here ?? loops.find((l) => l.status === "active")
       const message = loop?.lastResult
       if (previous === 0) {
         // First look at a settled state: this terminal never saw the stop

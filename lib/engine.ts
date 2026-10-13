@@ -1720,16 +1720,12 @@ export class LoopEngine {
         this.log.warn(`${loop.consecutiveErrors} consecutive errors and continuing`)
       }
 
-      // Rotate when one is due — a boundary signal after real work, the
-      // session's turn budget, or context pressure. This is deliberately after
-      // the boundary read and before the next prompt: rotating mid-turn would
-      // destroy the work in flight, and it is only safe once the session has
-      // been idle long enough to know no subagent is still writing into it.
-      const pending = this.pendingRotation.get(sessionID)
-      const reason = pending ?? (await this.rotationReason(sessionID, loop, boundary))
-      if (reason) {
-        const rotated = await this.rotateSession(sessionID, reason)
-        if (rotated) return
+      // Compact when the step budget is exceeded — keep one session,
+      // trim context, rather than rotating to a new session.
+      if (loop.sessionIterations >= this.sessionSteps) {
+        await this.compactSession(sessionID)
+        loop.sessionIterations = 0
+        this.log.info(`compacted ${sessionID}: step budget exceeded, reset sessionIterations`)
       }
 
       // Re-plan before continuing, so the next turn runs on the current best
@@ -1746,10 +1742,7 @@ export class LoopEngine {
       // rides along too, so a claim is visible in the status after the turn
       // settles rather than only in the log.
       const note = claimed ? "completion claimed, " : checkpointed ? "task boundary claimed, " : ""
-      const deferred = this.pendingRotation.has(sessionID)
-        ? ` (rotation deferred: ${this.pendingRotation.get(sessionID)})`
-        : ""
-      loop.lastResult = `iteration ${iteration} done; ${note}continuing${deferred}`
+      loop.lastResult = `iteration ${iteration} done; ${note}continuing`
       this.log.info(`loop iteration ${iteration} complete; continuing`)
       this.emit()
     } catch (error) {
@@ -1835,11 +1828,11 @@ export class LoopEngine {
   }
 
   /**
- * The successor session's title: the loop's task, then its session number.
+ * The loop's title: the first substantial line of its prompt.
  *
  * The task label is the first substantial line of the loop prompt, so a loop
  * whose prompt names its work ("Task 1 changing the widget") titles its
- * sessions "Task 1 changing the widget · loop 3". A leading mode line
+ * session "Task 1 changing the widget". A leading mode line
  * ("mode free") is skipped — it is policy, not task.
  */
 private rotationTitle(loop: LoopState): string {
@@ -1848,7 +1841,7 @@ private rotationTitle(loop: LoopState): string {
     .map((l) => l.trim())
     .filter((l) => l.length > 0)
   const task = lines.find((l) => !/^mode\s+\w+$/i.test(l)) ?? "loop"
-  return `${task.slice(0, 70)} · loop ${(loop.sessionNumber ?? 1) + 1}`
+  return task.slice(0, 70)
 }
 
 /** The seed for a rotated session: the loop's own prompt, plus the protocol. */
@@ -1872,65 +1865,6 @@ private rotationTitle(loop: LoopState): string {
    * the work is on disk and the seed says so. A deferral is remembered and
    * retried on the next turn end.
    */
-  private async rotateSession(sessionID: string, reason: string): Promise<boolean> {
-    const loop = this.loopFor(sessionID)
-    if (!loop) return false
-    const record = this.tracked.get(sessionID)
-
-    const result = await rotate(this.ctx as unknown as RotationContext, {
-      sessionID,
-      seed: this.rotationSeed(loop.prompt),
-      agent: record?.agent,
-      title: this.rotationTitle(loop),
-    })
-
-    if (!result.rotated) {
-      this.pendingRotation.set(sessionID, reason)
-      loop.lastResult = `rotation deferred (${reason}): ${result.deferred ?? "unknown"}`
-      this.log.warn(`rotation deferred on ${sessionID} (${reason}): ${result.deferred ?? "unknown"}`)
-      this.emit()
-      return false
-    }
-
-    // The loop record MOVES to the new key: per-session loops are keyed by
-    // session, and the loop's identity is the work, not the session id.
-    // `iterations` is the loop's and carries; per-session metrics start over.
-    const turns = loop.sessionIterations
-    const newSessionID = result.newSessionID!
-    this.untrack(sessionID)
-    this.track(newSessionID, record?.agent ?? "general")
-    delete this.state.loops[sessionID]
-    const next: LoopState = {
-      ...loop,
-      sessionID: newSessionID,
-      rotatedFrom: sessionID,
-      sessionNumber: (loop.sessionNumber ?? 1) + 1,
-      sessionIterations: 0,
-      lastResult: `rotated to ${newSessionID} after ${turns} turns (${reason})`,
-    }
-    this.state.loops[newSessionID] = next
-    if (result.deletedOld === false) {
-      this.log.warn(
-        `retired session ${sessionID} could not be deleted; it stays idle` +
-          (result.deleteError ? `: ${result.deleteError}` : ""),
-      )
-    }
-    // The seed prompt is the successor's opening turn, so arm it here, or the
-    // first turn-end event would be a duplicate ending and the loop would
-    // stand down. The seed is also a turn in flight, and its message count is
-    // the restart-detector's baseline for the new session.
-    this.armedSessions.add(newSessionID)
-    next.turnStartedAt = Date.now()
-    const count = await this.messageCount(newSessionID)
-    if (count >= 0) this.messageCounts.set(newSessionID, count)
-    this.redrives.delete(sessionID)
-    this.failedTurns.delete(sessionID)
-    this.pendingRotation.delete(sessionID)
-    this.clocks.clocksFor(newSessionID).start(Date.now())
-    this.log.info(`session rotated on ${sessionID} after ${turns} turns (${reason}) -> ${newSessionID}`)
-    this.emit()
-    return true
-  }
 
   /** The context window of the session's current model, or 0 when unknown. */
   private async contextLimitFor(sessionID: string): Promise<number> {
@@ -1981,7 +1915,6 @@ private rotationTitle(loop: LoopState): string {
     this.state.loops[sessionID] = {
       status: "active",
       sessionID,
-      rotatedFrom: null,
       sessionNumber: 1,
       prompt,
       // A start is a fresh run: the iteration counter belongs to the run,
@@ -2085,10 +2018,8 @@ private rotationTitle(loop: LoopState): string {
         loop.turnStartedAt = null
       }
       this.redrives.delete(sid)
-      this.pendingRotation.delete(sid)
       // The loop keeps its sessionID so a later `start` finds its home; the
       // owner is what says nobody drives it right now.
-      this.failedTurns.delete(sid)
       this.armedSessions.delete(sid)
       this.hangInterrupts.delete(sid)
 

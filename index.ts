@@ -181,13 +181,25 @@ export default {
     // on the sequenced intent rather than the status fields, so a request
     // cannot be lost to a status write that happened to land after it.
     let settle: ReturnType<typeof setTimeout> | undefined
-    const watcher = watch(dirname(statePath()), (_event, filename) => {
-      if (filename && basename(filename) !== basename(statePath())) return
-      clearTimeout(settle)
-      settle = setTimeout(() => {
-        void reconcileFromFile()
-      }, 150)
-    })
+    // `fs.watch` throws synchronously when the directory is absent, and this
+    // runs inside `setup`, so an unguarded call takes the whole plugin down
+    // with it (`failed to load plugin ... ENOENT ... watch`). The state
+    // directory is part of this plugin's own home, so treat it as optional and
+    // lose only the file-watching channel rather than the engine.
+    let watcher: ReturnType<typeof watch> | undefined
+    try {
+      watcher = watch(dirname(statePath()), (_event, filename) => {
+        if (filename && basename(filename) !== basename(statePath())) return
+        clearTimeout(settle)
+        settle = setTimeout(() => {
+          void reconcileFromFile()
+        }, 150)
+      })
+    } catch (error) {
+      log.warn(
+        `not watching ${dirname(statePath())}: ${messageOf(error)}; mode changes from the file need a restart`,
+      )
+    }
 
     async function reconcileFromFile(): Promise<void> {
       const incoming = readState()
@@ -289,7 +301,7 @@ export default {
 
     return () => {
       abort.abort()
-      watcher.close()
+      watcher?.close()
       clearTimeout(settle)
       clearInterval(heartbeat)
       for (const timer of timers) clearTimeout(timer)

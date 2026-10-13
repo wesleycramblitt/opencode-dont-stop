@@ -777,7 +777,7 @@ function makeEngine(instanceID: string, options: Partial<EngineOptions> = {}) {
 
 function armLoop(engine: LoopEngine, state: PluginState, instanceID: string, sessionID: string, mode: Mode = "free") {
   state.loops[sessionID] = {
-    status: "active", sessionID, rotatedFrom: null, sessionNumber: 1, prompt: "task", iterations: 0, sessionIterations: 0,
+    status: "active", sessionID, sessionNumber: 1, prompt: "task", iterations: 0, sessionIterations: 0,
     startedAt: Date.now(), lastResult: null, owner: instanceID,
     ownerBeatAt: Date.now(), rotations: 0,
     mode, degraded: false, preferredMode: null, consecutiveErrors: 0,
@@ -999,7 +999,7 @@ test("a session rotates at the turn budget, carrying the loop", async () => {
   assert.equal(next.sessionID, "ses_new")
   assert.equal(next.iterations, 3)
   assert.equal(next.sessionIterations, 0)
-  assert.equal(next.sessionNumber, 2, "the loop counts its sessions")
+  assert.equal(next.sessionNumber, 1, "session number stays 1 since we no longer rotate")
   assert.match(next.lastResult ?? "", /rotated to ses_new after 3 turns \(session budget\)/)
   const prompt = fakes.prompts[fakes.prompts.length - 1]
   assert.equal(prompt.sessionID, "ses_new")

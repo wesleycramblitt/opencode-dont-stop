@@ -35,14 +35,8 @@ export interface LoopState {
   status: "active" | "stopped"
   sessionID: string | null
   /**
-   * The session this loop rotated away FROM, so a terminal sitting on the
-   * retired session can announce where the loop went instead of watching a
-   * quietly frozen conversation. Absent until the first rotation.
-   */
-  rotatedFrom: string | null
-  /**
-   * How many sessions the loop has lived on (1 = the session it started in).
-   * Carried across rotations and used in the successor's title ("loop N").
+   * The loop runs in a single session. Kept for backwards compatibility;
+   * always 1 since we no longer rotate sessions.
    */
   sessionNumber: number
   prompt: string
@@ -193,7 +187,6 @@ function loopState(mode: Mode): LoopState {
   return {
     status: "stopped",
     sessionID: null,
-    rotatedFrom: null,
     sessionNumber: 1,
     prompt: "",
     iterations: 0,
