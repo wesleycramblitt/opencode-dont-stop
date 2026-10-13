@@ -391,16 +391,15 @@ export function runCommand(raw: string, env: CommandEnv): string {
     if (!cleanedPrompt) {
       return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
     }
-    // Restarting a loop: with no text, the most recent loop's stored prompt is re-used — the same full /dont-stop command the original
-      // run opened with. This is what makes a restarted (or fresh) session
-      // land back on the loop with one verb instead of a re-paste.
       const prior = engine.primaryLoop()
       if (prior?.prompt) {
         void engine.start(target, prior.prompt).then(persist)
         return `loop restarted on ${target} with the stored prompt (mode: ${state.mode})`
       }
-      return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
-    }
+      else {
+          return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
+      }
+
     void engine.start(target, prompt).then(persist)
     return `loop started on ${target} (mode: ${state.mode})`
   }
