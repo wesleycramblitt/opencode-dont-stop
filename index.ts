@@ -397,11 +397,9 @@ export function runCommand(raw: string, env: CommandEnv): string {
         return `loop restarted on ${target} with the stored prompt (mode: ${state.mode})`
       }
       else {
-          return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
+        void engine.start(target, prompt).then(persist)
+        return `loop started on ${target} (mode: ${state.mode})`
       }
-
-    void engine.start(target, prompt).then(persist)
-    return `loop started on ${target} (mode: ${state.mode})`
   }
 
   if (verb === "stop") {
