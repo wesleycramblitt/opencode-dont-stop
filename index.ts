@@ -33,19 +33,30 @@ import { DEFAULT_CLOCKS } from "./lib/clocks.ts"
 
 /* -------------------------------------------------------------------- types */
 
-/** Where a prompt file may live, resolved against the cwd. */
-function resolvePromptFile(path: string): string {
+/**
+ * Where a prompt file may live.
+ *
+ * A relative path resolves against the location the command was run in — the
+ * directory the user sees in the TUI — not the server's process cwd: the
+ * plugin runs in the shared server, whose cwd is wherever the service was
+ * launched. That mismatch made `--prompt-file prompts/loop.md` look under
+ * `/home/wes` instead of the project, fail to find the file, and leave the
+ * palette with nothing to show, because a command's return value is discarded
+ * in v2. `process.cwd()` remains the last resort when the runtime exposes no
+ * location.
+ */
+function resolvePromptFile(path: string, baseDir?: string): string {
   const home = process.env.HOME ?? ""
   if (path.startsWith("~/")) return `${home}${path.slice(1)}`
   if (!path.startsWith("/") && !path.startsWith("~")) {
-    return resolve(process.cwd(), path)
+    return resolve(baseDir ?? process.cwd(), path)
   }
   return path
 }
 
 /** Read a prompt from a file. Throws a descriptive error on failure. */
-function readPromptFile(path: string): string {
-  const resolved = resolvePromptFile(path)
+function readPromptFile(path: string, baseDir?: string): string {
+  const resolved = resolvePromptFile(path, baseDir)
   if (!existsSync(resolved)) {
     throw new Error(`prompt file not found: ${resolved}`)
   }
@@ -105,6 +116,7 @@ export default {
             log,
             persist,
             sessionID: input?.sessionID,
+            baseDir: context.location?.directory,
           })
         },
       })
@@ -327,6 +339,8 @@ interface CommandEnv {
   log: ReturnType<typeof createLogger>
   persist: () => void
   sessionID?: string
+  /** The location the command was run in; the base for relative prompt files. */
+  baseDir?: string
 }
 
 /**
@@ -334,7 +348,7 @@ interface CommandEnv {
  * without a live server, and so the TUI can call the same verbs.
  */
 export function runCommand(raw: string, env: CommandEnv): string {
-  const { state, engine, log, persist, sessionID } = env
+  const { state, engine, log, persist, sessionID, baseDir } = env
   const [verb, ...rest] = raw.trim().split(/\s+/)
 
   if (!verb || verb === "status" || verb === "help") {
@@ -370,8 +384,12 @@ export function runCommand(raw: string, env: CommandEnv): string {
       if (!path) return "usage: dont-stop-set start --prompt-file <path>"
       let prompt: string
       try {
-        prompt = readPromptFile(path)
+        prompt = readPromptFile(path, baseDir)
       } catch (error) {
+        // The return value is discarded by the palette in v2, so a missing or
+        // unreadable file must leave a trace somewhere the user can see it.
+        log.warn(`start --prompt-file failed: ${messageOf(error)}`)
+        persist()
         return `error: ${messageOf(error)}`
       }
       rest.splice(fileIndex, 2)
@@ -386,20 +404,25 @@ export function runCommand(raw: string, env: CommandEnv): string {
     const target = sessionID ?? newestTrackedFor(engine)
     if (!target) return "error: no session to run the loop on"
     const prompt = rest.join(" ").trim()
-    // Strip leading/trailing whitespace and collapse internal whitespace
-    const cleanedPrompt = prompt.replace(/^\s+|\s+$/g, '').replace(/\s+/g, ' ')
-    if (!cleanedPrompt) {
-      return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
+    // A start WITH text runs that text. Only an empty start means "resume":
+    // the most recent loop's stored prompt is re-used, so a restarted (or
+    // fresh) session lands back on the loop with one verb. Checking the
+    // stored prompt first is what made `start <new prompt>` inject the
+    // PREVIOUS loop's prompt — and an empty `start` inject nothing at all —
+    // while the palette showed no error, because a command's return value is
+    // discarded in v2.
+    if (prompt) {
+      void engine.start(target, prompt).then(persist)
+      return `loop started on ${target} (mode: ${state.mode})`
     }
     const prior = engine.primaryLoop()
     if (prior?.prompt) {
       void engine.start(target, prior.prompt).then(persist)
       return `loop restarted on ${target} with the stored prompt (mode: ${state.mode})`
     }
-    else {
-      void engine.start(target, prompt).then(persist)
-      return `loop started on ${target} (mode: ${state.mode})`
-    }
+    log.warn("start had no prompt and no stored loop prompt to resume")
+    persist()
+    return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
   }
 
   if (verb === "stop") {
@@ -547,6 +570,8 @@ interface AgentEditor {
 }
 
 interface PluginServerContext {
+  /** The location this plugin instance is loaded for; the user's working directory. */
+  location?: { directory?: string }
   command: { transform(fn: (editor: { add(input: { name: string; description: string; execute: (input: { prompt?: string | { text?: string }; sessionID?: string }) => Promise<string> | string }): void }) => void): Promise<unknown> }
   agent: { reload(): Promise<unknown> }
   /** v2 events: `{ type, data }`. */
