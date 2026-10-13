@@ -1910,6 +1910,10 @@ private rotationTitle(loop: LoopState): string {
       )
       return
     }
+    // If a loop is stopped, reset it completely so we start fresh.
+    if (existing?.status === "stopped") {
+      this.log.info(`resetting stopped loop ${sessionID} before starting fresh`)
+    }
 
     this.track(sessionID)
     this.state.loops[sessionID] = {

@@ -386,9 +386,12 @@ export function runCommand(raw: string, env: CommandEnv): string {
     const target = sessionID ?? newestTrackedFor(engine)
     if (!target) return "error: no session to run the loop on"
     const prompt = rest.join(" ").trim()
-    if (!prompt) {
-      // Restarting a loop: with no text, the most recent loop's stored
-      // prompt is re-used — the same full /dont-stop command the original
+    // Strip leading/trailing whitespace and collapse internal whitespace
+    const cleanedPrompt = prompt.replace(/^\s+|\s+$/g, '').replace(/\s+/g, ' ')
+    if (!cleanedPrompt) {
+      return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
+    }
+    // Restarting a loop: with no text, the most recent loop's stored prompt is re-used — the same full /dont-stop command the original
       // run opened with. This is what makes a restarted (or fresh) session
       // land back on the loop with one verb instead of a re-paste.
       const prior = engine.primaryLoop()
