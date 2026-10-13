@@ -12,7 +12,7 @@
 
 import { watch } from "node:fs"
 import { existsSync, readFileSync } from "node:fs"
-import { basename, dirname } from "node:path"
+import { basename, dirname, resolve } from "node:path"
 
 import { LoopEngine } from "./lib/engine.ts"
 import { createLogger } from "./lib/log.ts"
@@ -37,6 +37,9 @@ import { DEFAULT_CLOCKS } from "./lib/clocks.ts"
 function resolvePromptFile(path: string): string {
   const home = process.env.HOME ?? ""
   if (path.startsWith("~/")) return `${home}${path.slice(1)}`
+  if (!path.startsWith("/") && !path.startsWith("~")) {
+    return resolve(process.cwd(), path)
+  }
   return path
 }
 
