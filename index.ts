@@ -391,15 +391,15 @@ export function runCommand(raw: string, env: CommandEnv): string {
     if (!cleanedPrompt) {
       return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
     }
-      const prior = engine.primaryLoop()
-      if (prior?.prompt) {
-        void engine.start(target, prior.prompt).then(persist)
-        return `loop restarted on ${target} with the stored prompt (mode: ${state.mode})`
-      }
-      else {
-        void engine.start(target, prompt).then(persist)
-        return `loop started on ${target} (mode: ${state.mode})`
-      }
+    const prior = engine.primaryLoop()
+    if (prior?.prompt) {
+      void engine.start(target, prior.prompt).then(persist)
+      return `loop restarted on ${target} with the stored prompt (mode: ${state.mode})`
+    }
+    else {
+      void engine.start(target, prompt).then(persist)
+      return `loop started on ${target} (mode: ${state.mode})`
+    }
   }
 
   if (verb === "stop") {
