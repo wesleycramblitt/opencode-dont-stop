@@ -26,6 +26,9 @@ import { LoopEngine, CONTINUE_PROMPT, type EngineOptions } from "../lib/engine.t
 import { initialState, readState, type Mode, type PluginState } from "../lib/state.ts"
 import { FREE_TIERS } from "../data/free-tiers.ts"
 
+/** Wait for a real timer (the engine's re-drive timers) to fire. */
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
 /* ------------------------------------------------------- v2 event vocabulary */
 
 test("eventSignals reads v2 payloads from `data`", () => {
@@ -284,6 +287,69 @@ test("a retry scheduled on a free-mode loop cuts the storm: cooldown, rotate, re
   assert.equal(state.loops["ses_loop"].lastResult, "rotated general to b/y (retry-after-network)")
   // The re-drive owns the next prompt, exactly like a hang interrupt.
   assert.ok((engine as unknown as { redrives: Map<string, number> }).redrives.has("ses_loop"))
+  // ...and it follows at the failure delay, not the hang path's 20s: the
+  // storm cut is meant to hand the turn to the next model immediately.
+  const at = (engine as unknown as { redrives: Map<string, number> }).redrives.get("ses_loop")!
+  assert.ok(at - Date.now() <= 2_000, `re-drive scheduled ${at - Date.now()}ms out`)
+})
+
+test("a failed turn re-drives on the freshly rotated model without a heartbeat", async () => {
+  const { engine, state, fakes } = makeEngine("i1", { failureRedriveDelayMs: 40 })
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x" }),
+    row({ key: "b/y", providerID: "b", id: "y" }),
+  ])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!
+  tracked.model = { providerID: "a", id: "x" }
+
+  // The provider failure event first — it is what ends the turn — then the
+  // recovery funnel, exactly as the server entrypoint wires them.
+  engine.observe({ type: "session.error", data: { sessionID: "ses_loop" } })
+  await engine.onError({ sessionID: "ses_loop", message: "rate limit exceeded" })
+
+  // The switch is applied before the prompt (the prompt must not race the
+  // pin), and the re-drive is armed at the failure delay.
+  assert.ok(
+    fakes.switched.some((s) => s.sessionID === "ses_loop" && (s.model as { id: string }).id === "y"),
+    "the new model is pinned on the session",
+  )
+  const at = (engine as unknown as { redrives: Map<string, number> }).redrives.get("ses_loop")!
+  assert.ok(at - Date.now() <= 2_000, "the re-drive follows at the failure delay")
+
+  // No heartbeat: the armed timer alone sends the continue prompt.
+  await sleep(150)
+  const prompt = fakes.prompts.find((p) => p.text === CONTINUE_PROMPT)
+  assert.ok(prompt, "the continue prompt went out on the timer")
+  assert.equal(prompt!.sessionID, "ses_loop")
+})
+
+test("consecutive failures keep walking the chain, each on the failure delay", async () => {
+  const { engine, state, fakes } = makeEngine("i1", { failureRedriveDelayMs: 30 })
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x" }),
+    row({ key: "b/y", providerID: "b", id: "y" }),
+    row({ key: "c/z", providerID: "c", id: "z" }),
+  ])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!
+  tracked.model = { providerID: "a", id: "x" }
+
+  engine.observe({ type: "session.error", data: { sessionID: "ses_loop" } })
+  await engine.onError({ sessionID: "ses_loop", message: "rate limit exceeded" })
+  await sleep(100)
+  engine.observe({ type: "session.error", data: { sessionID: "ses_loop" } })
+  await engine.onError({ sessionID: "ses_loop", message: "rate limit exceeded" })
+  await sleep(100)
+
+  assert.match(state.loops["ses_loop"].lastResult ?? "", /rotated general to c\/z/)
+  assert.equal(
+    fakes.prompts.filter((p) => p.text === CONTINUE_PROMPT).length,
+    2,
+    "each rotation was re-driven on the next model",
+  )
 })
 
 test("paid-mode loops let opencode's own retries finish", async () => {

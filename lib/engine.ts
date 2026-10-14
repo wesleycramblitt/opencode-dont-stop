@@ -104,10 +104,16 @@ export interface EngineOptions {
    */
   hardware?: HardwareProfile
   /**
-   * Delay before re-driving the loop: after cancelling a hung turn, and
-   * before a second attempt on a model that just failed.
+   * Delay before re-driving the loop after cancelling a hung turn: the abort
+   * needs a moment to settle before the next prompt lands.
    */
   redriveDelayMs?: number
+  /**
+   * Delay before re-driving after a *failed* turn. The turn is already over,
+   * so the loop can walk to the next model almost immediately instead of
+   * waiting out the hang-settle delay.
+   */
+  failureRedriveDelayMs?: number
   /** How long a model that hung stays out of the chain. */
   hangCooldownMs?: number
   /**
@@ -159,6 +165,24 @@ export const DEFAULT_REINJECT_EVERY = 10
  * the meantime, the redrive stands down and the normal idle path takes over.
  */
 export const DEFAULT_REDRIVE_DELAY_MS = 20_000
+
+/**
+ * How soon a failed turn is re-driven on the freshly rotated model.
+ *
+ * A failure event means the turn is over, so unlike the hang path there is
+ * nothing to settle: the loop walks to the next model almost immediately.
+ * Sharing the hang path's 20s (plus a heartbeat that could add 30 more) is
+ * what made a five-model walk take minutes — the owner watched the model
+ * switch and then silence until the re-drive's `Continue.` finally arrived.
+ */
+export const DEFAULT_FAILURE_REDRIVE_DELAY_MS = 1_500
+
+/**
+ * How long a re-drive waits before re-checking a session that was still
+ * running when the deadline passed. Short, because the wait is for a turn to
+ * finish settling, not for a provider.
+ */
+export const REDRIVE_POLL_MS = 1_000
 
 /** How long a model that hung stays out of the chain (10 minutes). */
 export const DEFAULT_HANG_COOLDOWN_MS = 10 * 60_000
@@ -272,6 +296,8 @@ export class LoopEngine {
   private retryInterrupts = new Map<string, number>()
   /** Re-drive deadlines per loop session, or absent. */
   private redrives = new Map<string, number>()
+  /** Timers that wake the engine at a re-drive deadline instead of the beat. */
+  private redriveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
   /**
    * This process's identity. Written into the state file as the loop's owner,
@@ -299,6 +325,7 @@ export class LoopEngine {
   private readonly sessionSteps: number
   private readonly reinjectEvery: number
   private readonly redriveDelayMs: number
+  private readonly failureRedriveDelayMs: number
   private readonly hangCooldownMs: number
   private readonly leaseGraceMs: number
   private readonly reseedGraceMs: number
@@ -335,6 +362,7 @@ export class LoopEngine {
     this.sessionSteps = options.sessionSteps ?? DEFAULT_SESSION_STEPS
     this.reinjectEvery = options.reinjectEvery ?? DEFAULT_REINJECT_EVERY
     this.redriveDelayMs = options.redriveDelayMs ?? DEFAULT_REDRIVE_DELAY_MS
+    this.failureRedriveDelayMs = options.failureRedriveDelayMs ?? DEFAULT_FAILURE_REDRIVE_DELAY_MS
     this.hangCooldownMs = options.hangCooldownMs ?? DEFAULT_HANG_COOLDOWN_MS
     this.reseedGraceMs = options.reseedGraceMs ?? DEFAULT_RESEED_GRACE_MS
     this.hardware = options.hardware ?? HARDWARE_4090
@@ -494,7 +522,7 @@ export class LoopEngine {
       const loop = this.loopFor(sessionID)
       if (loop) loop.turnStartedAt = null
       if (ours) return
-      if (!this.redrives.has(sessionID)) this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
+      if (!this.redrives.has(sessionID)) this.scheduleRedrive(sessionID, this.redriveDelayMs)
       return
     }
 
@@ -939,7 +967,7 @@ export class LoopEngine {
       // local fallback is still the chain's tail, so this usually does not
       // happen at all.
       this.log.warn(`no untried model left for ${sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
-      if (!this.redrives.has(sessionID)) this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
+      if (!this.redrives.has(sessionID)) this.scheduleRedrive(sessionID, this.redriveDelayMs)
       this.emit()
       return
     }
@@ -947,36 +975,87 @@ export class LoopEngine {
 
     // An aborted request never emits the idle event the loop is driven by, so
     // without a scheduled re-drive the loop would go silent right here. The
-    // heartbeat picks this up; `maybeRedrive` stands down if a real turn
+    // timer fires at the deadline; `maybeRedrive` stands down if a real turn
     // started in the meantime.
-    this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
+    this.scheduleRedrive(sessionID, this.redriveDelayMs)
     this.emit()
+  }
+
+  /**
+   * Schedule the loop's next re-drive, replacing any pending one.
+   *
+   * The deadline stays in `redrives` (the durable record `beat()` reads), and
+   * a timer wakes the engine at that deadline — the heartbeat is a 30s
+   * cadence, far too slow to walk a chain of broken models. The timer is
+   * unref'd so a pending re-drive never keeps the process alive.
+   */
+  private scheduleRedrive(sessionID: string, delayMs: number): void {
+    this.redrives.set(sessionID, Date.now() + delayMs)
+    this.armRedrive(sessionID, delayMs)
+  }
+
+  /** Arm the one timer that wakes this session's re-drive, replacing any old one. */
+  private armRedrive(sessionID: string, delayMs: number): void {
+    const existing = this.redriveTimers.get(sessionID)
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(() => {
+      this.redriveTimers.delete(sessionID)
+      void this.redriveNow(sessionID).catch(() => {})
+    }, Math.max(delayMs, 0))
+    ;(timer as { unref?: () => void }).unref?.()
+    this.redriveTimers.set(sessionID, timer)
+  }
+
+  /** Drop a scheduled re-drive, deadline and timer together. */
+  private clearRedrive(sessionID: string): void {
+    this.redrives.delete(sessionID)
+    const timer = this.redriveTimers.get(sessionID)
+    if (timer) {
+      clearTimeout(timer)
+      this.redriveTimers.delete(sessionID)
+    }
+  }
+
+  /** Fire a due re-drive; re-arm while it still cannot be sent. */
+  private async redriveNow(sessionID: string): Promise<void> {
+    const pending = await this.maybeRedrive(sessionID)
+    if (!pending) return
+    const at = this.redrives.get(sessionID)
+    if (at === undefined) return
+    // A send failure re-arms at the full settle delay; a session still
+    // finishing its turn is polled on the short tick until it ends.
+    this.armRedrive(sessionID, Math.max(at - Date.now(), REDRIVE_POLL_MS))
   }
 
   /**
    * Re-drive one loop when its last turn was cancelled rather than completed.
    *
-   * Deliberately conservative: it fires once, at the deadline, and only while
-   * the session is genuinely idle — if anything started a turn in the
-   * meantime, the normal idle path owns it and this does nothing. The
-   * deadline is *kept* rather than consumed in that case, so a re-drive
-   * scheduled behind a slow turn is not thrown away.
+   * Deliberately conservative: it fires at the deadline, and only while the
+   * session is genuinely idle — if anything started a turn in the meantime,
+   * the normal idle path owns it and this stands down. The deadline is *kept*
+   * rather than consumed in that case, so a re-drive scheduled behind a slow
+   * turn is not thrown away.
+   *
+   * Returns whether the re-drive is still pending, so the timer can re-arm at
+   * the right moment instead of leaving it to the next heartbeat.
    */
-  private async maybeRedrive(sessionID: string): Promise<void> {
+  private async maybeRedrive(sessionID: string): Promise<boolean> {
     const at = this.redrives.get(sessionID)
-    if (at === undefined || Date.now() < at) return
+    if (at === undefined) return false
+    if (Date.now() < at) return true
 
     if (!this.ownsLoop(sessionID)) {
-      this.redrives.delete(sessionID)
-      return
+      this.clearRedrive(sessionID)
+      return false
     }
-    if (this.clocks.peek(sessionID)?.activity.running) return
+    if (this.clocks.peek(sessionID)?.activity.running) return true
     this.redrives.delete(sessionID)
 
     try {
       this.log.info(`re-driving ${sessionID} after a cancelled turn`)
       await this.sendPrompt(sessionID, CONTINUE_PROMPT)
       this.clocks.clocksFor(sessionID).start(Date.now())
+      return false
     } catch (error) {
       // Not a stop (owner, 2026-10-11): a failed continue does not end the
       // loop, it reschedules one — the session may be mid-teardown or the
@@ -984,6 +1063,7 @@ export class LoopEngine {
       this.log.warn(`re-drive failed on ${sessionID}: ${msg(error)}; will try again`)
       this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
       void this.onError({ sessionID, error, message: msg(error) }).catch(() => {})
+      return true
     }
   }
 
@@ -1047,12 +1127,16 @@ export class LoopEngine {
     const outcome = await this.rotate(sessionID, `retry-after-${classified.kind}`)
     if (outcome !== "moved" && outcome !== "not-ours") {
       this.log.warn(`no untried model left for ${sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
-      if (!this.redrives.has(sessionID)) this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
+      if (!this.redrives.has(sessionID)) this.scheduleRedrive(sessionID, this.redriveDelayMs)
       this.emit()
       return
     }
     current.rotations += 1
-    this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
+    // The interrupted turn will not emit the idle event the loop is driven by,
+    // so the re-drive owes the prompt. It fires at the failure delay — the
+    // turn is already over, and walking a chain of broken models at the
+    // heartbeat's cadence is what made the sweep look stuck.
+    this.scheduleRedrive(sessionID, this.failureRedriveDelayMs)
     this.emit()
   }
 
@@ -1279,7 +1363,7 @@ export class LoopEngine {
       if (!this.tracked.has(sessionID)) this.track(sessionID)
       this.messageCounts.set(sessionID, count)
       this.log.warn(`recovered loop on ${sessionID} left by instance ${disk.owner ?? "none"}; adopting it`)
-      this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
+      this.scheduleRedrive(sessionID, this.redriveDelayMs)
       this.emit()
     }
   }
@@ -1411,7 +1495,10 @@ export class LoopEngine {
     if (action.compact && ownsThis && input.sessionID) {
       const compacted = await this.compactSession(input.sessionID)
       if (compacted) {
-        this.redrives.set(input.sessionID, Date.now() + this.redriveDelayMs)
+        // The compaction lands at the next step boundary, so the continue
+        // prompt is the thing that triggers it — it goes out promptly, not on
+        // the hang-settle delay.
+        this.scheduleRedrive(input.sessionID, this.failureRedriveDelayMs)
         this.emit()
         return action
       }
@@ -1419,7 +1506,7 @@ export class LoopEngine {
       const outcome = await this.rotate(input.sessionID, classified.kind)
       if (outcome !== "moved" && outcome !== "not-ours") {
         this.log.warn(`no untried model left for ${input.sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
-        if (!this.redrives.has(input.sessionID)) this.redrives.set(input.sessionID, Date.now() + this.redriveDelayMs)
+        if (!this.redrives.has(input.sessionID)) this.scheduleRedrive(input.sessionID, this.redriveDelayMs)
       }
       this.emit()
       return action
@@ -1430,7 +1517,7 @@ export class LoopEngine {
       this.log.info(`retrying ${key} once after ${classified.kind} before rotating`)
       // Nothing has changed on the session, so nothing will prompt it: the
       // re-drive is what turns "retry" into an actual second attempt.
-      if (input.sessionID) this.redrives.set(input.sessionID, Date.now() + this.redriveDelayMs)
+      if (input.sessionID) this.scheduleRedrive(input.sessionID, this.failureRedriveDelayMs)
     } else if (action.resweep && input.sessionID && ownsThis) {
       const outcome = await this.rotate(input.sessionID, classified.kind)
       // Not a stop when the chain has nothing left (owner, 2026-10-11): the
@@ -1438,10 +1525,17 @@ export class LoopEngine {
       // that was never ours to make, and quietly does nothing.
       if (outcome !== "moved" && outcome !== "not-ours") {
         this.log.warn(`no untried model left for ${input.sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
-        if (!this.redrives.has(input.sessionID)) this.redrives.set(input.sessionID, Date.now() + this.redriveDelayMs)
+        if (!this.redrives.has(input.sessionID)) this.scheduleRedrive(input.sessionID, this.redriveDelayMs)
         this.emit()
         return action
       }
+      // The rotation landed on a fresh model and the failed turn owes a
+      // prompt. Some failures reach here without the execution-failed ending
+      // that would advance the loop (`session.error` is not a turn-end event),
+      // so the re-drive is scheduled now — at the failure delay, not the
+      // heartbeat's cadence — and walks the chain immediately when the new
+      // model fails too.
+      if (outcome === "moved") this.scheduleRedrive(input.sessionID, this.failureRedriveDelayMs)
     }
 
     this.emit()
@@ -1559,7 +1653,10 @@ export class LoopEngine {
     loop.lastResult = `rotated ${agent} to ${pick.providerID}/${pick.id} (${cause})`
     this.log.info(loop.lastResult)
 
-    void applySessionModels(
+    // Await the switch: the caller's re-drive prompts the session moments
+    // later, and a prompt that races the pin runs on the model we just left —
+    // the rotation would look like it did nothing.
+    await applySessionModels(
       this.ctx as unknown as ApplyContext,
       [{ sessionID, model: record.model }],
       this.log,
@@ -1761,7 +1858,7 @@ export class LoopEngine {
     this.state.loops[sessionID]!.turnStartedAt = null
     // A real turn completed, so any pending re-drive of a cancelled one is
     // stale: this idle event is the driver now.
-    this.redrives.delete(sessionID)
+    this.clearRedrive(sessionID)
     try {
       loop.iterations += 1
       loop.sessionIterations += 1
@@ -1815,6 +1912,9 @@ export class LoopEngine {
     } catch (error) {
       this.log.error(`advance failed on ${sessionID}: ${msg(error)}`)
       loop.consecutiveErrors += 1
+      // The prompt never landed, so nothing else will drive the loop: without
+      // a re-drive it would sit idle until the owner noticed.
+      this.scheduleRedrive(sessionID, this.failureRedriveDelayMs)
       this.emit()
     } finally {
       this.advancing.delete(sessionID)
@@ -1983,7 +2083,7 @@ private rotationTitle(loop: LoopState): string {
     }
     const loop = this.state.loops[sessionID]
     this.failedTurns.delete(sessionID)
-    this.redrives.delete(sessionID)
+    this.clearRedrive(sessionID)
     this.resetEpisode()
     // Announce ownership in the control plane, so every other instance reads
     // this loop as somebody else's and leaves it alone.
@@ -2064,7 +2164,7 @@ private rotationTitle(loop: LoopState): string {
         loop.rotations = 0
         loop.turnStartedAt = null
       }
-      this.redrives.delete(sid)
+      this.clearRedrive(sid)
       // The loop keeps its sessionID so a later `start` finds its home; the
       // owner is what says nobody drives it right now.
       this.armedSessions.delete(sid)

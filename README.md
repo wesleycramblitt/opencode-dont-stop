@@ -245,9 +245,12 @@ it are where the old design spun:
   a request was in flight re-fired every 3 minutes forever.
 - The hung model goes on a 10-minute cooldown, so the chain actually moves
   instead of cycling back to the model that just hung.
-- The loop **re-drives itself** 20s later, because the abort removed the idle
-  event the loop is normally driven by — without that, one hang silently ended
-  the loop's progress while leaving it "active".
+- The loop **re-drives itself** — 20s after a hang interrupt, so the abort
+  settles, and about 1.5s after a failed turn, which is already over — because
+  the abort removed the idle event the loop is normally driven by; without
+  that, one hang silently ended the loop's progress while leaving it "active".
+  A timer fires the re-drive at its deadline; it does not wait for the 30s
+  heartbeat, so a chain of broken models is walked in seconds, not minutes.
 - **Every model gets one try per turn.** Rotation moves to the best-ranked model
   that has not been attempted since the last completed turn, so the chain is
   walked once in rank order and then starts waiting instead of cycling through
@@ -303,9 +306,10 @@ clock was never disarmed, because a retry is activity, not progress. When
 the loop's session schedules a retry in `free` mode, the engine classifies
 the retry's own error, interrupts the turn (the storm never happens),
 cooldowns the model per the policy above, rotates, and re-drives on the
-next untried model. Paid modes let opencode's retries finish: a blip on a
-model you are paying for usually recovers, and a second chance belongs in
-the paid chain.
+next untried model — promptly, on the failure delay, so a sweep of several
+broken endpoints does not spend a heartbeat between each one. Paid modes let
+opencode's retries finish: a blip on a model you are paying for usually
+recovers, and a second chance belongs in the paid chain.
 
 `interrupted` leads the pattern list on purpose. The loop's own hang recovery
 produces exactly this error — "tool interrupted" — and scoring it as an
@@ -432,7 +436,9 @@ what the plugin is doing at any moment; the footer is always visible and
 **reactive** (a Solid signal re-renders it on every state change, including a
 quiet mode switch), and it shows the loop of the session you are in when that
 session has one, else the newest loop. A stopped loop reads `◍ free idle`
-instead of vanishing.
+instead of vanishing. Models serving a cooldown are shown as `cooling N`
+right after the mode (the status command lists their names); the count only
+includes unexpired entries.
 
 ## Layout
 

@@ -376,10 +376,17 @@ function DontStopFooter(props: { state: PluginState; sessionID: string | null })
     state.intent.action === "halt" &&
     state.intent.at > (loop!.startedAt ?? 0)
 
+  // Cooling is shown next to the mode, not at the end of the row: the model
+  // segment is long, and a segment past it is the first thing clipped — which
+  // reads as "cooling went away". Only unexpired entries count, so a stale
+  // state file cannot show a phantom sentence.
+  const cooling = Object.entries(state.cooldowns ?? {}).filter(([, until]) => until > Date.now()).length
+
   return (
     <box flexDirection="row" gap={1}>
       <text fg="magenta">◍</text>
       <text fg="cyan">{mode}{degraded ? "!" : ""}</text>
+      {cooling > 0 ? <text fg="yellow">cooling {cooling}</text> : null}
       {active ? (
         halting ? (
           <text fg="yellow">halting…</text>
@@ -394,9 +401,6 @@ function DontStopFooter(props: { state: PluginState; sessionID: string | null })
       ) : (
         <text fg="gray">idle</text>
       )}
-      {state.cooldowns && Object.keys(state.cooldowns).length > 0 ? (
-        <text fg="yellow">cooling {Object.keys(state.cooldowns).length}</text>
-      ) : null}
     </box>
   )
 }
