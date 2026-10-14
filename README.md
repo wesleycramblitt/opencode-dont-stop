@@ -251,6 +251,9 @@ it are where the old design spun:
   that, one hang silently ended the loop's progress while leaving it "active".
   A timer fires the re-drive at its deadline; it does not wait for the 30s
   heartbeat, so a chain of broken models is walked in seconds, not minutes.
+  The re-drive restates the full mission (the aborted turn was carrying it)
+  unless it is the same-model retry of a transient failure, which keeps the
+  short nudge.
 - **Every model gets one try per turn.** Rotation moves to the best-ranked model
   that has not been attempted since the last completed turn, so the chain is
   walked once in rank order and then starts waiting instead of cycling through
@@ -490,9 +493,12 @@ session.execution.*        -> advance()  (only in the owning instance)
   if the turn merely errored into idleness, the budget survives it
   if the step budget is hit -> compact the transcript (work untouched)
   re-plan                  -> re-rank, sweep for a better/available model, switch
-  send the next prompt     -> session goes busy, hang clock re-arms; most turns
-                              get a short nudge, and every N turns (and right
-                              after a compaction) the full mission is restated
+  send the next prompt     -> session goes busy, hang clock re-arms; a turn
+                              with tool work gets a short nudge, while the
+                              full mission is restated after a compaction, on
+                              the reinject cadence, when a turn used no tool,
+                              and on every re-drive after an interruption,
+                              failure or restart
 ```
 
 ### Ownership and halting
@@ -552,12 +558,18 @@ judgements wrong (one declared a review-and-build sweep complete after
 compiling task files but before building anything), and an oracle token only
 invited a model that had lost the mission to park on it.
 
-Instead the loop **keeps the mission in front of the model**. Most turns get a
-short nudge ("Continue."); every `reinjectEvery` turns (10 by default), and
-immediately after a step-budget compaction, the full opening prompt is
-restated. That is what fixes the "finished a few tasks and sat still" failure:
-the opening instructions age out of attention and compaction summarizes them
-away, so the one guaranteed-fresh message is the one that carries the mission.
+Instead the loop **keeps the mission in front of the model**. A turn that used
+a tool gets a short nudge ("Continue."); otherwise the full opening prompt is
+restated — after a compaction, on the `reinjectEvery` cadence (10 turns by
+default, counted from the last restatement), when the turn that just ended
+used no tool at all (the model talking about the task instead of doing it),
+and on every re-drive after an interruption, failure or restart, where the
+aborted request took the mission out of the model's immediate attention. The
+one re-drive that keeps the short nudge is the same-model retry of a transient
+failure, whose request is already the last thing in the transcript. That is
+what fixes the "finished a few tasks and sat still" failure: the opening
+instructions age out of attention and compaction summarizes them away, so the
+message that carries the mission has to be the freshest one.
 
 Nothing is terminal: the iteration budget, the consecutive-error budget, an
 exhausted chain and three interrupts are all reported but never stop — the

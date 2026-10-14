@@ -93,7 +93,9 @@ export interface EngineOptions {
   sessionSteps?: number
   /** How often to re-inject the full loop prompt into an active session.
    *  Reinjection keeps the mission in front of the model once per-turn
-   *  instructions age out of attention (or get summarized by compaction). */
+   *  instructions age out of attention (or get summarized by compaction).
+   *  The countdown measures turns since the last restatement, wherever that
+   *  happened — cadence, stagnant turn, or a re-drive. */
   reinjectEvery?: number
   /** Identifies this process as the loop's owner. Generated when omitted. */
   instanceID?: string
@@ -143,12 +145,15 @@ export const DEFAULT_MAX_ITERATIONS = 100
 export const DEFAULT_SESSION_STEPS = 30
 
 /**
- * How many turns between full-prompt reinjections.
+ * How many turns between scheduled full-prompt reinjections.
  *
  * The model drifts once the opening instructions age out of attention or get
- * summarized by compaction, so the mission is restated on this cadence (and
- * immediately after a compaction). Between reinjections a short nudge is
- * enough while the context still holds the task.
+ * summarized by compaction, so the mission is restated on this cadence — and
+ * sooner when a turn ends with no tool activity, when a compaction just ran,
+ * or when a re-drive follows an interrupt, failure or restart. The countdown
+ * measures turns since the last restatement, so those earlier triggers start
+ * it over. Between restatements a short nudge is enough while the context
+ * still holds the task.
  */
 export const DEFAULT_REINJECT_EVERY = 10
 
@@ -173,7 +178,7 @@ export const DEFAULT_REDRIVE_DELAY_MS = 20_000
  * nothing to settle: the loop walks to the next model almost immediately.
  * Sharing the hang path's 20s (plus a heartbeat that could add 30 more) is
  * what made a five-model walk take minutes — the owner watched the model
- * switch and then silence until the re-drive's `Continue.` finally arrived.
+ * switch and then silence until the re-drive's prompt finally arrived.
  */
 export const DEFAULT_FAILURE_REDRIVE_DELAY_MS = 1_500
 
@@ -183,6 +188,17 @@ export const DEFAULT_FAILURE_REDRIVE_DELAY_MS = 1_500
  * finish settling, not for a provider.
  */
 export const REDRIVE_POLL_MS = 1_000
+
+/**
+ * The grace added to every re-drive timer, so it fires after its deadline.
+ *
+ * `setTimeout` is measured on libuv's clock, while the deadline it is racing
+ * is `Date.now()`; the two do not agree to the millisecond, and a timer
+ * observed firing 1ms early makes `maybeRedrive` read the re-drive as not yet
+ * due — which, without this, spent the full poll tick waiting for a moment
+ * that had already arrived.
+ */
+export const REDRIVE_TIMER_GRACE_MS = 1
 
 /** How long a model that hung stays out of the chain (10 minutes). */
 export const DEFAULT_HANG_COOLDOWN_MS = 10 * 60_000
@@ -242,13 +258,46 @@ export const LEASE_GRACE_BEATS = 3
 /**
  * The loop drive prompt.
  *
- * Short — just tells the model to keep going. No sentinels, no boundary tokens,
- * no completion protocol. The full mission lives in the prompt that gets
- * reinjected periodically (see reinjectPromptThreshold). Reinjection is what
- * keeps the model on track once per-turn instructions age out of attention
- * (or get summarized away by compaction).
+ * Short — just tells the model to keep going. No sentinels, no boundary
+ * tokens, no completion protocol. It is enough only while the model is
+ * visibly working (the turn that ends used a tool); the full mission is
+ * restated by `missionText` whenever attention may have faded — the cadence,
+ * a stagnant turn, and every re-drive after an interruption, failure,
+ * compaction or restart.
  */
 export const CONTINUE_PROMPT = "Continue."
+
+/**
+ * The full mission, restated: the loop's own prompt plus the keep-going
+ * instruction.
+ *
+ * Built in one place because more than one path sends it — the cadence and
+ * stagnation paths in `advance`, and the re-drive path after an interrupted
+ * or failed turn — and a drift in any one of them would mean a different
+ * mission reaches the model.
+ */
+export function missionText(prompt: string): string {
+  return `${prompt}\n\nKeep working.`
+}
+
+/** What a scheduled re-drive carries: the short nudge or the full mission. */
+export type RedriveKind = "nudge" | "mission"
+
+/**
+ * A pending re-drive: the deadline and the strength of the prompt owed.
+ *
+ * An interruption, a failure, a compaction or a restart all take the mission
+ * out of the model's immediate attention — the abort killed the turn that was
+ * carrying it, or compaction summarized it away — so the re-drive restates
+ * the full mission by default. The one exception is the same-model retry of a
+ * transient failure: the transcript is intact and the request that just died
+ * is already the last thing on it, so a nudge is the honest continuation.
+ */
+export interface Redrive {
+  /** Epoch ms at which the prompt may be sent. */
+  at: number
+  kind: RedriveKind
+}
 
 /**
  * What a rotation attempt did.
@@ -294,8 +343,23 @@ export class LoopEngine {
   private hangInterrupts = new Map<string, number>()
   /** When a retry storm was last cut short per loop session. */
   private retryInterrupts = new Map<string, number>()
-  /** Re-drive deadlines per loop session, or absent. */
-  private redrives = new Map<string, number>()
+  /** Pending re-drives per loop session, or absent. */
+  private redrives = new Map<string, Redrive>()
+  /**
+   * Whether the current turn of a loop session has used a tool. Cleared when
+   * a prompt goes out, set by a tool event, so at turn end it describes
+   * exactly the turn that just ended: a completed turn that never set it
+   * produced prose only — the model talking about the work instead of doing
+   * it — and gets the mission restated ahead of the `reinjectEvery` cadence.
+   */
+  private readonly turnToolUse = new Set<string>()
+  /**
+   * The iteration at which each loop last had its mission restated. The
+   * `reinjectEvery` cadence counts from here rather than from iteration zero,
+   * so a restatement earned by a stagnant turn or a re-drive starts the
+   * countdown over instead of letting a second one follow a turn later.
+   */
+  private readonly lastReinjections = new Map<string, number>()
   /** Timers that wake the engine at a re-drive deadline instead of the beat. */
   private redriveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
@@ -485,6 +549,13 @@ export class LoopEngine {
         if (signals.model) record.model = signals.model
         if (signals.agent) record.agent = signals.agent
       }
+    }
+
+    // Tool use is the work. A turn that ends without any is the stagnant
+    // state the mission restatement exists for, so it is recorded against
+    // the turn now in flight. Only loop sessions matter.
+    if (signals.progress === "tool" && this.state.loops[sessionID]) {
+      this.turnToolUse.add(sessionID)
     }
 
     this.state.lastEvent = event.type
@@ -987,10 +1058,12 @@ export class LoopEngine {
    * The deadline stays in `redrives` (the durable record `beat()` reads), and
    * a timer wakes the engine at that deadline — the heartbeat is a 30s
    * cadence, far too slow to walk a chain of broken models. The timer is
-   * unref'd so a pending re-drive never keeps the process alive.
+   * unref'd so a pending re-drive never keeps the process alive. The prompt
+   * owed defaults to the full mission; only the same-model retry of a
+   * transient failure asks for the short nudge (see `Redrive`).
    */
-  private scheduleRedrive(sessionID: string, delayMs: number): void {
-    this.redrives.set(sessionID, Date.now() + delayMs)
+  private scheduleRedrive(sessionID: string, delayMs: number, kind: RedriveKind = "mission"): void {
+    this.redrives.set(sessionID, { at: Date.now() + delayMs, kind })
     this.armRedrive(sessionID, delayMs)
   }
 
@@ -1001,7 +1074,7 @@ export class LoopEngine {
     const timer = setTimeout(() => {
       this.redriveTimers.delete(sessionID)
       void this.redriveNow(sessionID).catch(() => {})
-    }, Math.max(delayMs, 0))
+    }, Math.max(delayMs, 0) + REDRIVE_TIMER_GRACE_MS)
     ;(timer as { unref?: () => void }).unref?.()
     this.redriveTimers.set(sessionID, timer)
   }
@@ -1020,11 +1093,14 @@ export class LoopEngine {
   private async redriveNow(sessionID: string): Promise<void> {
     const pending = await this.maybeRedrive(sessionID)
     if (!pending) return
-    const at = this.redrives.get(sessionID)
-    if (at === undefined) return
-    // A send failure re-arms at the full settle delay; a session still
-    // finishing its turn is polled on the short tick until it ends.
-    this.armRedrive(sessionID, Math.max(at - Date.now(), REDRIVE_POLL_MS))
+    const redrive = this.redrives.get(sessionID)
+    if (!redrive) return
+    // A session still finishing its turn is polled on the short tick; a
+    // wake that arrived before the deadline (the grace in `armRedrive` does
+    // not make that impossible — the clock can move) re-arms for the sliver
+    // that is left, instead of paying the full poll for a missed millisecond.
+    const remaining = redrive.at - Date.now()
+    this.armRedrive(sessionID, remaining > 0 ? remaining : REDRIVE_POLL_MS)
   }
 
   /**
@@ -1040,9 +1116,9 @@ export class LoopEngine {
    * the right moment instead of leaving it to the next heartbeat.
    */
   private async maybeRedrive(sessionID: string): Promise<boolean> {
-    const at = this.redrives.get(sessionID)
-    if (at === undefined) return false
-    if (Date.now() < at) return true
+    const redrive = this.redrives.get(sessionID)
+    if (!redrive) return false
+    if (Date.now() < redrive.at) return true
 
     if (!this.ownsLoop(sessionID)) {
       this.clearRedrive(sessionID)
@@ -1051,9 +1127,17 @@ export class LoopEngine {
     if (this.clocks.peek(sessionID)?.activity.running) return true
     this.redrives.delete(sessionID)
 
+    // The mission for an interrupt, failure, compaction or restart — the
+    // moments the re-drive exists for — and the short nudge only for the
+    // same-model retry of a transient failure, whose request is already the
+    // last thing in the transcript.
+    const text = redrive.kind === "mission"
+      ? (this.missionOf(sessionID) ?? CONTINUE_PROMPT)
+      : CONTINUE_PROMPT
+
     try {
       this.log.info(`re-driving ${sessionID} after a cancelled turn`)
-      await this.sendPrompt(sessionID, CONTINUE_PROMPT)
+      await this.sendPrompt(sessionID, text)
       this.clocks.clocksFor(sessionID).start(Date.now())
       return false
     } catch (error) {
@@ -1061,7 +1145,7 @@ export class LoopEngine {
       // loop, it reschedules one — the session may be mid-teardown or the
       // provider briefly unreachable, and the error funnel reports either.
       this.log.warn(`re-drive failed on ${sessionID}: ${msg(error)}; will try again`)
-      this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
+      this.redrives.set(sessionID, { at: Date.now() + this.redriveDelayMs, kind: redrive.kind })
       void this.onError({ sessionID, error, message: msg(error) }).catch(() => {})
       return true
     }
@@ -1077,8 +1161,8 @@ export class LoopEngine {
    * short: the retry's own error is classified, the model goes on the same
    * cooldown it would have earned once the attempts were spent, the turn is
    * interrupted, and the chain rotates. The interrupted event that follows
-   * stands down (the hang marker), and the scheduled re-drive sends the
-   * continue prompt on the next model.
+   * stands down (the hang marker), and the scheduled re-drive restates the
+   * mission on the next model.
    *
    * Paid modes let opencode's retries finish: a blip on a model you are
    * paying for usually recovers, and the paid chain is exactly where a
@@ -1178,6 +1262,7 @@ export class LoopEngine {
 
     this.log.warn(`session ${sessionID} restarted (${previous} -> ${count} messages); re-injecting the loop prompt`)
     await this.sendPrompt(sessionID, loop.prompt)
+    this.lastReinjections.set(sessionID, loop.iterations)
     loop.lastResult = "session restarted; loop prompt re-injected"
     this.emit()
   }
@@ -1488,8 +1573,8 @@ export class LoopEngine {
     // Stale provider state (an expired reasoning item the endpoint no longer
     // holds) is a fact about the transcript, not the model: no cooldown and
     // no rotation by default. Compaction replaces the transcript carrying the
-    // dangling reference, and the re-drive runs the continue prompt against
-    // the compacted context. When compaction is already rate-limited — it did
+    // dangling reference, and the re-drive restates the mission against the
+    // compacted context. When compaction is already rate-limited — it did
     // not clear the state — the loop pays a rotation instead of spinning on
     // the same request.
     if (action.compact && ownsThis && input.sessionID) {
@@ -1516,8 +1601,10 @@ export class LoopEngine {
       this.retries[key] = failures + 1
       this.log.info(`retrying ${key} once after ${classified.kind} before rotating`)
       // Nothing has changed on the session, so nothing will prompt it: the
-      // re-drive is what turns "retry" into an actual second attempt.
-      if (input.sessionID) this.scheduleRedrive(input.sessionID, this.failureRedriveDelayMs)
+      // re-drive is what turns "retry" into an actual second attempt. The
+      // transcript is intact, so this is the one re-drive that keeps the
+      // short nudge instead of restating the mission.
+      if (input.sessionID) this.scheduleRedrive(input.sessionID, this.failureRedriveDelayMs, "nudge")
     } else if (action.resweep && input.sessionID && ownsThis) {
       const outcome = await this.rotate(input.sessionID, classified.kind)
       // Not a stop when the chain has nothing left (owner, 2026-10-11): the
@@ -1717,8 +1804,8 @@ export class LoopEngine {
    * session whose transcript carries provider state the endpoint no longer
    * honors (a stale reasoning item). Best-effort and rate-limited per session:
    * the server admits the request and compacts at the next step boundary — the
-   * continue prompt that follows — so the next turn runs on a transcript that
-   * fits, or that no longer references the expired state.
+   * mission restatement that follows — so the next turn runs on a transcript
+   * that fits, or that no longer references the expired state.
    */
   private async compactSession(sessionID: string): Promise<boolean> {
     const last = this.compactionRequests.get(sessionID) ?? 0
@@ -1837,10 +1924,11 @@ export class LoopEngine {
    *    answer changed. This is the "continually evaluate on each turn"
    *    contract, and it runs before the prompt so the next turn is already on
    *    the current best model.
-   * 4. Send the next prompt. Most turns get a short nudge; every
-   *    `reinjectEvery` turns — and right after a compaction — the full loop
-   *    prompt is restated, because the mission drifts out of attention as the
-   *    conversation grows. There is no completion protocol: the model is never
+   * 4. Send the next prompt. A turn with tool work gets a short nudge; the
+   *    full loop prompt is restated right after a compaction, on the
+   *    `reinjectEvery` cadence, and when the turn that just ended used no
+   *    tool — the mission drifts out of attention as the conversation grows,
+   *    and a model that only talks about the work is where that shows. There is no completion protocol: the model is never
    *    asked to declare the work done, and nothing but the owner halts the
    *    loop.
    *
@@ -1898,15 +1986,27 @@ export class LoopEngine {
       // model rather than whatever happened to be selected earlier.
       await this.refresh(false)
 
-      // The next prompt. Compaction summarizes the opening prompt away, and
-      // attention to it fades as the conversation grows, so the full mission is
-      // restated on a cadence (and immediately after a compaction). Between
-      // restatements the short nudge is enough.
-      const reinject =
-        compactedNow || (this.reinjectEvery > 0 && iteration % this.reinjectEvery === 0)
-      await this.sendPrompt(sessionID, reinject ? `${loop.prompt}\n\nKeep working.` : CONTINUE_PROMPT)
+      // The next prompt. Compaction summarizes the opening prompt away and
+      // attention to it fades as the conversation grows, so the full mission
+      // is restated after a compaction, when the cadence is due, and when the
+      // turn that just ended used no tool at all — the model talking about
+      // the task instead of doing it is the stagnant state the restatement
+      // exists for. The cadence counts from the last restatement, so an
+      // earlier one (here or on a re-drive) moves it rather than leaving a
+      // second one a turn later. Between restatements the short nudge is
+      // enough while the context still holds the task.
+      const stagnant = !this.turnToolUse.has(sessionID)
+      const lastRestated = this.lastReinjections.get(sessionID) ?? 0
+      const overdue = this.reinjectEvery > 0 && iteration - lastRestated >= this.reinjectEvery
+      let nextPrompt = CONTINUE_PROMPT
+      if (compactedNow || stagnant || overdue) {
+        nextPrompt = this.missionOf(sessionID) ?? CONTINUE_PROMPT
+      }
+      await this.sendPrompt(sessionID, nextPrompt)
       this.clocks.clocksFor(sessionID).start(Date.now())
-      loop.lastResult = `iteration ${iteration} done; continuing`
+      loop.lastResult = stagnant
+        ? `iteration ${iteration} done with no tool activity; restating the mission`
+        : `iteration ${iteration} done; continuing`
       this.log.info(`loop iteration ${iteration} complete; continuing`)
       this.emit()
     } catch (error) {
@@ -1929,6 +2029,9 @@ export class LoopEngine {
     // pair of turn-end events an ending produces: the first one advances, the
     // second is a duplicate that must not.
     this.failedTurns.delete(sessionID)
+    // The new turn starts with no tool use recorded; `observe` sets the flag
+    // when one arrives, so the turn-end read describes exactly this turn.
+    this.turnToolUse.delete(sessionID)
     this.armedSessions.add(sessionID)
     const loop = this.loopFor(sessionID)
     if (loop) {
@@ -1942,6 +2045,22 @@ export class LoopEngine {
       session: { prompt(input: { sessionID: string; text: string }): Promise<unknown> }
     }
     await session.session.prompt({ sessionID, text })
+  }
+
+  /**
+   * The full mission, restated, with the reinjection countdown wound.
+   *
+   * Every path that restates the mission comes through here — the cadence and
+   * stagnation paths in `advance`, and every re-drive that carries the
+   * mission — so the `reinjectEvery` countdown always measures turns since
+   * the last restatement. Null when the loop has no prompt to restate, so
+   * callers fall back to the short nudge instead of sending an empty message.
+   */
+  private missionOf(sessionID: string): string | null {
+    const loop = this.loopFor(sessionID)
+    if (!loop || loop.prompt.trim().length === 0) return null
+    this.lastReinjections.set(sessionID, loop.iterations)
+    return missionText(loop.prompt)
   }
 
   /**
@@ -2084,6 +2203,7 @@ private rotationTitle(loop: LoopState): string {
     const loop = this.state.loops[sessionID]
     this.failedTurns.delete(sessionID)
     this.clearRedrive(sessionID)
+    this.lastReinjections.delete(sessionID)
     this.resetEpisode()
     // Announce ownership in the control plane, so every other instance reads
     // this loop as somebody else's and leaves it alone.
@@ -2169,6 +2289,8 @@ private rotationTitle(loop: LoopState): string {
       // owner is what says nobody drives it right now.
       this.armedSessions.delete(sid)
       this.hangInterrupts.delete(sid)
+      this.turnToolUse.delete(sid)
+      this.lastReinjections.delete(sid)
 
       // The halt applies to the whole tree, not just the root: subagents of
       // the loop's session were spawned by it, and a loop that is over must

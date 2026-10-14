@@ -22,7 +22,7 @@ import { clearCooldown, cooldown, meets, loadCatalogue, pricingAt, blendedPriceA
 import { rankForMode, profileFor } from "../lib/modes.ts"
 import { measureContext, descendantIDs, effectiveContext, ollamaServedContext, shouldRotate } from "../lib/rotation.ts"
 import { catalogueRefreshDue, modelsDevTiers, parseAlibabaInventory, rangeUpperBound, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
-import { LoopEngine, CONTINUE_PROMPT, type EngineOptions } from "../lib/engine.ts"
+import { LoopEngine, CONTINUE_PROMPT, missionText, type EngineOptions, type Redrive } from "../lib/engine.ts"
 import { initialState, readState, type Mode, type PluginState } from "../lib/state.ts"
 import { FREE_TIERS } from "../data/free-tiers.ts"
 
@@ -286,10 +286,10 @@ test("a retry scheduled on a free-mode loop cuts the storm: cooldown, rotate, re
   assert.deepEqual(fakes.interrupted, ["ses_loop"])
   assert.equal(state.loops["ses_loop"].lastResult, "rotated general to b/y (retry-after-network)")
   // The re-drive owns the next prompt, exactly like a hang interrupt.
-  assert.ok((engine as unknown as { redrives: Map<string, number> }).redrives.has("ses_loop"))
+  assert.ok((engine as unknown as { redrives: Map<string, Redrive> }).redrives.has("ses_loop"))
   // ...and it follows at the failure delay, not the hang path's 20s: the
   // storm cut is meant to hand the turn to the next model immediately.
-  const at = (engine as unknown as { redrives: Map<string, number> }).redrives.get("ses_loop")!
+  const at = (engine as unknown as { redrives: Map<string, Redrive> }).redrives.get("ses_loop")!.at
   assert.ok(at - Date.now() <= 2_000, `re-drive scheduled ${at - Date.now()}ms out`)
 })
 
@@ -315,13 +315,13 @@ test("a failed turn re-drives on the freshly rotated model without a heartbeat",
     fakes.switched.some((s) => s.sessionID === "ses_loop" && (s.model as { id: string }).id === "y"),
     "the new model is pinned on the session",
   )
-  const at = (engine as unknown as { redrives: Map<string, number> }).redrives.get("ses_loop")!
+  const at = (engine as unknown as { redrives: Map<string, Redrive> }).redrives.get("ses_loop")!.at
   assert.ok(at - Date.now() <= 2_000, "the re-drive follows at the failure delay")
 
-  // No heartbeat: the armed timer alone sends the continue prompt.
+  // No heartbeat: the armed timer alone sends the restated mission.
   await sleep(150)
-  const prompt = fakes.prompts.find((p) => p.text === CONTINUE_PROMPT)
-  assert.ok(prompt, "the continue prompt went out on the timer")
+  const prompt = fakes.prompts.find((p) => p.text === missionText("task"))
+  assert.ok(prompt, "the mission restatement went out on the timer")
   assert.equal(prompt!.sessionID, "ses_loop")
 })
 
@@ -346,7 +346,7 @@ test("consecutive failures keep walking the chain, each on the failure delay", a
 
   assert.match(state.loops["ses_loop"].lastResult ?? "", /rotated general to c\/z/)
   assert.equal(
-    fakes.prompts.filter((p) => p.text === CONTINUE_PROMPT).length,
+    fakes.prompts.filter((p) => p.text === missionText("task")).length,
     2,
     "each rotation was re-driven on the next model",
   )
@@ -521,7 +521,7 @@ test("a loop orphaned by a service restart is recovered, not halted", async () =
   assert.equal(state.loops["ses_loop"].owner, "i2", "the new instance adopts it")
   assert.equal(state.loops["ses_loop"].lastResult, "recovered after restart; continuing")
   assert.ok(
-    (engine as unknown as { redrives: Map<string, number> }).redrives.has("ses_loop"),
+    (engine as unknown as { redrives: Map<string, Redrive> }).redrives.has("ses_loop"),
     "a re-drive covers the case opencode does not resume",
   )
   assert.equal(fakes.interrupted.length, 0)
@@ -560,23 +560,82 @@ test("a stale reasoning-state failure compacts the transcript and re-drives", as
   assert.deepEqual(fakes.compacted, ["ses_loop"], "the transcript carrying the dangling reference is replaced")
   assert.ok(state.cooldowns["a/x"] === undefined, "the model is not cooled down")
   assert.ok(
-    (engine as unknown as { redrives: Map<string, number> }).redrives.has("ses_loop"),
-    "the continue prompt is re-driven against the compacted context",
+    (engine as unknown as { redrives: Map<string, Redrive> }).redrives.has("ses_loop"),
+    "the mission is re-driven against the compacted context",
   )
 })
 
-test("the loop nudges each turn and restates the mission on a cadence", async () => {
+test("the loop nudges working turns and restates the mission on a cadence", async () => {
   const { engine, state, fakes } = makeEngine("i1", { sessionSteps: 100, reinjectEvery: 2 })
   injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
   armLoop(engine, state, "i1", "ses_loop", "free")
 
-  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
-  assert.equal(fakes.prompts.at(-1)?.text, CONTINUE_PROMPT, "a plain turn gets the short nudge")
+  const tool = () => engine.observe({ type: "session.tool.called", data: { sessionID: "ses_loop" } })
 
+  tool()
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(fakes.prompts.at(-1)?.text, CONTINUE_PROMPT, "a working turn gets the short nudge")
+
+  tool()
   await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
   const prompt = fakes.prompts.at(-1)?.text ?? ""
   assert.match(prompt, /^task/, "the mission is restated on the cadence")
   assert.match(prompt, /Keep working\.$/)
+})
+
+test("a turn with no tool activity restates the mission and moves the cadence", async () => {
+  const { engine, state, fakes } = makeEngine("i1", { sessionSteps: 100, reinjectEvery: 3 })
+  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
+  armLoop(engine, state, "i1", "ses_loop", "free")
+
+  // No tool event: the turn only talked about the work. The mission is
+  // restated at once, instead of waiting out the cadence.
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(fakes.prompts.at(-1)?.text, missionText("task"), "a stagnant turn gets the mission")
+
+  // Work resumed. The restatement wound the countdown, so the next turns are
+  // nudges and the cadence only fires again on the fourth (1 + 3).
+  const toolTurn = async () => {
+    engine.observe({ type: "session.tool.called", data: { sessionID: "ses_loop" } })
+    await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  }
+  await toolTurn()
+  assert.equal(fakes.prompts.at(-1)?.text, CONTINUE_PROMPT)
+  await toolTurn()
+  assert.equal(fakes.prompts.at(-1)?.text, CONTINUE_PROMPT)
+  await toolTurn()
+  assert.equal(fakes.prompts.at(-1)?.text, missionText("task"), "the cadence resumes from the restatement")
+})
+
+test("a re-drive after an interrupt restates the mission", async () => {
+  const { engine, state, fakes } = makeEngine("i1", { redriveDelayMs: 30 })
+  armLoop(engine, state, "i1", "ses_loop", "free")
+
+  // The turn is aborted (the user's escape): the interrupt removes the idle
+  // event the loop is normally driven by, and the re-drive that covers it
+  // carries the mission rather than the two-word nudge the model just
+  // failed to act on.
+  engine.observe({ type: "session.execution.interrupted", data: { sessionID: "ses_loop" } })
+  await engine.onTurnEnd("ses_loop", "session.execution.interrupted")
+  await sleep(120)
+
+  assert.equal(fakes.prompts.at(-1)?.text, missionText("task"), "the aborted turn's mission is restated")
+})
+
+test("the same-model retry of a transient failure keeps the short nudge", async () => {
+  const { engine, state, fakes } = makeEngine("i1", { failureRedriveDelayMs: 30 })
+  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
+  armLoop(engine, state, "i1", "ses_loop", "cheap")
+  state.mode = "cheap" // the retry policy is read from the default mode
+  const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!
+  tracked.model = { providerID: "a", id: "x" }
+
+  engine.observe({ type: "session.error", data: { sessionID: "ses_loop" } })
+  await engine.onError({ sessionID: "ses_loop", message: "socket hang up" })
+  await sleep(120)
+
+  assert.equal(fakes.prompts.at(-1)?.text, CONTINUE_PROMPT, "the retry continues on the intact transcript")
+  assert.deepEqual(fakes.interrupted, [], "no rotation for a transient failure")
 })
 
 test("a step-budget compaction re-anchors the full loop prompt", async () => {
