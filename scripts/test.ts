@@ -318,10 +318,11 @@ test("a failed turn re-drives on the freshly rotated model without a heartbeat",
   const at = (engine as unknown as { redrives: Map<string, Redrive> }).redrives.get("ses_loop")!.at
   assert.ok(at - Date.now() <= 2_000, "the re-drive follows at the failure delay")
 
-  // No heartbeat: the armed timer alone sends the restated mission.
+  // No heartbeat: the armed timer alone sends the continue prompt on the
+  // rotated model; the previous prompt is already in context above.
   await sleep(150)
-  const prompt = fakes.prompts.find((p) => p.text === missionText("task"))
-  assert.ok(prompt, "the mission restatement went out on the timer")
+  const prompt = fakes.prompts.find((p) => p.text === CONTINUE_PROMPT)
+  assert.ok(prompt, "the continue prompt went out on the timer")
   assert.equal(prompt!.sessionID, "ses_loop")
 })
 
@@ -346,7 +347,7 @@ test("consecutive failures keep walking the chain, each on the failure delay", a
 
   assert.match(state.loops["ses_loop"].lastResult ?? "", /rotated general to c\/z/)
   assert.equal(
-    fakes.prompts.filter((p) => p.text === missionText("task")).length,
+    fakes.prompts.filter((p) => p.text === CONTINUE_PROMPT).length,
     2,
     "each rotation was re-driven on the next model",
   )
@@ -607,19 +608,19 @@ test("a turn with no tool activity restates the mission and moves the cadence", 
   assert.equal(fakes.prompts.at(-1)?.text, missionText("task"), "the cadence resumes from the restatement")
 })
 
-test("a re-drive after an interrupt restates the mission", async () => {
+test("a re-drive after a non-our interrupt continues with the nudge", async () => {
   const { engine, state, fakes } = makeEngine("i1", { redriveDelayMs: 30 })
   armLoop(engine, state, "i1", "ses_loop", "free")
 
-  // The turn is aborted (the user's escape): the interrupt removes the idle
-  // event the loop is normally driven by, and the re-drive that covers it
-  // carries the mission rather than the two-word nudge the model just
-  // failed to act on.
+  // The turn is aborted by the user (escape): it is not ours — no hangInterrupt
+  // marker — so the engine gives the loop a moment via re-drive rather than
+  // advancing immediately. Since the prompt is already in context above the
+  // model's response, the nudge suffices.
   engine.observe({ type: "session.execution.interrupted", data: { sessionID: "ses_loop" } })
   await engine.onTurnEnd("ses_loop", "session.execution.interrupted")
   await sleep(120)
 
-  assert.equal(fakes.prompts.at(-1)?.text, missionText("task"), "the aborted turn's mission is restated")
+  assert.equal(fakes.prompts.at(-1)?.text, CONTINUE_PROMPT, "the interrupt re-drive continues with the short nudge")
 })
 
 test("the same-model retry of a transient failure keeps the short nudge", async () => {

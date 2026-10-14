@@ -286,12 +286,12 @@ export type RedriveKind = "nudge" | "mission"
 /**
  * A pending re-drive: the deadline and the strength of the prompt owed.
  *
- * An interruption, a failure, a compaction or a restart all take the mission
- * out of the model's immediate attention — the abort killed the turn that was
- * carrying it, or compaction summarized it away — so the re-drive restates
- * the full mission by default. The one exception is the same-model retry of a
- * transient failure: the transcript is intact and the request that just died
- * is already the last thing on it, so a nudge is the honest continuation.
+ * A nudge is enough on nearly every re-drive: the previous turn's prompt is
+ * already in context above the model's response, so the mission doesn't go
+ * stale through rotation alone. It is only needed when the turn was cut off
+ * before it could land (the hang path, user escape) or the transcript itself
+ * changed (compaction, restart) — those moments where the mission is taken
+ * out of the model's immediate attention.
  */
 export interface Redrive {
   /** Epoch ms at which the prompt may be sent. */
@@ -1038,7 +1038,7 @@ export class LoopEngine {
       // local fallback is still the chain's tail, so this usually does not
       // happen at all.
       this.log.warn(`no untried model left for ${sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
-      if (!this.redrives.has(sessionID)) this.scheduleRedrive(sessionID, this.redriveDelayMs)
+      if (!this.redrives.has(sessionID)) this.scheduleRedrive(sessionID, this.redriveDelayMs, "mission")
       this.emit()
       return
     }
@@ -1062,7 +1062,7 @@ export class LoopEngine {
    * owed defaults to the full mission; only the same-model retry of a
    * transient failure asks for the short nudge (see `Redrive`).
    */
-  private scheduleRedrive(sessionID: string, delayMs: number, kind: RedriveKind = "mission"): void {
+  private scheduleRedrive(sessionID: string, delayMs: number, kind: RedriveKind = "nudge"): void {
     this.redrives.set(sessionID, { at: Date.now() + delayMs, kind })
     this.armRedrive(sessionID, delayMs)
   }
@@ -1211,7 +1211,7 @@ export class LoopEngine {
     const outcome = await this.rotate(sessionID, `retry-after-${classified.kind}`)
     if (outcome !== "moved" && outcome !== "not-ours") {
       this.log.warn(`no untried model left for ${sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
-      if (!this.redrives.has(sessionID)) this.scheduleRedrive(sessionID, this.redriveDelayMs)
+      if (!this.redrives.has(sessionID)) this.scheduleRedrive(sessionID, this.redriveDelayMs, "mission")
       this.emit()
       return
     }
@@ -1583,7 +1583,7 @@ export class LoopEngine {
         // The compaction lands at the next step boundary, so the continue
         // prompt is the thing that triggers it — it goes out promptly, not on
         // the hang-settle delay.
-        this.scheduleRedrive(input.sessionID, this.failureRedriveDelayMs)
+        this.scheduleRedrive(input.sessionID, this.failureRedriveDelayMs, "mission")
         this.emit()
         return action
       }
@@ -1928,7 +1928,7 @@ export class LoopEngine {
    *    full loop prompt is restated right after a compaction, on the
    *    `reinjectEvery` cadence, and when the turn that just ended used no
    *    tool — the mission drifts out of attention as the conversation grows,
-   *    and a model that only talks about the work is where that shows. There is no completion protocol: the model is never
+   *    and a model that only talks about the work is where that shows. On a re-drive caused by an interrupt or compaction (the moments the mission actually leaves the transcript), it is restated again; otherwise the nudge suffices since the session's last sent prompt is in context above the model's response. There is no completion protocol: the model is never
    *    asked to declare the work done, and nothing but the owner halts the
    *    loop.
    *
@@ -2013,8 +2013,9 @@ export class LoopEngine {
       this.log.error(`advance failed on ${sessionID}: ${msg(error)}`)
       loop.consecutiveErrors += 1
       // The prompt never landed, so nothing else will drive the loop: without
-      // a re-drive it would sit idle until the owner noticed.
-      this.scheduleRedrive(sessionID, this.failureRedriveDelayMs)
+      // a re-drive it would sit idle until the owner noticed. Restate the
+      // mission since we can't just continue from something that never sent.
+      this.scheduleRedrive(sessionID, this.failureRedriveDelayMs, "mission")
       this.emit()
     } finally {
       this.advancing.delete(sessionID)
