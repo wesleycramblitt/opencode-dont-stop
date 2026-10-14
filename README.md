@@ -41,7 +41,7 @@ execution result and would double-advance a loop that listened to both.
 | Mode | Selects | On failure |
 | --- | --- | --- |
 | `free` | verified zero-cost models swept by capability, then quota-backed models, then the best local model | next untried model in that order; re-sweep when the task completes |
-| `cheap` | paid models cheapest-first, then free models, then local | next untried model in that order; degrade to `free` on low funds |
+| `cheap` | paid models cheapest-first *at the session's context*, then free models, then local | next untried model in that order; degrade to `free` on low funds |
 | `local` | best local model for the task, GPU-aware | next local model; remote only if nothing local can serve |
 | `power` | most capable model for the agent and task, re-evaluated each turn | next most capable |
 
@@ -74,8 +74,8 @@ network access at plugin load time.
 
 | Source | What it provides |
 | --- | --- |
-| **models.dev** `/api.json` | The authoritative registry: capabilities, modalities, limits, pricing, knowledge cutoff, release date, and the `canonical_model_id` linking every provider alias to one identity |
-| **Alibaba Model Studio** `/api/v1/models` | The live per-account inventory behind a key: id, name, description, features, per-model prices (standard and thinking bands, cache read/write), context window, max output, and request/response modalities. It lists models models.dev has not caught up with, so a row from it outranks a models.dev row of the same id |
+| **models.dev** `/api.json` | The authoritative registry: capabilities, modalities, limits, pricing (including context price tiers), knowledge cutoff, release date, and the `canonical_model_id` linking every provider alias to one identity |
+| **Alibaba Model Studio** `/api/v1/models` | The live per-account inventory behind a key: id, name, description, features, per-model prices by context range (standard and thinking bands, cache read/write), context window, max output, and request/response modalities. It lists models models.dev has not caught up with, so a row from it outranks a models.dev row of the same id |
 | **ollama.com** search | The top 100 locally-runnable models by popularity, with context windows, parameter sizes and capability tags |
 | **local ollama** `/api/tags` | What is actually installed on this machine |
 | **`data/benchmarks.ts`** | Curated, cited benchmark scores keyed by canonical id |
@@ -85,6 +85,24 @@ never enter the catalogue: a row with no pricing must not be mistaken for a
 free one. When two sources share a key the more authoritative row wins —
 local install, then the vendor's own inventory, then models.dev, then the
 popularity scrape.
+
+### Price tiers
+
+Vendors price by input length, not by a single headline number: qwen3.7-flash
+is $0.03/$0.13 per 1M up to 32k tokens, $0.10/$0.40 to 256k, and $0.20/$0.80
+beyond. The catalogue carries that shape (`pricing.tiers`, one band per
+threshold) and `pricingAt(pricing, tokens)` reads the band a request actually
+falls in. Both sources publish the bands and both are parsed into the same
+shape: models.dev as `cost.tiers` (or the legacy `context_over_200k`
+breakpoint), Alibaba's inventory as its `Input<=32k` / `32k<Input<=256k` /
+`256k<Input<=1m` price groups.
+
+`cheap` mode is the consumer: it ranks paid rows by the blended rate at the
+context the next request will carry (`blendedPriceAt`), so a model that is
+cheapest when the window is nearly empty does not win a 300k-token session on
+a rate that conversation will never pay. The context comes from the session's
+own usage (`contextUsed`): ranking for a fresh session sees zero and pays the
+base tier, which is correct. ollama rows are free and carry no tiers.
 
 ### Alibaba's inventory
 

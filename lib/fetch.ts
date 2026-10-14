@@ -27,6 +27,8 @@ import { fileURLToPath } from "node:url"
 
 import { benchmarksFor, type Benchmarks } from "../data/benchmarks.ts"
 import { FREE_TIERS } from "../data/free-tiers.ts"
+// Type-only: the pricing shape is owned by the catalogue; no runtime cycle.
+import type { PriceBand, Rates } from "./catalogue.ts"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 export const CATALOGUE_FILE = join(HERE, "..", "data", "catalogue.json")
@@ -155,7 +157,34 @@ interface ModelsDevModel {
   release_date?: string
   modalities?: { input?: string[]; output?: string[] }
   limit?: { context?: number; output?: number }
-  cost?: { input?: number; output?: number; cache_read?: number; cache_write?: number }
+  cost?: {
+    input?: number
+    output?: number
+    cache_read?: number
+    cache_write?: number
+    /**
+     * Context bands: the price above each `tier.size` threshold. This is the
+     * shape models.dev publishes today for tiered vendors.
+     */
+    tiers?: Array<{
+      input?: number
+      output?: number
+      cache_read?: number
+      cache_write?: number
+      tier?: { type?: string; size?: number }
+    }>
+    /**
+     * Legacy single band: the price above 200k input tokens, kept for models
+     * that were catalogued before `tiers`. Both can appear on one model; see
+     * `modelsDevTiers` for which wins.
+     */
+    context_over_200k?: {
+      input?: number
+      output?: number
+      cache_read?: number
+      cache_write?: number
+    }
+  }
   canonical_model_id?: string
   status?: string
 }
@@ -186,7 +215,7 @@ interface RawRow {
   context: number
   maxOutput: number
   capabilities: Record<string, boolean>
-  pricing: { input: number; output: number; cacheRead: number; cacheWrite: number }
+  pricing: { input: number; output: number; cacheRead: number; cacheWrite: number; tiers?: PriceBand[] }
   canonicalID: string | null
   local: boolean
   source: "models.dev" | "ollama" | "local" | "alibaba"
@@ -242,6 +271,48 @@ const SOURCE_PRIORITY: Record<RawRow["source"], number> = {
   ollama: 0,
 }
 
+/**
+ * The context bands a models.dev cost object carries.
+ *
+ * Two shapes exist in the registry and both are parsed: `tiers`, a list of
+ * `{ tier: { size } }` thresholds, and the legacy `context_over_200k` single
+ * band for models catalogued before thresholds were part of the schema.
+ * `tiers` wins when both appear — the registry duplicates the same figures
+ * into both fields, and counting them as two bands would double-tag the same
+ * breakpoint. A tier entry that omits a rate inherits the base one.
+ */
+export function modelsDevTiers(cost: NonNullable<ModelsDevModel["cost"]>): PriceBand[] {
+  const list = cost.tiers
+  if (Array.isArray(list) && list.length > 0) {
+    const bands: PriceBand[] = []
+    for (const entry of list) {
+      const tier = entry.tier ?? {}
+      const size = num(tier.size)
+      if (tier.type && tier.type !== "context") continue
+      if (size <= 0) continue
+      bands.push({
+        size,
+        input: num(entry.input ?? cost.input),
+        output: num(entry.output ?? cost.output),
+        cacheRead: num(entry.cache_read ?? cost.cache_read),
+        cacheWrite: num(entry.cache_write ?? cost.cache_write),
+      })
+    }
+    return bands.sort((a, b) => a.size - b.size)
+  }
+  const legacy = cost.context_over_200k
+  if (legacy) {
+    return [{
+      size: 200_000,
+      input: num(legacy.input ?? cost.input),
+      output: num(legacy.output ?? cost.output),
+      cacheRead: num(legacy.cache_read ?? cost.cache_read),
+      cacheWrite: num(legacy.cache_write ?? cost.cache_write),
+    }]
+  }
+  return []
+}
+
 /** Flatten models.dev into raw rows for the requested providers. */
 function rowsFromModelsDev(payload: unknown): RawRow[] {
   const providers = payload as Record<string, ModelsDevProvider>
@@ -254,6 +325,7 @@ function rowsFromModelsDev(payload: unknown): RawRow[] {
     for (const model of Object.values(provider.models)) {
       const input = model.modalities?.input ?? []
       const output = model.modalities?.output ?? []
+      const tiers = model.cost ? modelsDevTiers(model.cost) : []
       rows.push({
         providerID,
         id: model.id,
@@ -286,6 +358,7 @@ function rowsFromModelsDev(payload: unknown): RawRow[] {
           output: num(model.cost?.output),
           cacheRead: num(model.cost?.cache_read),
           cacheWrite: num(model.cost?.cache_write),
+          ...(tiers.length > 0 ? { tiers } : {}),
         },
         canonicalID: model.canonical_model_id ?? null,
         // `ollama` (the scrape) and the local daemon are local. `ollama-cloud`
@@ -645,6 +718,13 @@ async function localOllama(options: FetchOptions): Promise<Map<string, { context
 
 /* -------------------------------------------------------- alibaba shaping */
 
+/** One price row inside an inventory price group. */
+interface AlibabaPriceRow {
+  type?: string
+  price?: string | number
+  time_band?: string | null
+}
+
 /** A model entry as the Model Studio inventory reports it. */
 export interface AlibabaModelEntry {
   model: string
@@ -663,11 +743,9 @@ export interface AlibabaModelEntry {
     max_output_tokens?: number | null
   }
   prices?: Array<{
-    prices?: Array<{
-      type?: string
-      price?: string | number
-      time_band?: string
-    }>
+    /** The band this group covers, e.g. "32k<Input<=256k". */
+    range_name?: string
+    prices?: AlibabaPriceRow[]
   }>
 }
 
@@ -758,22 +836,65 @@ export function parseAlibabaInventory(payload: unknown): AlibabaModelEntry[] {
   return out
 }
 
-/** The token prices for an entry, preferring standard over thinking bands. */
-function alibabaPricing(entry: AlibabaModelEntry): { input: number; output: number; cacheRead: number; cacheWrite: number } {
-  const bands = entry.prices ?? []
-  const pick = (preferred: string[], fallback: string[]) => {
-    const all = bands.flatMap((band) => band.prices ?? [])
-    const found = all.find((p) => preferred.includes(p.type ?? ""))
-    const alt = found ? null : all.find((p) => fallback.includes(p.type ?? ""))
-    const price = found ?? alt
-    return typeof price?.price === "string" || typeof price?.price === "number" ? Number(price.price) : 0
+/**
+ * The upper input bound a range name declares: "32k<Input<=256k" -> 256000.
+ * Unlabelled or unrecognised names yield 0.
+ */
+export function rangeUpperBound(name: string | undefined): number {
+  if (!name) return 0
+  let upper = 0
+  for (const match of name.matchAll(/(\d+(?:\.\d+)?)\s*([kKmM])/g)) {
+    const value = Number(match[1])
+    if (!Number.isFinite(value)) continue
+    upper = Math.round(match[2].toLowerCase() === "m" ? value * 1_000_000 : value * 1_000)
   }
+  return upper
+}
+
+/** The price rows one band declares, picking the preferred type then any fallback. */
+function pickRate(rows: AlibabaPriceRow[], preferred: string[], fallback: string[]): number {
+  const found = rows.find((p) => preferred.includes(p.type ?? ""))
+  const alt = found ? null : rows.find((p) => fallback.includes(p.type ?? ""))
+  const price = found ?? alt
+  return typeof price?.price === "string" || typeof price?.price === "number" ? Number(price.price) : 0
+}
+
+/** The four rates one price group declares. */
+function bandRates(rows: AlibabaPriceRow[]): Rates {
   return {
-    input: pick(["input_token", "thinking_input_token"], ["text_input_token", "omni_no_audio_input_token", "omni_input_token"]),
-    output: pick(["output_token", "thinking_output_token"], ["text_output_token", "omni_text_output_token", "omni_output_token"]),
-    cacheRead: pick(["input_token_cache_read", "thinking_input_token_cache_read"], []),
-    cacheWrite: pick(["input_token_cache_creation_5m", "input_token_cache"], []),
+    input: pickRate(rows, ["input_token", "thinking_input_token"], ["text_input_token", "omni_no_audio_input_token", "omni_input_token"]),
+    output: pickRate(rows, ["output_token", "thinking_output_token"], ["text_output_token", "omni_text_output_token", "omni_output_token"]),
+    cacheRead: pickRate(rows, ["input_token_cache_read", "thinking_input_token_cache_read"], []),
+    cacheWrite: pickRate(rows, ["input_token_cache_creation_5m", "input_token_cache"], []),
   }
+}
+
+/**
+ * The token prices for an entry, as base rates plus context bands.
+ *
+ * The inventory groups its price rows by context range ("Input<=32k",
+ * "32k<Input<=256k", "256k<Input<=1m"). The shortest group is the base rate;
+ * every later group becomes a band whose `size` is the previous group's upper
+ * bound — the same shape models.dev publishes, so the two sources agree and a
+ * row that comes from either is priced the same way.
+ */
+function alibabaPricing(entry: AlibabaModelEntry): Rates & { tiers?: PriceBand[] } {
+  const groups = (entry.prices ?? [])
+    .map((group) => ({ upper: rangeUpperBound(group.range_name), rows: group.prices ?? [] }))
+    .filter((group) => group.rows.length > 0)
+    .sort((a, b) => a.upper - b.upper)
+  if (groups.length === 0) return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+
+  const [base, ...rest] = groups
+  const tiers: PriceBand[] = []
+  let previous = base.upper
+  for (const group of rest) {
+    // An unlabelled or unparsed group cannot anchor the next band.
+    if (previous <= 0) break
+    tiers.push({ size: previous, ...bandRates(group.rows) })
+    previous = group.upper
+  }
+  return { ...bandRates(base.rows), ...(tiers.length > 0 ? { tiers } : {}) }
 }
 
 /** Capabilities from the inventory's feature and modality lists. */
@@ -883,7 +1004,7 @@ export interface CatalogueRow {
   context: number
   maxOutput: number
   capabilities: Record<string, boolean>
-  pricing: { input: number; output: number; cacheRead: number; cacheWrite: number }
+  pricing: { input: number; output: number; cacheRead: number; cacheWrite: number; tiers?: PriceBand[] }
   local: boolean
   /** Popularity rank among local ollama models, when known. */
   ollamaRank?: number

@@ -114,12 +114,20 @@ export const AGENT_LEADS: Partial<Record<AgentKind, readonly string[]>> = {
   architect: ["ollama/qwen3.5:9b-ctx256k", "ollama/qwen3-coder:30b-ctx256k"],
 }
 
-/** Rank rows for one task under one mode. Pure and deterministic. */
+/** Rank rows for one task under one mode. Pure and deterministic.
+ *
+ * `contextTokens` is the input context the next request will carry, when
+ * known (a live session's usage). Only `cheap` consumes it: price tiers are
+ * selected by input length, so the cheapest model for a fresh session can be
+ * the priciest one at 300k tokens. Zero means "context unknown" and ranks at
+ * the base rates.
+ */
 export function rankForMode(
   cat: Catalogue,
   mode: Mode,
   task: TaskProfile,
   hardware: HardwareProfile = HARDWARE_4090,
+  contextTokens = 0,
 ): CatalogueModel[] {
   // `stop` is not a real mode: it selects nothing so the loop can halt.
   if (mode === "stop") return []
@@ -131,7 +139,7 @@ export function rankForMode(
     case "free":
       return leadWithAgent(rankFree(candidates, task), candidates, task.kind, hardware)
     case "cheap":
-      return rankCheap(candidates, task)
+      return rankCheap(candidates, task, contextTokens)
     case "local":
       return rankLocal(cat, candidates, task, hardware)
     case "power":
@@ -217,6 +225,12 @@ function rankFree(candidates: CatalogueModel[], task: TaskProfile): CatalogueMod
  * are needed. Among rows that qualify, price decides and capability breaks
  * ties.
  *
+ * Price is read at the context the request will carry (`contextTokens`), not
+ * at the base rate: a tiered model — qwen3.7-flash is 0.16/1M blended up to
+ * 32k and 1.00/1M past 256k — must be compared against its peers at the
+ * session's actual size, or the ranking promotes it on a rate no long
+ * conversation will ever pay.
+ *
  * Shape: every paid row cheapest-first, then the free rows, then the local
  * fallbacks — the same walk free mode makes, one try per model, with the paid
  * head in front. The head minimises spend; the paid tail gives the loop
@@ -224,7 +238,7 @@ function rankFree(candidates: CatalogueModel[], task: TaskProfile): CatalogueMod
  * free and local tails are the degradation targets, reached only once the paid
  * rows have all had their try.
  */
-function rankCheap(candidates: CatalogueModel[], task: TaskProfile): CatalogueModel[] {
+function rankCheap(candidates: CatalogueModel[], task: TaskProfile, contextTokens: number): CatalogueModel[] {
   const qualified = candidates.filter((m) => meetsTask(m, task))
   const pool = qualified.length > 0 ? qualified : candidates
 
@@ -237,7 +251,7 @@ function rankCheap(candidates: CatalogueModel[], task: TaskProfile): CatalogueMo
   const freeLocal = sortBy(free.filter((m) => m.local), sorts.capabilityContext)
 
   return dedupe([
-    ...sortBy(paid, sorts.cheapest),
+    ...sortBy(paid, sorts.cheapestAt(contextTokens)),
     ...freeRemote,
     ...freeLocal,
   ])
@@ -399,7 +413,7 @@ export function describeMode(mode: Mode): string {
     case "free":
       return "sweep free models, then quota-backed, then best local"
     case "cheap":
-      return "cheapest capable model per task; degrade to free on low funds"
+      return "cheapest capable model per task at the session's context; degrade to free on low funds"
     case "local":
       return "best local model per task, GPU-aware"
     case "power":

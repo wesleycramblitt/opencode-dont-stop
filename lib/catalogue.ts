@@ -36,11 +36,32 @@ export interface Capabilities {
   embedding: boolean
 }
 
+/**
+ * A context-length price band.
+ *
+ * `size` is the input-token threshold a request must exceed for the band to
+ * apply, until the next band's threshold is passed: vendors publish these as
+ * "Input<=32k", "32k<Input<=256k", "256k<Input<=1m".
+ */
+export interface PriceBand {
+  size: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+}
+
 export interface Pricing {
   input: number
   output: number
   cacheRead: number
   cacheWrite: number
+  /**
+   * Context bands, ascending by `size`. Absent when the model charges one
+   * rate at every context length; the base rates above are the price below
+   * the first band.
+   */
+  tiers?: PriceBand[]
 }
 
 export interface Scores {
@@ -395,15 +416,29 @@ export function filterLoose(cat: Catalogue, req: Requirements): CatalogueModel[]
   return cat.models.filter((m) => meets(m, { ...req, allowUnverified: true }))
 }
 
-/** Sort comparators. Each returns a new array. */
-export const sorts = {
-  /** Cheapest first; capability breaks ties so a cheap-and-good wins. */
-  cheapest: (a: CatalogueModel, b: CatalogueModel) => {
-    const pa = blendedPrice(a)
-    const pb = blendedPrice(b)
+/**
+ * Cheapest-first comparator at a given context length. Capability breaks
+ * ties so a cheap-and-good wins.
+ *
+ * The factory exists because "cheapest" is only defined at a context size:
+ * a tiered model is the cheapest row near zero and can be the priciest one
+ * at 300k tokens, so cheap mode must price the request it is about to make.
+ */
+function cheapestComparator(tokens: number): (a: CatalogueModel, b: CatalogueModel) => number {
+  return (a, b) => {
+    const pa = blendedPriceAt(a, tokens)
+    const pb = blendedPriceAt(b, tokens)
     if (pa !== pb) return pa - pb
     return b.scores.capability - a.scores.capability
-  },
+  }
+}
+
+/** Sort comparators. Each returns a new array. */
+export const sorts = {
+  /** Cheapest first at the base rate; capability breaks ties so a cheap-and-good wins. */
+  cheapest: cheapestComparator(0),
+  /** Cheapest first at a request's context length, honouring price tiers. */
+  cheapestAt: cheapestComparator,
   /**
    * Most capable, preferring larger context on a near-tie.
    *
@@ -451,8 +486,45 @@ function bench(m: CatalogueModel, column: string): number {
 
 /* ------------------------------------------------------------------ pricing */
 
+/** The four rates, without the bands that select between them. */
+export interface Rates {
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+}
+
+/**
+ * The rates a request pays when its input context holds `tokens`.
+ *
+ * Tiering is by input length, and a band starts when the context *exceeds*
+ * its threshold — the vendor's own wording is "32k<Input<=256k". So the last
+ * band the context has passed wins, and below the first band the base rates
+ * apply. This matches how opencode itself selects the tier for a turn
+ * (`input + cache.read + cache.write > tier.size`).
+ */
+export function pricingAt(pricing: Pricing, tokens: number): Rates {
+  let effective: Rates = pricing
+  for (const band of pricing.tiers ?? []) {
+    if (tokens <= band.size) break
+    effective = band
+  }
+  return {
+    input: effective.input,
+    output: effective.output,
+    cacheRead: effective.cacheRead,
+    cacheWrite: effective.cacheWrite,
+  }
+}
+
 export function blendedPrice(m: CatalogueModel): number {
   return m.pricing.input + m.pricing.output
+}
+
+/** The blended per-1M price at a request's context length. */
+export function blendedPriceAt(m: CatalogueModel, tokens: number): number {
+  const rates = pricingAt(m.pricing, tokens)
+  return rates.input + rates.output
 }
 
 export function isFree(m: CatalogueModel): boolean {
@@ -692,12 +764,33 @@ function capabilities(value: unknown): Capabilities {
 
 function pricing(value: unknown): Pricing {
   const record = (value ?? {}) as Record<string, unknown>
+  const tiers = priceBands(record.tiers)
   return {
     input: num(record.input),
     output: num(record.output),
     cacheRead: num(record.cacheRead),
     cacheWrite: num(record.cacheWrite),
+    ...(tiers.length > 0 ? { tiers } : {}),
   }
+}
+
+/** Coerce persisted price bands, dropping unusable entries. */
+function priceBands(value: unknown): PriceBand[] {
+  if (!Array.isArray(value)) return []
+  const bands: PriceBand[] = []
+  for (const raw of value) {
+    const record = (raw ?? {}) as Record<string, unknown>
+    const size = num(record.size)
+    if (size <= 0) continue
+    bands.push({
+      size,
+      input: num(record.input),
+      output: num(record.output),
+      cacheRead: num(record.cacheRead),
+      cacheWrite: num(record.cacheWrite),
+    })
+  }
+  return bands.sort((a, b) => a.size - b.size)
 }
 
 function scores(value: unknown): Scores {

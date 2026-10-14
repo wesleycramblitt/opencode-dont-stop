@@ -1,11 +1,11 @@
 {
   "version": 1,
-  "generatedAt": "2026-10-12T23:43:00.084Z",
+  "generatedAt": "2026-10-14T07:40:08.339Z",
   "sources": [
     {
       "id": "models.dev",
       "url": "https://models.dev/api.json",
-      "models": 499
+      "models": 504
     },
     {
       "id": "ollama-popular",
@@ -25,12 +25,12 @@
     {
       "id": "opencode-registry",
       "url": "server",
-      "models": 114
+      "models": 115
     },
     {
       "id": "unroutable",
       "url": "-",
-      "models": 544
+      "models": 548
     }
   ],
   "models": [
@@ -126,7 +126,16 @@
         "input": 2.5,
         "output": 15,
         "cacheRead": 0.25,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 5,
+            "output": 22.5,
+            "cacheRead": 0.5,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -928,7 +937,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.5,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 1,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -2726,7 +2744,16 @@
         "input": 3,
         "output": 15,
         "cacheRead": 0.3,
-        "cacheWrite": 3.75
+        "cacheWrite": 3.75,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 6,
+            "output": 22.5,
+            "cacheRead": 0.6,
+            "cacheWrite": 7.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -3101,6 +3128,72 @@
       }
     },
     {
+      "key": "opencode/cat-jam-free",
+      "providerID": "opencode",
+      "id": "cat-jam-free",
+      "name": "Cat Jam Free",
+      "description": "A text-only reasoning model for coding and agentic workflows, with tool calling and structured JSON outputs.",
+      "family": "",
+      "releaseDate": "2026-10-12",
+      "knowledge": "",
+      "openWeights": false,
+      "context": 262144,
+      "maxOutput": 131072,
+      "capabilities": {
+        "text": true,
+        "image": false,
+        "audio": false,
+        "pdf": false,
+        "video": false,
+        "reasoning": true,
+        "toolCall": true,
+        "structured": true,
+        "embedding": false
+      },
+      "pricing": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0
+      },
+      "local": false,
+      "weights": {
+        "total": null,
+        "active": null,
+        "moe": false,
+        "source": "unknown"
+      },
+      "cloud": true,
+      "reachable": true,
+      "capabilityTags": [
+        "text",
+        "reasoning",
+        "toolCall",
+        "structured"
+      ],
+      "canonicalID": null,
+      "benchmarks": null,
+      "scores": {
+        "reasoning": 5.2,
+        "code": 4.35,
+        "agentic": 5.34,
+        "general": 3.97,
+        "capability": 5.02
+      },
+      "freeTier": null,
+      "provenance": {
+        "metadata": "models.dev",
+        "benchmark": null,
+        "estimated": true,
+        "estimatedFields": [
+          "reasoning",
+          "code",
+          "agentic",
+          "general"
+        ]
+      }
+    },
+    {
       "key": "opencode/gpt-5.3-codex-spark",
       "providerID": "opencode",
       "id": "gpt-5.3-codex-spark",
@@ -3193,7 +3286,16 @@
         "input": 2,
         "output": 10,
         "cacheRead": 0.1,
-        "cacheWrite": 2.5
+        "cacheWrite": 2.5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 4,
+            "output": 15,
+            "cacheRead": 0.2,
+            "cacheWrite": 5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -3398,7 +3500,16 @@
         "input": 10,
         "output": 50,
         "cacheRead": 1,
-        "cacheWrite": 12.5
+        "cacheWrite": 12.5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 20,
+            "output": 75,
+            "cacheRead": 2,
+            "cacheWrite": 25
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -3466,7 +3577,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.3,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 0.6,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -4532,7 +4652,16 @@
         "input": 2,
         "output": 12,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 18,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -4667,7 +4796,16 @@
         "input": 3,
         "output": 15,
         "cacheRead": 0.3,
-        "cacheWrite": 3.75
+        "cacheWrite": 3.75,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 6,
+            "output": 22.5,
+            "cacheRead": 0.6,
+            "cacheWrite": 7.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -5004,7 +5142,16 @@
         "input": 0.2,
         "output": 1.2,
         "cacheRead": 0.02,
-        "cacheWrite": 0.25
+        "cacheWrite": 0.25,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 0.4,
+            "output": 1.8,
+            "cacheRead": 0.04,
+            "cacheWrite": 0.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -5474,7 +5621,16 @@
         "input": 5,
         "output": 30,
         "cacheRead": 0.5,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 10,
+            "output": 45,
+            "cacheRead": 1,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -6404,7 +6560,16 @@
         "input": 0.1,
         "output": 0.5,
         "cacheRead": 0.01,
-        "cacheWrite": 0.125
+        "cacheWrite": 0.125,
+        "tiers": [
+          {
+            "size": 100000,
+            "input": 0.5,
+            "output": 2.5,
+            "cacheRead": 0.05,
+            "cacheWrite": 0.625
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -6608,7 +6773,16 @@
         "input": 0.1,
         "output": 0.5,
         "cacheRead": 0.01,
-        "cacheWrite": 0.125
+        "cacheWrite": 0.125,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 0.2,
+            "output": 0.75,
+            "cacheRead": 0.02,
+            "cacheWrite": 0.25
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -7009,7 +7183,16 @@
         "input": 2.5,
         "output": 15,
         "cacheRead": 0.25,
-        "cacheWrite": 3.125
+        "cacheWrite": 3.125,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 5,
+            "output": 22.5,
+            "cacheRead": 0.5,
+            "cacheWrite": 6.25
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -7545,7 +7728,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.5,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 1,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -7612,7 +7804,16 @@
         "input": 2,
         "output": 12,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 18,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -7747,7 +7948,16 @@
         "input": 4,
         "output": 20,
         "cacheRead": 0.4,
-        "cacheWrite": 5
+        "cacheWrite": 5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 8,
+            "output": 30,
+            "cacheRead": 0.8,
+            "cacheWrite": 10
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -7774,6 +7984,76 @@
         "agentic": 8.23,
         "general": 7.72,
         "capability": 8.02
+      },
+      "freeTier": null,
+      "provenance": {
+        "metadata": "models.dev",
+        "benchmark": null,
+        "estimated": true,
+        "estimatedFields": [
+          "reasoning",
+          "code",
+          "agentic",
+          "general"
+        ]
+      }
+    },
+    {
+      "key": "opencode/gemini-4-argon",
+      "providerID": "opencode",
+      "id": "gemini-4-argon",
+      "name": "Gemini 4 Argon",
+      "description": "Google's flagship reasoning model for complex software engineering, deep math and science, and long-horizon autonomous agents",
+      "family": "gemini",
+      "releaseDate": "2026-10-13",
+      "knowledge": "2026-03",
+      "openWeights": false,
+      "context": 1048576,
+      "maxOutput": 65536,
+      "capabilities": {
+        "text": true,
+        "image": true,
+        "audio": true,
+        "pdf": true,
+        "video": true,
+        "reasoning": true,
+        "toolCall": true,
+        "structured": true,
+        "embedding": false
+      },
+      "pricing": {
+        "input": 2,
+        "output": 10,
+        "cacheRead": 0.1,
+        "cacheWrite": 0
+      },
+      "local": false,
+      "weights": {
+        "total": null,
+        "active": null,
+        "moe": false,
+        "source": "unknown"
+      },
+      "cloud": true,
+      "reachable": false,
+      "capabilityTags": [
+        "text",
+        "image",
+        "audio",
+        "pdf",
+        "video",
+        "reasoning",
+        "toolCall",
+        "structured"
+      ],
+      "canonicalID": "google/gemini-4-argon",
+      "benchmarks": null,
+      "scores": {
+        "reasoning": 7.66,
+        "code": 6.76,
+        "agentic": 7.93,
+        "general": 8.07,
+        "capability": 7.78
       },
       "freeTier": null,
       "provenance": {
@@ -8019,7 +8299,16 @@
         "input": 2,
         "output": 10,
         "cacheRead": 0.2,
-        "cacheWrite": 2.5
+        "cacheWrite": 2.5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 4,
+            "output": 15,
+            "cacheRead": 0.4,
+            "cacheWrite": 5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -8288,7 +8577,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.5,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 1,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -8381,6 +8679,76 @@
         "agentic": 4.89,
         "general": 4.18,
         "capability": 5.16
+      },
+      "freeTier": null,
+      "provenance": {
+        "metadata": "models.dev",
+        "benchmark": null,
+        "estimated": true,
+        "estimatedFields": [
+          "reasoning",
+          "code",
+          "agentic",
+          "general"
+        ]
+      }
+    },
+    {
+      "key": "opencode-go/gemini-4-argon-contributor",
+      "providerID": "opencode-go",
+      "id": "gemini-4-argon-contributor",
+      "name": "Gemini 4 Argon Contributor",
+      "description": "Google's flagship reasoning model for complex software engineering, deep math and science, and long-horizon autonomous agents",
+      "family": "gemini",
+      "releaseDate": "2026-10-13",
+      "knowledge": "2026-03",
+      "openWeights": false,
+      "context": 1048576,
+      "maxOutput": 65536,
+      "capabilities": {
+        "text": true,
+        "image": true,
+        "audio": true,
+        "pdf": true,
+        "video": true,
+        "reasoning": true,
+        "toolCall": true,
+        "structured": true,
+        "embedding": false
+      },
+      "pricing": {
+        "input": 4,
+        "output": 20,
+        "cacheRead": 0.2,
+        "cacheWrite": 0
+      },
+      "local": false,
+      "weights": {
+        "total": null,
+        "active": null,
+        "moe": false,
+        "source": "unknown"
+      },
+      "cloud": true,
+      "reachable": true,
+      "capabilityTags": [
+        "text",
+        "image",
+        "audio",
+        "pdf",
+        "video",
+        "reasoning",
+        "toolCall",
+        "structured"
+      ],
+      "canonicalID": "google/gemini-4-argon",
+      "benchmarks": null,
+      "scores": {
+        "reasoning": 7.91,
+        "code": 7.02,
+        "agentic": 8.18,
+        "general": 8.32,
+        "capability": 8.01
       },
       "freeTier": null,
       "provenance": {
@@ -8704,7 +9072,7 @@
         "source": "unknown"
       },
       "cloud": true,
-      "reachable": true,
+      "reachable": false,
       "capabilityTags": [
         "text",
         "image",
@@ -8867,6 +9235,72 @@
       }
     },
     {
+      "key": "opencode-go/cat-jam-free",
+      "providerID": "opencode-go",
+      "id": "cat-jam-free",
+      "name": "Cat Jam Free",
+      "description": "A text-only reasoning model for coding and agentic workflows, with tool calling and structured JSON outputs.",
+      "family": "",
+      "releaseDate": "2026-10-12",
+      "knowledge": "",
+      "openWeights": false,
+      "context": 262144,
+      "maxOutput": 131072,
+      "capabilities": {
+        "text": true,
+        "image": false,
+        "audio": false,
+        "pdf": false,
+        "video": false,
+        "reasoning": true,
+        "toolCall": true,
+        "structured": true,
+        "embedding": false
+      },
+      "pricing": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0
+      },
+      "local": false,
+      "weights": {
+        "total": null,
+        "active": null,
+        "moe": false,
+        "source": "unknown"
+      },
+      "cloud": true,
+      "reachable": true,
+      "capabilityTags": [
+        "text",
+        "reasoning",
+        "toolCall",
+        "structured"
+      ],
+      "canonicalID": null,
+      "benchmarks": null,
+      "scores": {
+        "reasoning": 5.2,
+        "code": 4.35,
+        "agentic": 5.34,
+        "general": 3.97,
+        "capability": 5.02
+      },
+      "freeTier": null,
+      "provenance": {
+        "metadata": "models.dev",
+        "benchmark": null,
+        "estimated": true,
+        "estimatedFields": [
+          "reasoning",
+          "code",
+          "agentic",
+          "general"
+        ]
+      }
+    },
+    {
       "key": "opencode-go/grok-4.5",
       "providerID": "opencode-go",
       "id": "grok-4.5",
@@ -8893,7 +9327,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.3,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 0.6,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -9293,7 +9736,16 @@
         "input": 0.3,
         "output": 1.2,
         "cacheRead": 0.06,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 512000,
+            "input": 0.6,
+            "output": 2.4,
+            "cacheRead": 0.12,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -9360,7 +9812,16 @@
         "input": 0.2,
         "output": 1.2,
         "cacheRead": 0.02,
-        "cacheWrite": 0.25
+        "cacheWrite": 0.25,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 0.4,
+            "output": 1.8,
+            "cacheRead": 0.04,
+            "cacheWrite": 0.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -9697,7 +10158,16 @@
         "input": 0.1,
         "output": 0.5,
         "cacheRead": 0.01,
-        "cacheWrite": 0.125
+        "cacheWrite": 0.125,
+        "tiers": [
+          {
+            "size": 100000,
+            "input": 0.5,
+            "output": 2.5,
+            "cacheRead": 0.05,
+            "cacheWrite": 0.625
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -9765,7 +10235,16 @@
         "input": 0.1,
         "output": 0.5,
         "cacheRead": 0.01,
-        "cacheWrite": 0.125
+        "cacheWrite": 0.125,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 0.2,
+            "output": 0.75,
+            "cacheRead": 0.02,
+            "cacheWrite": 0.25
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -9899,7 +10378,16 @@
         "input": 0.5,
         "output": 3,
         "cacheRead": 0.05,
-        "cacheWrite": 0.625
+        "cacheWrite": 0.625,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 2,
+            "output": 6,
+            "cacheRead": 0.2,
+            "cacheWrite": 2.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -10303,7 +10791,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.5,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 1,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -10370,7 +10867,16 @@
         "input": 0.4,
         "output": 1.6,
         "cacheRead": 0.04,
-        "cacheWrite": 0.5
+        "cacheWrite": 0.5,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 1.2,
+            "output": 4.8,
+            "cacheRead": 0.12,
+            "cacheWrite": 1.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -10447,7 +10953,7 @@
         "source": "unknown"
       },
       "cloud": true,
-      "reachable": true,
+      "reachable": false,
       "capabilityTags": [
         "text",
         "reasoning",
@@ -12094,7 +12600,16 @@
         "input": 0.1456,
         "output": 0.4367,
         "cacheRead": 0.0291,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.2911,
+            "output": 0.8734,
+            "cacheRead": 0.0582,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -12161,7 +12676,16 @@
         "input": 0.2911,
         "output": 1.1645,
         "cacheRead": 0.0582,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.5823,
+            "output": 2.3291,
+            "cacheRead": 0.1165,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -12227,7 +12751,16 @@
         "input": 0.726,
         "output": 3.1946,
         "cacheRead": 0.1743,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 1.0165,
+            "output": 3.7754,
+            "cacheRead": 0.2614,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -12364,7 +12897,16 @@
         "input": 0.2911,
         "output": 1.1645,
         "cacheRead": 0.0582,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.5823,
+            "output": 2.3291,
+            "cacheRead": 0.1165,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -12430,7 +12972,16 @@
         "input": 0.58,
         "output": 2.6,
         "cacheRead": 0.14,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.87,
+            "output": 3.18,
+            "cacheRead": 0.22,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -12496,7 +13047,16 @@
         "input": 0.0218,
         "output": 0.2184,
         "cacheRead": 0.0044,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.0437,
+            "output": 0.4367,
+            "cacheRead": 0.0044,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -12632,7 +13192,16 @@
         "input": 0.2911,
         "output": 1.1645,
         "cacheRead": 0.0582,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.5823,
+            "output": 2.3291,
+            "cacheRead": 0.1165,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -12829,7 +13398,16 @@
         "input": 0.8781,
         "output": 3.5126,
         "cacheRead": 0.1903,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 1.1709,
+            "output": 4.098,
+            "cacheRead": 0.2927,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -12960,7 +13538,16 @@
         "input": 0.73,
         "output": 3.19,
         "cacheRead": 0.174,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 1.02,
+            "output": 3.77,
+            "cacheRead": 0.261,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -13026,7 +13613,16 @@
         "input": 0,
         "output": 0,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -13072,7 +13668,7 @@
       "providerID": "zenmux",
       "id": "z-ai/glm-image",
       "name": "GLM-Image",
-      "description": "GLM-Image is an image generation model adopts a hybrid autoregressive + diffusion decoder architecture. In general image generation quality, GLM\u2011Image aligns with mainstream latent diffusion approaches, but it shows significant advantages in text-rendering and knowledge\u2011intensive generation scenarios. It performs especially well in tasks requiring precise semantic understanding and complex information expression, while maintaining strong capabilities in high\u2011fidelity and fine\u2011grained detail generation. In addition to text\u2011to\u2011image generation, GLM\u2011Image also supports a rich set of image\u2011to\u2011image tasks including image editing, style transfer, identity\u2011preserving generation, and multi\u2011subject consistency.",
+      "description": "GLM-Image is an image generation model adopts a hybrid autoregressive + diffusion decoder architecture. In general image generation quality, GLM‑Image aligns with mainstream latent diffusion approaches, but it shows significant advantages in text-rendering and knowledge‑intensive generation scenarios. It performs especially well in tasks requiring precise semantic understanding and complex information expression, while maintaining strong capabilities in high‑fidelity and fine‑grained detail generation. In addition to text‑to‑image generation, GLM‑Image also supports a rich set of image‑to‑image tasks including image editing, style transfer, identity‑preserving generation, and multi‑subject consistency.",
       "family": "",
       "releaseDate": "2026-01-19",
       "knowledge": "",
@@ -13155,7 +13751,16 @@
         "input": 0.1165,
         "output": 0.2911,
         "cacheRead": 0.0233,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.1747,
+            "output": 1.1645,
+            "cacheRead": 0.0349,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -13417,7 +14022,16 @@
         "input": 1.25,
         "output": 2.5,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 2.5,
+            "output": 5,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -13485,7 +14099,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.5,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 1,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -13531,7 +14154,7 @@
       "providerID": "zenmux",
       "id": "x-ai/grok-voice-tts-1.0",
       "name": "Grok Voice TTS 1.0",
-      "description": "Convert text into spoken audio with a single API call. The API supports a rich set of expressive voices, inline speech tags for fine-grained delivery control, and output formats from high-fidelity MP3 to telephony-optimized \u03bc-law.",
+      "description": "Convert text into spoken audio with a single API call. The API supports a rich set of expressive voices, inline speech tags for fine-grained delivery control, and output formats from high-fidelity MP3 to telephony-optimized μ-law.",
       "family": "",
       "releaseDate": "2026-07-31",
       "knowledge": "",
@@ -13802,7 +14425,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 128000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 0.2,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -13868,7 +14500,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 128000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 0.2,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -13934,7 +14575,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.5,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 1,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -16074,7 +16724,16 @@
         "input": 0.4,
         "output": 2,
         "cacheRead": 0.08,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 0.8,
+            "output": 4,
+            "cacheRead": 0.16,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -16211,7 +16870,16 @@
         "input": 1,
         "output": 3,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 2,
+            "output": 6,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -16276,7 +16944,16 @@
         "input": 1,
         "output": 3,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 2,
+            "output": 6,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -17389,7 +18066,16 @@
         "input": 0.5,
         "output": 3,
         "cacheRead": 0.05,
-        "cacheWrite": 0.625
+        "cacheWrite": 0.625,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 2,
+            "output": 6,
+            "cacheRead": 0.2,
+            "cacheWrite": 2.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -17454,7 +18140,16 @@
         "input": 0.4,
         "output": 1.6,
         "cacheRead": 0.08,
-        "cacheWrite": 0.5
+        "cacheWrite": 0.5,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 1.2,
+            "output": 4.8,
+            "cacheRead": 0.24,
+            "cacheWrite": 1.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -17718,7 +18413,16 @@
         "input": 30,
         "output": 180,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 60,
+            "output": 270,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -18250,7 +18954,16 @@
         "input": 10,
         "output": 50,
         "cacheRead": 1,
-        "cacheWrite": 12.5
+        "cacheWrite": 12.5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 20,
+            "output": 75,
+            "cacheRead": 2,
+            "cacheWrite": 25
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -18450,7 +19163,16 @@
         "input": 1,
         "output": 6,
         "cacheRead": 0.1,
-        "cacheWrite": 1.25
+        "cacheWrite": 1.25,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 2,
+            "output": 9,
+            "cacheRead": 0.2,
+            "cacheWrite": 2.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -18585,7 +19307,16 @@
         "input": 5,
         "output": 30,
         "cacheRead": 0.5,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 10,
+            "output": 45,
+            "cacheRead": 1,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -18719,7 +19450,16 @@
         "input": 2.5,
         "output": 15,
         "cacheRead": 0.25,
-        "cacheWrite": 3.125
+        "cacheWrite": 3.125,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 5,
+            "output": 22.5,
+            "cacheRead": 0.5,
+            "cacheWrite": 6.25
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -18920,7 +19660,16 @@
         "input": 5,
         "output": 30,
         "cacheRead": 0.5,
-        "cacheWrite": 6.25
+        "cacheWrite": 6.25,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 10,
+            "output": 45,
+            "cacheRead": 1,
+            "cacheWrite": 12.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -18988,7 +19737,16 @@
         "input": 2,
         "output": 10,
         "cacheRead": 0.2,
-        "cacheWrite": 2.5
+        "cacheWrite": 2.5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 4,
+            "output": 15,
+            "cacheRead": 0.4,
+            "cacheWrite": 5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -21603,7 +22361,16 @@
         "input": 0.1,
         "output": 0.5,
         "cacheRead": 0.01,
-        "cacheWrite": 0.125
+        "cacheWrite": 0.125,
+        "tiers": [
+          {
+            "size": 100000,
+            "input": 0.5,
+            "output": 2.5,
+            "cacheRead": 0.05,
+            "cacheWrite": 0.625
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -21936,7 +22703,16 @@
         "input": 2.5,
         "output": 15,
         "cacheRead": 0.25,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 5,
+            "output": 22.5,
+            "cacheRead": 0.5,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -22004,7 +22780,16 @@
         "input": 30,
         "output": 180,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 60,
+            "output": 270,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -22131,7 +22916,16 @@
         "input": 30,
         "output": 180,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 60,
+            "output": 270,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -23181,7 +23975,16 @@
         "input": 4,
         "output": 20,
         "cacheRead": 0.4,
-        "cacheWrite": 5
+        "cacheWrite": 5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 8,
+            "output": 30,
+            "cacheRead": 0.8,
+            "cacheWrite": 10
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -23519,7 +24322,16 @@
         "input": 2,
         "output": 10,
         "cacheRead": 0.1,
-        "cacheWrite": 2.5
+        "cacheWrite": 2.5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 4,
+            "output": 15,
+            "cacheRead": 0.2,
+            "cacheWrite": 5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -23714,7 +24526,16 @@
         "input": 10,
         "output": 50,
         "cacheRead": 1,
-        "cacheWrite": 12.5
+        "cacheWrite": 12.5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 20,
+            "output": 75,
+            "cacheRead": 2,
+            "cacheWrite": 25
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -24044,7 +24865,16 @@
         "input": 4,
         "output": 20,
         "cacheRead": 0.4,
-        "cacheWrite": 5
+        "cacheWrite": 5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 8,
+            "output": 30,
+            "cacheRead": 0.8,
+            "cacheWrite": 10
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -24179,7 +25009,16 @@
         "input": 0.2,
         "output": 1.2,
         "cacheRead": 0.02,
-        "cacheWrite": 0.25
+        "cacheWrite": 0.25,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 0.4,
+            "output": 1.8,
+            "cacheRead": 0.04,
+            "cacheWrite": 0.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -24314,7 +25153,16 @@
         "input": 5,
         "output": 30,
         "cacheRead": 0.5,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 10,
+            "output": 45,
+            "cacheRead": 1,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -24582,7 +25430,16 @@
         "input": 0.1,
         "output": 0.5,
         "cacheRead": 0.01,
-        "cacheWrite": 0.125
+        "cacheWrite": 0.125,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 0.2,
+            "output": 0.75,
+            "cacheRead": 0.02,
+            "cacheWrite": 0.25
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -24838,7 +25695,16 @@
         "input": 2,
         "output": 12,
         "cacheRead": 0.2,
-        "cacheWrite": 2.5
+        "cacheWrite": 2.5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 4,
+            "output": 18,
+            "cacheRead": 0.4,
+            "cacheWrite": 5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -25176,7 +26042,16 @@
         "input": 4,
         "output": 20,
         "cacheRead": 0.4,
-        "cacheWrite": 5
+        "cacheWrite": 5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 8,
+            "output": 30,
+            "cacheRead": 0.8,
+            "cacheWrite": 10
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -25244,7 +26119,16 @@
         "input": 2,
         "output": 10,
         "cacheRead": 0.2,
-        "cacheWrite": 2.5
+        "cacheWrite": 2.5,
+        "tiers": [
+          {
+            "size": 272000,
+            "input": 4,
+            "output": 15,
+            "cacheRead": 0.4,
+            "cacheWrite": 5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -26491,7 +27375,16 @@
         "input": 2,
         "output": 12,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 18,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -26561,7 +27454,16 @@
         "input": 1.25,
         "output": 10,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 2.5,
+            "output": 15,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -26695,7 +27597,16 @@
         "input": 1.25,
         "output": 10,
         "cacheRead": 0.125,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 2.5,
+            "output": 15,
+            "cacheRead": 0.25,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -27035,7 +27946,16 @@
         "input": 2,
         "output": 12,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 18,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -27104,7 +28024,16 @@
         "input": 2,
         "output": 12,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 18,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -27365,7 +28294,16 @@
         "input": 2,
         "output": 12,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 18,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -27864,6 +28802,76 @@
         "agentic": 6.36,
         "general": 6.25,
         "capability": 5.89
+      },
+      "freeTier": null,
+      "provenance": {
+        "metadata": "models.dev",
+        "benchmark": null,
+        "estimated": true,
+        "estimatedFields": [
+          "reasoning",
+          "code",
+          "agentic",
+          "general"
+        ]
+      }
+    },
+    {
+      "key": "google/gemini-4-argon",
+      "providerID": "google",
+      "id": "gemini-4-argon",
+      "name": "Gemini 4 Argon",
+      "description": "Google's flagship reasoning model for complex software engineering, deep math and science, and long-horizon autonomous agents",
+      "family": "gemini",
+      "releaseDate": "2026-10-13",
+      "knowledge": "2026-03",
+      "openWeights": false,
+      "context": 1048576,
+      "maxOutput": 32768,
+      "capabilities": {
+        "text": true,
+        "image": true,
+        "audio": true,
+        "pdf": true,
+        "video": true,
+        "reasoning": true,
+        "toolCall": true,
+        "structured": true,
+        "embedding": false
+      },
+      "pricing": {
+        "input": 2,
+        "output": 10,
+        "cacheRead": 0.1,
+        "cacheWrite": 0
+      },
+      "local": false,
+      "weights": {
+        "total": null,
+        "active": null,
+        "moe": false,
+        "source": "unknown"
+      },
+      "cloud": true,
+      "reachable": false,
+      "capabilityTags": [
+        "text",
+        "image",
+        "audio",
+        "pdf",
+        "video",
+        "reasoning",
+        "toolCall",
+        "structured"
+      ],
+      "canonicalID": "google/gemini-4-argon",
+      "benchmarks": null,
+      "scores": {
+        "reasoning": 7.66,
+        "code": 6.76,
+        "agentic": 7.93,
+        "general": 8.07,
+        "capability": 7.78
       },
       "freeTier": null,
       "provenance": {
@@ -28514,7 +29522,16 @@
         "input": 0.05,
         "output": 0.4,
         "cacheRead": 0.005,
-        "cacheWrite": 0.01
+        "cacheWrite": 0.01,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 0.25,
+            "output": 2,
+            "cacheRead": 0.025,
+            "cacheWrite": 0.05
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -28625,7 +29642,7 @@
       "providerID": "alibaba",
       "id": "qwen3.7-max",
       "name": "Qwen3.7-Max",
-      "description": "The Max model, the largest and most capable in the Qwen3.7 series, currently offers a pure\u2011text\u2011only interface for public experimentation. Qwen3.7 is a next\u2011generation flagship model designed for the agent\u2011centric era, with its core strengths lying in the breadth and depth of its agent\u2011level capabilities: it excels at programming, office and productivity tasks, and long\u2011term autonomous execution.",
+      "description": "The Max model, the largest and most capable in the Qwen3.7 series, currently offers a pure‑text‑only interface for public experimentation. Qwen3.7 is a next‑generation flagship model designed for the agent‑centric era, with its core strengths lying in the breadth and depth of its agent‑level capabilities: it excels at programming, office and productivity tasks, and long‑term autonomous execution.",
       "family": "qwen",
       "releaseDate": "2026-05-21T17:06:44",
       "knowledge": "",
@@ -28906,7 +29923,23 @@
         "input": 0.2,
         "output": 1.6,
         "cacheRead": 0.02,
-        "cacheWrite": 0.04
+        "cacheWrite": 0.04,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.3,
+            "output": 2.4,
+            "cacheRead": 0.03,
+            "cacheWrite": 0.06
+          },
+          {
+            "size": 128000,
+            "input": 0.6,
+            "output": 4.8,
+            "cacheRead": 0.06,
+            "cacheWrite": 0.12
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -29279,7 +30312,7 @@
       "providerID": "alibaba",
       "id": "kimi-k3",
       "name": "Kimi-K3",
-      "description": "Kimi-K3 is Moonshot AI\u2019s most capable flagship model to date, featuring 2.8 trillion parameters. Built on the KDA hybrid linear attention mechanism (Kimi Delta Attention) and Attention Residuals, it natively supports visual understanding and offers a 1-million-token context window. As the world's first open-source model at the 3-trillion-parameter scale, it is designed for frontier intelligence scenarios such as long-horizon programming, knowledge work, and reasoning.",
+      "description": "Kimi-K3 is Moonshot AI’s most capable flagship model to date, featuring 2.8 trillion parameters. Built on the KDA hybrid linear attention mechanism (Kimi Delta Attention) and Attention Residuals, it natively supports visual understanding and offers a 1-million-token context window. As the world's first open-source model at the 3-trillion-parameter scale, it is designed for frontier intelligence scenarios such as long-horizon programming, knowledge work, and reasoning.",
       "family": "moonshot-ai",
       "releaseDate": "2026-08-19T20:05:17",
       "knowledge": "",
@@ -29429,7 +30462,16 @@
         "input": 0.4,
         "output": 2.4,
         "cacheRead": 0.04,
-        "cacheWrite": 0.5
+        "cacheWrite": 0.5,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 0.5,
+            "output": 3,
+            "cacheRead": 0.05,
+            "cacheWrite": 0.625
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -29687,7 +30729,16 @@
         "input": 0.4,
         "output": 1.2,
         "cacheRead": 0.04,
-        "cacheWrite": 0.08
+        "cacheWrite": 0.08,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 1.2,
+            "output": 3.6,
+            "cacheRead": 0.12,
+            "cacheWrite": 0.24
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -29752,7 +30803,23 @@
         "input": 0.03,
         "output": 0.13,
         "cacheRead": 0.003,
-        "cacheWrite": 0.006
+        "cacheWrite": 0.006,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.1,
+            "output": 0.4,
+            "cacheRead": 0.01,
+            "cacheWrite": 0.02
+          },
+          {
+            "size": 256000,
+            "input": 0.2,
+            "output": 0.8,
+            "cacheRead": 0.02,
+            "cacheWrite": 0.04
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -29950,7 +31017,23 @@
         "input": 1.5,
         "output": 7.5,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 2.7,
+            "output": 13.5,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          {
+            "size": 128000,
+            "input": 4.5,
+            "output": 22.5,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -30079,7 +31162,23 @@
         "input": 0.45,
         "output": 2.25,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.75,
+            "output": 3.75,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          {
+            "size": 128000,
+            "input": 1.2,
+            "output": 6,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -30121,7 +31220,7 @@
       "providerID": "alibaba",
       "id": "qwen3.8-omni-flash",
       "name": "Qwen3.8-Omni-Flash",
-      "description": "Qwen\u2019s next-generation native omni-modal model supports context lengths of up to 1M tokens and natively accepts text, image, audio, and video inputs. Built on the Qwen3.8-Flash-Next architecture, it is designed for agentic capabilities in real-world productivity scenarios. In addition to coding, knowledge work, GUI interaction, and other agentic tasks, it delivers significant performance gains in workflows that require integrated processing of text, images, audio, and video, including video editing, music video creation, film and video production and narration, multimedia summarization, and audio-video dialogue. It supports two-channel and four-channel spatial audio understanding and is compatible with both the DashScope and OpenAI protocols. We recommend installing the companion Qwen-MM-Plugins to help agent frameworks access its native multimodal capabilities.",
+      "description": "Qwen’s next-generation native omni-modal model supports context lengths of up to 1M tokens and natively accepts text, image, audio, and video inputs. Built on the Qwen3.8-Flash-Next architecture, it is designed for agentic capabilities in real-world productivity scenarios. In addition to coding, knowledge work, GUI interaction, and other agentic tasks, it delivers significant performance gains in workflows that require integrated processing of text, images, audio, and video, including video editing, music video creation, film and video production and narration, multimedia summarization, and audio-video dialogue. It supports two-channel and four-channel spatial audio understanding and is compatible with both the DashScope and OpenAI protocols. We recommend installing the companion Qwen-MM-Plugins to help agent frameworks access its native multimodal capabilities.",
       "family": "qwen",
       "releaseDate": "2026-09-09T16:51:31",
       "knowledge": "",
@@ -30319,7 +31418,7 @@
       "providerID": "alibaba",
       "id": "qwen3-omni-flash",
       "name": "Qwen3-Omni-Flash",
-      "description": "Qwen3-Omni-Flash multimodal large-scale model, based on the Thinker\u2013Talker Mixed Expert (MoE) architecture, supports efficient understanding and speech generation of text, images, audio, and video. It can interact with text in 119 languages \u200b\u200band speech in 20 languages, generating human-like speech for precise cross-lingual communication. The model boasts powerful command-following and system prompt customization capabilities, flexibly adapting to conversational styles and character settings. It is widely used in scenarios such as text creation, voice assistants, and multimedia analysis, providing a natural and smooth multimodal interaction experience.",
+      "description": "Qwen3-Omni-Flash multimodal large-scale model, based on the Thinker–Talker Mixed Expert (MoE) architecture, supports efficient understanding and speech generation of text, images, audio, and video. It can interact with text in 119 languages ​​and speech in 20 languages, generating human-like speech for precise cross-lingual communication. The model boasts powerful command-following and system prompt customization capabilities, flexibly adapting to conversational styles and character settings. It is widely used in scenarios such as text creation, voice assistants, and multimedia analysis, providing a natural and smooth multimodal interaction experience.",
       "family": "qwen",
       "releaseDate": "2025-12-04T00:00:00",
       "knowledge": "",
@@ -30863,7 +31962,16 @@
         "input": 0.25,
         "output": 1.5,
         "cacheRead": 0.025,
-        "cacheWrite": 0.3125
+        "cacheWrite": 0.3125,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 1,
+            "output": 4,
+            "cacheRead": 0.1,
+            "cacheWrite": 1.25
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -30931,7 +32039,30 @@
         "input": 0.3,
         "output": 1.5,
         "cacheRead": 0.03,
-        "cacheWrite": 0.06
+        "cacheWrite": 0.06,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.5,
+            "output": 2.5,
+            "cacheRead": 0.05,
+            "cacheWrite": 0.1
+          },
+          {
+            "size": 128000,
+            "input": 0.8,
+            "output": 4,
+            "cacheRead": 0.08,
+            "cacheWrite": 0.16
+          },
+          {
+            "size": 256000,
+            "input": 1.6,
+            "output": 9.6,
+            "cacheRead": 0.16,
+            "cacheWrite": 0.32
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -31292,7 +32423,7 @@
       "providerID": "alibaba",
       "id": "qwen3.8-flash",
       "name": "Qwen3.8-Flash",
-      "description": "Qwen3.8-Flash is the latest multimodal model from the Qwen family, combining powerful reasoning and generation with remarkable speed. It natively supports a million-token context window, allowing it to process lengthy documents, entire codebases, and complex conversations in a single pass. It shines in coding assistance, agentic workflows, and visual understanding \u2014 whether it's fixing code autonomously, operating desktop applications, or analyzing charts and long videos. Fully compatible with both OpenAI and Anthropic API protocols, it integrates seamlessly with popular developer tools like Claude Code and Codex, making it easy to build high-concurrency applications and intelligent workflows. With strong performance and highly competitive inference costs, Qwen3.8-Flash is an ideal choice for developers and businesses seeking the best of both worlds in AI applications.",
+      "description": "Qwen3.8-Flash is the latest multimodal model from the Qwen family, combining powerful reasoning and generation with remarkable speed. It natively supports a million-token context window, allowing it to process lengthy documents, entire codebases, and complex conversations in a single pass. It shines in coding assistance, agentic workflows, and visual understanding — whether it's fixing code autonomously, operating desktop applications, or analyzing charts and long videos. Fully compatible with both OpenAI and Anthropic API protocols, it integrates seamlessly with popular developer tools like Claude Code and Codex, making it easy to build high-concurrency applications and intelligent workflows. With strong performance and highly competitive inference costs, Qwen3.8-Flash is an ideal choice for developers and businesses seeking the best of both worlds in AI applications.",
       "family": "qwen",
       "releaseDate": "2026-08-25T20:15:44",
       "knowledge": "",
@@ -32103,7 +33234,16 @@
         "input": 0.5,
         "output": 3,
         "cacheRead": 0.05,
-        "cacheWrite": 0.625
+        "cacheWrite": 0.625,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 2,
+            "output": 6,
+            "cacheRead": 0.2,
+            "cacheWrite": 2.5
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -32214,7 +33354,7 @@
       "providerID": "alibaba",
       "id": "qwen3.7-plus",
       "name": "Qwen3.7-Plus",
-      "description": "Among the Qwen3.7 series, the cost-effective Plus model builds on its robust text capabilities while delivering a comprehensive upgrade to its vision\u2011language abilities, all while preserving its full\u2011stack agent\u2011level intelligence for coding, tool use, and productivity workflows. Its key distinguishing feature is multi\u2011modal interactive hybrid agent capabilities, enabling it to perceive real\u2011world scenes, read screens and interact with GUIs, generate code based on visual references, and perform end\u2011to\u2011end navigation within mobile apps.",
+      "description": "Among the Qwen3.7 series, the cost-effective Plus model builds on its robust text capabilities while delivering a comprehensive upgrade to its vision‑language abilities, all while preserving its full‑stack agent‑level intelligence for coding, tool use, and productivity workflows. Its key distinguishing feature is multi‑modal interactive hybrid agent capabilities, enabling it to perceive real‑world scenes, read screens and interact with GUIs, generate code based on visual references, and perform end‑to‑end navigation within mobile apps.",
       "family": "qwen",
       "releaseDate": "2026-06-01T20:18:21",
       "knowledge": "",
@@ -32236,7 +33376,16 @@
         "input": 0.4,
         "output": 1.6,
         "cacheRead": 0.04,
-        "cacheWrite": 0.08
+        "cacheWrite": 0.08,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 1.2,
+            "output": 4.8,
+            "cacheRead": 0.12,
+            "cacheWrite": 0.24
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -32365,7 +33514,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.5,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 1,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -32616,7 +33774,16 @@
         "input": 1.25,
         "output": 2.5,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 2.5,
+            "output": 5,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -32684,7 +33851,16 @@
         "input": 1.25,
         "output": 2.5,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 2.5,
+            "output": 5,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -32813,7 +33989,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.3,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 0.6,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -32881,7 +34066,16 @@
         "input": 1.25,
         "output": 2.5,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 2.5,
+            "output": 5,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -33009,7 +34203,16 @@
         "input": 1,
         "output": 2,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 2,
+            "output": 4,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -33077,7 +34280,16 @@
         "input": 1.25,
         "output": 2.5,
         "cacheRead": 0.2,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 2.5,
+            "output": 5,
+            "cacheRead": 0.4,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -33144,7 +34356,16 @@
         "input": 2,
         "output": 6,
         "cacheRead": 0.5,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 200000,
+            "input": 4,
+            "output": 12,
+            "cacheRead": 1,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -33190,7 +34411,7 @@
       "providerID": "ollama",
       "id": "deepseek-v4.1-flash",
       "name": "deepseek-v4.1-flash",
-      "description": "DeepSeek-V4.1-Flash is an advanced tool designed to enhance search capabilities, providing users with faster and more accurate results. Medium usage $0.30 in \u00b7 $1.20 out per 1M tokens",
+      "description": "DeepSeek-V4.1-Flash is an advanced tool designed to enhance search capabilities, providing users with faster and more accurate results. Medium usage $0.30 in · $1.20 out per 1M tokens",
       "family": "",
       "releaseDate": "",
       "knowledge": "",
@@ -33257,7 +34478,7 @@
       "providerID": "ollama",
       "id": "glm-5.3",
       "name": "glm-5.3",
-      "description": "Z.ai's flagship model and the most capable open-weights model for coding, with major gains on long-horizon agentic tasks. High usage $1.40 in \u00b7 $4.40 out per 1M tokens $$$$ | 1M context | tools",
+      "description": "Z.ai's flagship model and the most capable open-weights model for coding, with major gains on long-horizon agentic tasks. High usage $1.40 in · $4.40 out per 1M tokens $$$$ | 1M context | tools",
       "family": "",
       "releaseDate": "",
       "knowledge": "",
@@ -35285,7 +36506,7 @@
       "providerID": "ollama",
       "id": "north-mini-code-1.0",
       "name": "north-mini-code-1.0",
-      "description": "North Mini Code is Cohere's first model for developers \u2014 a 30B Mixture-of-Experts model.",
+      "description": "North Mini Code is Cohere's first model for developers — a 30B Mixture-of-Experts model.",
       "family": "",
       "releaseDate": "",
       "knowledge": "",
@@ -39715,7 +40936,7 @@
       "providerID": "alibaba",
       "id": "qwen3.8-max-0902",
       "name": "Qwen3.8-Max-0902",
-      "description": "Qwen3.8-Max-0902\uff08alias qwen3.8-max-2026-09-02\uff09is an upgraded snapshot of qwen3.8-max. Coding capability breaks new ground, handling more complex engineering-scale projects and long-horizon autonomous development. Collaborative agent performance is significantly enhanced, with greater composure in multi-tool orchestration and end-to-end task delivery. Native vision understanding is refined across chart reasoning, document parsing, and multimodal perception \u2014 sharper and more reliable. Retains the 1M context window, thinking mode, and full tool ecosystem, evolving at a higher level of intelligence.",
+      "description": "Qwen3.8-Max-0902（alias qwen3.8-max-2026-09-02）is an upgraded snapshot of qwen3.8-max. Coding capability breaks new ground, handling more complex engineering-scale projects and long-horizon autonomous development. Collaborative agent performance is significantly enhanced, with greater composure in multi-tool orchestration and end-to-end task delivery. Native vision understanding is refined across chart reasoning, document parsing, and multimodal perception — sharper and more reliable. Retains the 1M context window, thinking mode, and full tool ecosystem, evolving at a higher level of intelligence.",
       "family": "qwen",
       "releaseDate": "2026-09-01T17:03:25",
       "knowledge": "",
@@ -39872,7 +41093,23 @@
         "input": 0.03,
         "output": 0.13,
         "cacheRead": 0.003,
-        "cacheWrite": 0.006
+        "cacheWrite": 0.006,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.1,
+            "output": 0.4,
+            "cacheRead": 0.01,
+            "cacheWrite": 0.02
+          },
+          {
+            "size": 256000,
+            "input": 0.2,
+            "output": 0.8,
+            "cacheRead": 0.02,
+            "cacheWrite": 0.04
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -39918,7 +41155,7 @@
       "providerID": "alibaba",
       "id": "qwen3.7-max-2026-06-08",
       "name": "Qwen3.7-Max-2026-06-08",
-      "description": "The Max model, the largest and most capable in the Qwen3.7 series, has added visual\u2011modal understanding compared to the May 20 snapshot, enabling it to perceive real\u2011world scenes and supporting multimodal interactive hybrid agent capabilities. This version is based on a snapshot taken on June 8, 2026.",
+      "description": "The Max model, the largest and most capable in the Qwen3.7 series, has added visual‑modal understanding compared to the May 20 snapshot, enabling it to perceive real‑world scenes and supporting multimodal interactive hybrid agent capabilities. This version is based on a snapshot taken on June 8, 2026.",
       "family": "qwen",
       "releaseDate": "2026-06-10T14:59:45",
       "knowledge": "",
@@ -39985,7 +41222,7 @@
       "providerID": "alibaba",
       "id": "qwen3.7-plus-2026-05-26",
       "name": "Qwen3.7-Plus-2026-05-26",
-      "description": "Among the Qwen3.7 series, the cost-effective Plus model builds on its robust text capabilities while delivering a comprehensive upgrade to its vision\u2011language abilities, all while preserving its full\u2011stack agent\u2011level intelligence for coding, tool use, and productivity workflows. Its key distinguishing feature is multi\u2011modal interactive hybrid agent capabilities, enabling it to perceive real\u2011world scenes, read screens and interact with GUIs, generate code based on visual references, and perform end\u2011to\u2011end navigation within mobile apps.This version is a snapshot as of May 26, 2026.",
+      "description": "Among the Qwen3.7 series, the cost-effective Plus model builds on its robust text capabilities while delivering a comprehensive upgrade to its vision‑language abilities, all while preserving its full‑stack agent‑level intelligence for coding, tool use, and productivity workflows. Its key distinguishing feature is multi‑modal interactive hybrid agent capabilities, enabling it to perceive real‑world scenes, read screens and interact with GUIs, generate code based on visual references, and perform end‑to‑end navigation within mobile apps.This version is a snapshot as of May 26, 2026.",
       "family": "qwen",
       "releaseDate": "2026-06-01T21:18:13",
       "knowledge": "",
@@ -40007,7 +41244,16 @@
         "input": 0.4,
         "output": 1.6,
         "cacheRead": 0.04,
-        "cacheWrite": 0.08
+        "cacheWrite": 0.08,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 1.2,
+            "output": 4.8,
+            "cacheRead": 0.12,
+            "cacheWrite": 0.24
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -40053,7 +41299,7 @@
       "providerID": "alibaba",
       "id": "qwen3.7-max-2026-05-20",
       "name": "Qwen3.7-Max-2026-05-20",
-      "description": "The Max model, the largest and most capable in the Qwen3.7 series, currently offers a pure\u2011text\u2011only interface for public experimentation. Qwen3.7 is a next\u2011generation flagship model designed for the agent\u2011centric era, with its core strengths lying in the breadth and depth of its agent\u2011level capabilities: it excels at programming, office and productivity tasks, and long\u2011term autonomous execution.This version is a snapshot as of May 20, 2026.",
+      "description": "The Max model, the largest and most capable in the Qwen3.7 series, currently offers a pure‑text‑only interface for public experimentation. Qwen3.7 is a next‑generation flagship model designed for the agent‑centric era, with its core strengths lying in the breadth and depth of its agent‑level capabilities: it excels at programming, office and productivity tasks, and long‑term autonomous execution.This version is a snapshot as of May 20, 2026.",
       "family": "qwen",
       "releaseDate": "2026-05-21T17:07:12",
       "knowledge": "",
@@ -40118,7 +41364,7 @@
       "providerID": "alibaba",
       "id": "qwen3.7-max-2026-05-17",
       "name": "Qwen3.7-Max-2026-05-17",
-      "description": "The early version of the Max model in the Qwen3.7 series supports only the reasoning mode and makes its plain-text capabilities available for experimentation. Qwen3.7 is a next\u2011generation flagship model designed for the agent\u2011centric era, with major improvements in coding and agent\u2011level capabilities. This release is a snapshot as of May 17, 2026.",
+      "description": "The early version of the Max model in the Qwen3.7 series supports only the reasoning mode and makes its plain-text capabilities available for experimentation. Qwen3.7 is a next‑generation flagship model designed for the agent‑centric era, with major improvements in coding and agent‑level capabilities. This release is a snapshot as of May 17, 2026.",
       "family": "qwen",
       "releaseDate": "2026-05-20T00:00:00",
       "knowledge": "",
@@ -40205,7 +41451,16 @@
         "input": 0.25,
         "output": 1.5,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 1,
+            "output": 4,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -40316,7 +41571,7 @@
       "providerID": "alibaba",
       "id": "qwen3.7-max-preview",
       "name": "Qwen3.7-Max-Preview",
-      "description": "The Max model, the largest and most capable variant in the Qwen3.7 series, is available as a preview and supports only thinking mode, offering a pure text\u2011only interface for experimentation. It is primarily optimized for general\u2011purpose conversational use cases, such as knowledge\u2011based question answering, instruction following, and creative writing.",
+      "description": "The Max model, the largest and most capable variant in the Qwen3.7 series, is available as a preview and supports only thinking mode, offering a pure text‑only interface for experimentation. It is primarily optimized for general‑purpose conversational use cases, such as knowledge‑based question answering, instruction following, and creative writing.",
       "family": "qwen",
       "releaseDate": "2026-05-20T00:00:00",
       "knowledge": "",
@@ -40665,7 +41920,16 @@
         "input": 0.4,
         "output": 2.4,
         "cacheRead": 0.04,
-        "cacheWrite": 0.5
+        "cacheWrite": 0.5,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 0.5,
+            "output": 3,
+            "cacheRead": 0.05,
+            "cacheWrite": 0.625
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -40733,7 +41997,16 @@
         "input": 0.4,
         "output": 2.4,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 0.5,
+            "output": 3,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -41197,7 +42470,16 @@
         "input": 0.5,
         "output": 3,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 2,
+            "output": 6,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -41375,7 +42657,7 @@
       "providerID": "alibaba",
       "id": "ZHIPU/GLM-5.3",
       "name": "ZHIPU/GLM-5.3",
-      "description": "GLM-5.3 is Zhipu AI\u2019s most powerful model for programming capabilities to date, demonstrating a 50% improvement over GLM-5.2 in internal subjective evaluations. In terms of cybersecurity, GLM-5.3 performs on par with Mythos 5 in tasks such as white-box code review and vulnerability discovery, showcasing its strong potential for cybersecurity defense scenarios.",
+      "description": "GLM-5.3 is Zhipu AI’s most powerful model for programming capabilities to date, demonstrating a 50% improvement over GLM-5.2 in internal subjective evaluations. In terms of cybersecurity, GLM-5.3 performs on par with Mythos 5 in tasks such as white-box code review and vulnerability discovery, showcasing its strong potential for cybersecurity defense scenarios.",
       "family": "zhipu-ai",
       "releaseDate": "2026-08-17T16:43:47",
       "knowledge": "",
@@ -41970,7 +43252,16 @@
         "input": 0.4,
         "output": 1.2,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 1.2,
+            "output": 3.6,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -42034,7 +43325,16 @@
         "input": 0.4,
         "output": 1.2,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 1.2,
+            "output": 3.6,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -42206,7 +43506,7 @@
       "providerID": "alibaba",
       "id": "qwen3-omni-flash-realtime-2025-09-15",
       "name": "Qwen3-Omni-Flash-Realtime-2025-09-15",
-      "description": "The real-time version of the Qwen3-Omni-Flash multimodal large-scale model, based on the Thinker\u2013Talker Mixed Expert (MoE) architecture, supports efficient understanding and speech generation of text, images, audio, and video. It can interact with text in 119 languages \u200b\u200band speech in 20 languages, generating human-like speech for precise cross-lingual communication. The model boasts powerful command-following and system prompt customization capabilities, flexibly adapting to conversational styles and character settings. It is widely used in scenarios such as text creation, voice assistants, and multimedia analysis, providing a natural and smooth multimodal interaction experience.",
+      "description": "The real-time version of the Qwen3-Omni-Flash multimodal large-scale model, based on the Thinker–Talker Mixed Expert (MoE) architecture, supports efficient understanding and speech generation of text, images, audio, and video. It can interact with text in 119 languages ​​and speech in 20 languages, generating human-like speech for precise cross-lingual communication. The model boasts powerful command-following and system prompt customization capabilities, flexibly adapting to conversational styles and character settings. It is widely used in scenarios such as text creation, voice assistants, and multimedia analysis, providing a natural and smooth multimodal interaction experience.",
       "family": "qwen",
       "releaseDate": "2025-09-17T00:43:22",
       "knowledge": "",
@@ -42289,7 +43589,30 @@
         "input": 0.3,
         "output": 1.5,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 32000,
+            "input": 0.5,
+            "output": 2.5,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          {
+            "size": 128000,
+            "input": 0.8,
+            "output": 4,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          {
+            "size": 256000,
+            "input": 1.6,
+            "output": 9.6,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -42389,7 +43712,7 @@
       "providerID": "alibaba",
       "id": "qwen-plus-2025-01-25",
       "name": "Qwen-Plus-2025-01-25",
-      "description": "A balanced model in the Qwen series, with inference effectiveness and speed between Qwen-Max and Qwen-Turbo, making it suitable for moderately complex tasks. Compared to Qwen-Plus-2025-0112, there is a comprehensive upgrade in both Chinese and English capabilities. Notably, there are significant improvements in coding ability, logical reasoning, and multilingual support. The response style has been significantly adjusted to align with human preferences, especially for objective queries such as mathematics, logical reasoning, and knowledge-based questions\u2014both the level of detail in responses and the clarity of formatting have improved noticeably. Additionally, targeted enhancements have been made in creative writing, JSON format compliance, and role-playing abilities. This version is expected to be maintained until one month before the next snapshot release.",
+      "description": "A balanced model in the Qwen series, with inference effectiveness and speed between Qwen-Max and Qwen-Turbo, making it suitable for moderately complex tasks. Compared to Qwen-Plus-2025-0112, there is a comprehensive upgrade in both Chinese and English capabilities. Notably, there are significant improvements in coding ability, logical reasoning, and multilingual support. The response style has been significantly adjusted to align with human preferences, especially for objective queries such as mathematics, logical reasoning, and knowledge-based questions—both the level of detail in responses and the clarity of formatting have improved noticeably. Additionally, targeted enhancements have been made in creative writing, JSON format compliance, and role-playing abilities. This version is expected to be maintained until one month before the next snapshot release.",
       "family": "qwen",
       "releaseDate": "2025-01-30T23:30:20",
       "knowledge": "",
@@ -42472,7 +43795,16 @@
         "input": 0.05,
         "output": 0.4,
         "cacheRead": 0,
-        "cacheWrite": 0
+        "cacheWrite": 0,
+        "tiers": [
+          {
+            "size": 256000,
+            "input": 0.25,
+            "output": 2,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        ]
       },
       "local": false,
       "weights": {
@@ -42515,7 +43847,7 @@
       "providerID": "alibaba",
       "id": "glm-5.3-prime",
       "name": "GLM-5.3-Prime",
-      "description": "GLM-5.3-Prime is the high-speed variant of GLM-5.3, inheriting its full capabilities while achieving 1.5\u20132\u00d7 the output TPS through inference acceleration. It delivers state-of-the-art coding and agentic performance among open-source models, supports 1M context and 128K output tokens, and can produce production-grade results end-to-end \u2014 along with emergent cybersecurity capabilities such as vulnerability discovery. Designed for latency-sensitive scenarios including real-time conversation, multi-turn agent orchestration, and streaming code generation.",
+      "description": "GLM-5.3-Prime is the high-speed variant of GLM-5.3, inheriting its full capabilities while achieving 1.5–2× the output TPS through inference acceleration. It delivers state-of-the-art coding and agentic performance among open-source models, supports 1M context and 128K output tokens, and can produce production-grade results end-to-end — along with emergent cybersecurity capabilities such as vulnerability discovery. Designed for latency-sensitive scenarios including real-time conversation, multi-turn agent orchestration, and streaming code generation.",
       "family": "zhipu-ai",
       "releaseDate": "2026-09-21T11:44:04",
       "knowledge": "",
@@ -42715,7 +44047,7 @@
       "providerID": "alibaba",
       "id": "glm-5.2-fast-preview",
       "name": "GLM-5.2-Fast-Preview",
-      "description": "GLM-5.2-Fast-Preview is the high-speed variant of Zhipu AI&#39;s GLM-5.2, with 1M context and capabilities on par with the standard version. Inference-optimized to deliver 1.5\u20132\u00d7 the output TPS, it fits latency-sensitive use cases such as real-time chat, multi-turn agents, and streaming code generation.",
+      "description": "GLM-5.2-Fast-Preview is the high-speed variant of Zhipu AI&#39;s GLM-5.2, with 1M context and capabilities on par with the standard version. Inference-optimized to deliver 1.5–2× the output TPS, it fits latency-sensitive use cases such as real-time chat, multi-turn agents, and streaming code generation.",
       "family": "zhipu-ai",
       "releaseDate": "2026-07-10T10:22:38",
       "knowledge": "",
@@ -42785,7 +44117,7 @@
       "releaseDate": "",
       "knowledge": "",
       "openWeights": true,
-      "context": 262144,
+      "context": 2000000,
       "maxOutput": 0,
       "capabilities": {
         "text": true,

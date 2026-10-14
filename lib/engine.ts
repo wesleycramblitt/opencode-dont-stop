@@ -714,6 +714,9 @@ export class LoopEngine {
 
     for (const kind of AGENT_KINDS) {
       const task = this.taskFor(kind)
+      // The agent-default plan is for sessions that have not started, so it
+      // ranks at the base price tier; a live session's tier-aware re-pick
+      // happens in `refresh`/`rotate`, where its context usage is known.
       const ranked = rankForMode(this.catalogue, mode, task, this.hardware)
       if (ranked.length === 0) {
         notes.push(`${kind}: no model satisfies ${mode} requirements`)
@@ -773,31 +776,40 @@ export class LoopEngine {
       const loopPlan = loop.mode === primaryMode ? plan : this.buildPlan(loop.mode)
       const target = this.tracked.get(loop.sessionID)
       const entry = loopPlan.sessions.find((e) => e.sessionID === loop.sessionID)
-      if (entry && target) {
-        if (force || !target.model || !sameSlot(target.model, entry.model)) {
-          // Context veto on the switch: a plan that now prefers a model whose
-          // window cannot hold the conversation must not yank the session down
-          // to it — the next turn would come back truncated. The rotation path
-          // handles the "nothing fits" case by compacting; here, keeping the
-          // current model is the safe answer, and the session-rotation path
-          // sheds the context when the current model itself is outgrown.
-          if (!force && target.model && !sameSlot(target.model, entry.model) && this.catalogue) {
-            const row = this.catalogueRowFor(entry.model)
-            if (row) {
-              const used = await this.contextUsed(loop.sessionID)
-              if (used > 0 && !(await this.canHoldContext(row, used))) {
-                this.log.quiet(
-                  "info",
-                  `keeping ${modelKeyOf(target.model)} on ${loop.sessionID}: ` +
-                    `${entry.model.providerID}/${entry.model.id} cannot hold ${used} tokens of context`,
-                )
-                continue
-              }
-            }
+      if (!entry || !target) continue
+      const differs = !target.model || !sameSlot(target.model, entry.model)
+      if (!force && !differs) continue
+
+      let pick = entry
+      if (target.model && differs && this.catalogue) {
+        // The plan was ranked at the base rate. A live session's next request
+        // carries its actual context, so cheap mode re-prices the switch at
+        // that size before it is applied.
+        const used = !force || loop.mode === "cheap" ? await this.contextUsed(loop.sessionID) : 0
+        if (used > 0 && loop.mode === "cheap") {
+          const better = await this.cheapPickForContext(target.agent, used)
+          if (better && sameSlot(better, target.model)) continue
+          if (better) pick = { sessionID: entry.sessionID, model: slotFrom(better) }
+        }
+        // Context veto on the switch: a plan that now prefers a model whose
+        // window cannot hold the conversation must not yank the session down
+        // to it — the next turn would come back truncated. The rotation path
+        // handles the "nothing fits" case by compacting; here, keeping the
+        // current model is the safe answer, and the session-rotation path
+        // sheds the context when the current model itself is outgrown.
+        if (!force && sameSlot(pick.model, entry.model)) {
+          const row = this.catalogueRowFor(entry.model)
+          if (row && used > 0 && !(await this.canHoldContext(row, used))) {
+            this.log.quiet(
+              "info",
+              `keeping ${modelKeyOf(target.model)} on ${loop.sessionID}: ` +
+                `${entry.model.providerID}/${entry.model.id} cannot hold ${used} tokens of context`,
+            )
+            continue
           }
-          needsSwitch.push(entry)
         }
       }
+      needsSwitch.push(pick)
     }
 
     if (needsSwitch.length > 0 || force) {
@@ -1495,7 +1507,10 @@ export class LoopEngine {
     const agent = record.agent
 
     if (!this.catalogue) return "unavailable"
-    const ranked = rankForMode(this.catalogue, loop.mode, this.taskFor(agent), this.hardware)
+    // The session's current usage is read before ranking: it is both the
+    // context a candidate must hold and the price tier cheap mode ranks at.
+    const used = await this.contextUsed(sessionID)
+    const ranked = rankForMode(this.catalogue, loop.mode, this.taskFor(agent), this.hardware, used)
     if (ranked.length === 0) {
       this.log.warn(`no model left in the ${loop.mode} chain for ${agent}`)
       return "unavailable"
@@ -1517,7 +1532,6 @@ export class LoopEngine {
     // first those that can hold it, and if none can, the session is compacted
     // (the transcript is state; the work is on disk) before the chain is
     // walked again.
-    const used = await this.contextUsed(sessionID)
     let pick: CatalogueModel | null = null
     for (const candidate of ranked) {
       if (this.tried.has(`${candidate.providerID}/${candidate.id}`)) continue
@@ -1551,6 +1565,25 @@ export class LoopEngine {
       this.log,
     )
     return "moved"
+  }
+
+  /**
+   * Cheap mode's pick for a session whose next request carries `used` tokens.
+   *
+   * The plan's cheap ranking is priced at the base rate, which is right for a
+   * fresh session and wrong for a long one: qwen3.7-flash is the cheapest paid
+   * row up to 32k and third-most-expensive past 256k. So a session being
+   * (re)pinned in cheap mode is ranked at its actual context and the first
+   * candidate that can hold it wins. Null when nothing qualifies — the caller
+   * then keeps the session where it is.
+   */
+  private async cheapPickForContext(agent: string, used: number): Promise<CatalogueModel | null> {
+    if (!this.catalogue || used <= 0) return null
+    const ranked = rankForMode(this.catalogue, "cheap", this.taskFor(agent), this.hardware, used)
+    for (const candidate of ranked) {
+      if (await this.canHoldContext(candidate, used)) return candidate
+    }
+    return null
   }
 
   /**

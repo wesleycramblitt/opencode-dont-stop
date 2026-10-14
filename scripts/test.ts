@@ -18,10 +18,10 @@ import { join } from "node:path"
 import { eventSignals } from "../lib/events.ts"
 import { SessionClocks } from "../lib/clocks.ts"
 import { classify, actionFor, DEPRECATED_COOLDOWN_MS, PERMANENT_COOLDOWN_MS } from "../lib/errors.ts"
-import { clearCooldown, cooldown, meets, loadCatalogue, type Catalogue, type CatalogueModel, type HardwareProfile } from "../lib/catalogue.ts"
+import { clearCooldown, cooldown, meets, loadCatalogue, pricingAt, blendedPriceAt, type Catalogue, type CatalogueModel, type HardwareProfile } from "../lib/catalogue.ts"
 import { rankForMode, profileFor } from "../lib/modes.ts"
 import { measureContext, descendantIDs, effectiveContext, ollamaServedContext, shouldRotate } from "../lib/rotation.ts"
-import { catalogueRefreshDue, parseAlibabaInventory, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
+import { catalogueRefreshDue, modelsDevTiers, parseAlibabaInventory, rangeUpperBound, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
 import { LoopEngine, CONTINUE_PROMPT, type EngineOptions } from "../lib/engine.ts"
 import { initialState, readState, type Mode, type PluginState } from "../lib/state.ts"
 import { FREE_TIERS } from "../data/free-tiers.ts"
@@ -705,6 +705,69 @@ test("cheap ranking leads with the cheapest capable model, free tail after", () 
   assert.equal(ranked[ranked.length - 1].id, "c")
 })
 
+test("tiered pricing reads the band the request's context falls in", () => {
+  const flash = row({
+    key: "alibaba/qwen3.7-flash",
+    pricing: {
+      input: 0.03, output: 0.13, cacheRead: 0.003, cacheWrite: 0.038,
+      tiers: [
+        { size: 32_000, input: 0.1, output: 0.4, cacheRead: 0.01, cacheWrite: 0.125 },
+        { size: 256_000, input: 0.2, output: 0.8, cacheRead: 0.02, cacheWrite: 0.25 },
+      ],
+    },
+  })
+  // Below the first threshold the base rates apply.
+  assert.deepEqual(pricingAt(flash.pricing, 0), { input: 0.03, output: 0.13, cacheRead: 0.003, cacheWrite: 0.038 })
+  assert.equal(blendedPriceAt(flash, 31_999), 0.03 + 0.13)
+  // A band starts past its threshold ("32k<Input") and holds until the next.
+  assert.equal(blendedPriceAt(flash, 32_000), 0.03 + 0.13)
+  assert.equal(blendedPriceAt(flash, 32_001), 0.1 + 0.4)
+  assert.equal(blendedPriceAt(flash, 256_000), 0.1 + 0.4)
+  assert.equal(blendedPriceAt(flash, 256_001), 0.2 + 0.8)
+  // A flat row prices the same at every context.
+  const flat = row({ pricing: { input: 0.15, output: 0.6, cacheRead: 0, cacheWrite: 0 } })
+  assert.equal(blendedPriceAt(flat, 0), blendedPriceAt(flat, 900_000))
+})
+
+test("a persisted catalogue's price bands survive a load, sorted", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dont-stop-bands-"))
+  const file = join(dir, "catalogue.json")
+  writeFileSync(file, JSON.stringify({ models: [{
+    providerID: "alibaba",
+    id: "qwen3.7-flash",
+    pricing: {
+      input: 0.03, output: 0.13, cacheRead: 0, cacheWrite: 0,
+      tiers: [
+        { size: 256_000, input: 0.2, output: 0.8 },
+        { size: 32_000, input: 0.1, output: 0.4 },
+      ],
+    },
+  }] }))
+  const cat = loadCatalogue(file)
+  assert.ok(cat)
+  const flash = cat.byKey.get("alibaba/qwen3.7-flash")
+  assert.ok(flash)
+  // Bands are sorted on load, so the threshold walk is correct even when the
+  // persisted file lists them out of order.
+  assert.deepEqual(flash.pricing.tiers?.map((t) => t.size), [32_000, 256_000])
+  assert.equal(blendedPriceAt(flash, 300_000), 0.2 + 0.8)
+})
+
+test("cheap ranking prices the request at its context, not the base rate", () => {
+  const cat = catalogueOf([
+    // flash is 0.16/1M blended up to 256k and 1.00/1M beyond; steady is a
+    // flat 0.75/1M. At 300k tokens the "cheap" flash is the pricier row.
+    row({ key: "cheap/flash", id: "flash", context: 1_000_000, scores: { reasoning: 6, code: 7.5, agentic: 7, general: 7, capability: 6 }, pricing: {
+      input: 0.03, output: 0.13, cacheRead: 0, cacheWrite: 0,
+      tiers: [{ size: 256_000, input: 0.2, output: 0.8, cacheRead: 0, cacheWrite: 0 }],
+    } }),
+    row({ key: "steady/paid", id: "paid", context: 1_000_000, scores: { reasoning: 7, code: 7.5, agentic: 7, general: 7, capability: 7 }, pricing: { input: 0.15, output: 0.6, cacheRead: 0, cacheWrite: 0 } }),
+  ])
+  assert.equal(rankForMode(cat, "cheap", profileFor("build"))[0].id, "flash")
+  const long = rankForMode(cat, "cheap", profileFor("build"), undefined, 300_000)
+  assert.equal(long[0].id, "paid")
+})
+
 /* ------------------------------------------------------------------ rotation */
 
 test("context usage is read from v2 message tokens", () => {
@@ -773,12 +836,26 @@ const ALIBABA_FIXTURE = {
         capabilities: ["Reasoning", "VU", "TG"],
         inference_metadata: { request_modality: ["Image", "Text", "Video"], response_modality: ["Text"] },
         model_info: { context_window: 1_000_000, max_output_tokens: 131_072 },
-        prices: [{ prices: [
-          { type: "input_token", price: "0.03", time_band: "standard" },
-          { type: "output_token", price: "0.13", time_band: "standard" },
-          { type: "input_token_cache_creation_5m", price: "0.038", time_band: "standard" },
-          { type: "input_token_cache_read", price: "0.003", time_band: "standard" },
-        ]}],
+        prices: [
+          { range_name: "Input<=32k", prices: [
+            { type: "input_token", price: "0.03", time_band: "standard" },
+            { type: "output_token", price: "0.13", time_band: "standard" },
+            { type: "input_token_cache_creation_5m", price: "0.038", time_band: "standard" },
+            { type: "input_token_cache_read", price: "0.003", time_band: "standard" },
+          ]},
+          { range_name: "32k<Input<=256k", prices: [
+            { type: "input_token", price: "0.1", time_band: "standard" },
+            { type: "output_token", price: "0.4", time_band: "standard" },
+            { type: "input_token_cache_creation_5m", price: "0.125", time_band: "standard" },
+            { type: "input_token_cache_read", price: "0.01", time_band: "standard" },
+          ]},
+          { range_name: "256k<Input<=1m", prices: [
+            { type: "input_token", price: "0.2", time_band: "standard" },
+            { type: "output_token", price: "0.8", time_band: "standard" },
+            { type: "input_token_cache_creation_5m", price: "0.25", time_band: "standard" },
+            { type: "input_token_cache_read", price: "0.02", time_band: "standard" },
+          ]},
+        ],
       },
       { model: "qwen3-asr-flash", name: "ASR", features: [], capabilities: [], model_info: {}, prices: [{ prices: [{ type: "asr_input_token", price: "0.035" }] }] },
       { model: "wan2.2-t2v-plus", name: "Video", features: [], capabilities: [], model_info: {}, prices: [{ prices: [{ type: "video_ratio", price: "1" }] }] },
@@ -801,16 +878,51 @@ test("non-chat rows (ASR, video) are dropped, chat rows carry prices and modalit
   assert.equal(m.providerID, "alibaba")
   assert.equal(m.id, "qwen3.7-flash")
   assert.equal(m.context, 1_000_000)
+  // The base rates come from the shortest range; later ranges become bands
+  // whose threshold is the previous range's upper bound.
   assert.equal(m.pricing.input, 0.03)
   assert.equal(m.pricing.output, 0.13)
   assert.equal(m.pricing.cacheRead, 0.003)
   assert.equal(m.pricing.cacheWrite, 0.038)
+  assert.deepEqual(m.pricing.tiers?.map((t) => t.size), [32_000, 256_000])
+  assert.equal(m.pricing.tiers?.[0].input, 0.1)
+  assert.equal(m.pricing.tiers?.[0].output, 0.4)
+  assert.equal(m.pricing.tiers?.[1].input, 0.2)
+  assert.equal(m.pricing.tiers?.[1].output, 0.8)
   assert.equal(m.capabilities.text, true)
   assert.equal(m.capabilities.image, true)
   assert.equal(m.capabilities.video, true)
   assert.equal(m.capabilities.toolCall, true)
   assert.equal(m.capabilities.reasoning, true)
   assert.equal(m.source, "alibaba")
+})
+
+test("range names and models.dev costs both yield the same band shape", () => {
+  assert.equal(rangeUpperBound("Input<=32k"), 32_000)
+  assert.equal(rangeUpperBound("32k<Input<=256k"), 256_000)
+  assert.equal(rangeUpperBound("256k<Input<=1m"), 1_000_000)
+  assert.equal(rangeUpperBound(undefined), 0)
+  // models.dev's current shape: explicit thresholds, all fields present.
+  const tiers = modelsDevTiers({
+    input: 0.03, output: 0.13, cache_read: 0.003, cache_write: 0.0375,
+    tiers: [
+      { input: 0.1, output: 0.4, cache_read: 0.01, cache_write: 0.125, tier: { type: "context", size: 32_000 } },
+      { input: 0.2, output: 0.8, cache_read: 0.02, cache_write: 0.25, tier: { type: "context", size: 256_000 } },
+    ],
+  })
+  assert.deepEqual(tiers.map((t) => t.size), [32_000, 256_000])
+  assert.equal(tiers[0].input, 0.1)
+  assert.equal(tiers[1].output, 0.8)
+  // The legacy single band is one threshold at 200k, and loses to `tiers`
+  // when the registry duplicates the same breakpoint into both.
+  const legacy = modelsDevTiers({ input: 2, output: 10, context_over_200k: { input: 4, output: 15 } })
+  assert.deepEqual(legacy, [{ size: 200_000, input: 4, output: 15, cacheRead: 0, cacheWrite: 0 }])
+  const both = modelsDevTiers({
+    input: 2, output: 10,
+    context_over_200k: { input: 4, output: 15 },
+    tiers: [{ input: 4, output: 15, tier: { type: "context", size: 200_000 } }],
+  })
+  assert.equal(both.length, 1)
 })
 
 test("credential resolution prefers an override, then env, then the config", () => {
@@ -926,6 +1038,27 @@ test("rotation prefers a model that can hold the session's context", async () =>
   assert.match(engine.status!.lastResult!, /rotated general to b\/y/)
 })
 
+test("cheap rotation prices the session's actual context", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  // At the base rate flash is the cheapest paid row; at 300k tokens its top
+  // band makes steady the cheaper one, so rotation must read the context
+  // before it ranks.
+  const cat = catalogueOf([
+    row({ key: "cheap/flash", providerID: "cheap", id: "flash", context: 1_000_000, pricing: {
+      input: 0.03, output: 0.13, cacheRead: 0, cacheWrite: 0,
+      tiers: [{ size: 256_000, input: 0.2, output: 0.8, cacheRead: 0, cacheWrite: 0 }],
+    }, scores: { reasoning: 6, code: 7.5, agentic: 7, general: 7, capability: 6 } }),
+    row({ key: "steady/paid", providerID: "steady", id: "paid", context: 1_000_000, pricing: { input: 0.15, output: 0.6, cacheRead: 0, cacheWrite: 0 }, scores: { reasoning: 7, code: 7.5, agentic: 7, general: 7, capability: 7 } }),
+  ])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "cheap")
+  fakes.messages.push({ type: "assistant", tokens: { input: 300_000 } })
+
+  const outcome = await engine.rotate("ses_loop", "rate")
+  assert.equal(outcome, "moved")
+  assert.match(engine.status!.lastResult!, /rotated general to steady\/paid/)
+})
+
 test("an unloaded local model assumes the daemon cap, so a large session compacts before landing on the local tail", async () => {
   const { engine, state, fakes } = makeEngine("i1")
   // ollama/q has a huge native window (3.5M) but is not loaded, so the served
@@ -982,6 +1115,29 @@ test("refresh does not switch the loop session onto a window too small for it", 
   // the conversation; the switch is vetoed and the session stays on b/y.
   await engine.refresh(false)
   assert.deepEqual(fakes.switched, [], "no switch to a model too small for the session")
+})
+
+test("refresh keeps a cheap session on the tier-correct model", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  const cat = catalogueOf([
+    // The base-rate plan leads with flash; at 300k tokens steady is cheaper.
+    row({ key: "cheap/flash", providerID: "cheap", id: "flash", context: 1_000_000, pricing: {
+      input: 0.03, output: 0.13, cacheRead: 0, cacheWrite: 0,
+      tiers: [{ size: 256_000, input: 0.2, output: 0.8, cacheRead: 0, cacheWrite: 0 }],
+    }, scores: { reasoning: 6, code: 7.5, agentic: 7, general: 7, capability: 6 } }),
+    row({ key: "steady/paid", providerID: "steady", id: "paid", context: 1_000_000, pricing: { input: 0.15, output: 0.6, cacheRead: 0, cacheWrite: 0 }, scores: { reasoning: 7, code: 7.5, agentic: 7, general: 7, capability: 7 } }),
+  ])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "cheap")
+  // The session already runs on the tier-correct model and holds 300k tokens.
+  engine.observe({
+    type: "session.execution.started",
+    data: { sessionID: "ses_loop", model: { providerID: "steady", id: "paid" } },
+  })
+  fakes.messages.push({ type: "assistant", tokens: { input: 300_000 } })
+
+  await engine.refresh(false)
+  assert.deepEqual(fakes.switched, [], "the tier-correct model stays pinned")
 })
 
 test("rotation walks the chain once and then stops instead of cycling", async () => {
