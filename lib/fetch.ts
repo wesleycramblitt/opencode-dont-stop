@@ -103,6 +103,17 @@ interface FetchOptions {
   skipLocal?: boolean
   /** Alibaba key override, ahead of env and config resolution. */
   alibabaKey?: string
+  /**
+   * Read reachability from the `opencode` CLI subprocess.
+   *
+   * Default true — correct for the standalone update script. A caller running
+   * *inside* a live opencode server must pass false: the subprocess call is
+   * `execFileSync`, which blocks the server's event loop, and the CLI needs
+   * that same server to answer — the deadlock that made the server
+   * "unresponsive" and got it restarted by the CLI's own recovery. In-server
+   * reachability is re-derived from `ctx.model.list()` instead.
+   */
+  registry?: boolean
 }
 
 async function getJSON(url: string, options: FetchOptions): Promise<unknown> {
@@ -353,6 +364,14 @@ function tagsFromSearchItem(item: string): { context: number; parameterSize?: st
  * requires authentication: a plain fetch to its port returns 401, and the CLI
  * already carries the credentials. The server picks an ephemeral port per run,
  * so discovery is the CLI's job too.
+ *
+ * Call this only from a process that is NOT the opencode server. The call is
+ * `execFileSync` — it blocks the caller's event loop — and the CLI it spawns
+ * must talk back to the server to answer, so running it inside the server is
+ * a self-deadlock: the server cannot serve the CLI while it waits for it, the
+ * CLI declares the background service unresponsive and restarts it, and the
+ * work in flight dies. `fetchCatalogue({ registry: false })` is the in-server
+ * path; the engine re-derives reachability in-process.
  *
  * Returns null when the server cannot be reached, which means "unknown" rather
  * than "unreachable" — a fetch run away from a live server must not mark
@@ -1458,8 +1477,18 @@ export async function fetchCatalogue(options: FetchOptions = {}): Promise<Catalo
   // Reachability: a row is usable only if the running server can route to it.
   // The set is empty-safe — an unreachable server leaves everything reachable
   // rather than empting the catalogue, and the plugin re-checks at load.
-  const reachable = reachableModels()
-  if (reachable) {
+  //
+  // The registry read is a *subprocess* (`opencode api get /api/model`) and
+  // `execFileSync` blocks the event loop of whoever calls it. Run from the
+  // plugin inside the server, that blocks the very server the CLI has to
+  // talk to: the CLI gives up, restarts the service, and the refresh dies
+  // before the file is written. In-server callers therefore pass
+  // `registry: false` and rely on the engine's in-process re-derivation
+  // (`applyReachability`); only the standalone update script needs this.
+  const reachable = options.registry === false ? null : reachableModels()
+  if (options.registry === false) {
+    sourceStats.push({ id: "opencode-registry", url: "skipped (in-server)", models: 0 })
+  } else if (reachable) {
     let unroutable = 0
     for (const row of raw) {
       if (!reachable.has(`${row.providerID}/${row.id}`)) {

@@ -271,6 +271,7 @@ of the sweep after any failure, and a spent promotional quota out **forever**.
 | `rate` | 429, rate limit, throttling | no | cooldown 1m, rotate, re-sweep | cooldown 1h |
 | `capability` | model lacks a required capability | no | cooldown 5m, restrict the pool | cooldown 1h |
 | `context` | context window exceeded | no | rotate to a larger-context model | cooldown 1h |
+| `state` | "reasoning item … was not found or has expired" — the transcript references provider state the endpoint no longer holds | no | **compact the transcript, then re-drive**; rotate only if compaction is already rate-limited | same (no cooldown: the model is not at fault) |
 | `notfound` | model gone or deprecated | no | cooldown 24h, rotate past | same |
 | `deprecated` | "…has been deprecated…" — the provider retires the row | no | **permanent** in every mode; nothing lifts it | same |
 | `auth` | 401/403, bad key | no | cooldown 15m, rotate to another provider | cooldown 1h |
@@ -347,7 +348,9 @@ missing or empty. Any inline text is prepended to the file's contents.
 the same full /dont-stop command the original run opened with — so a restarted
 (or fresh) session lands back on the loop with one verb. A loop session that
 is restarted while active is detected on the heartbeat (its message count
-drops) and re-seeded with the full prompt automatically.
+drops) and re-seeded with the full prompt automatically — except within a
+90-second boot window, where opencode's own SessionRestart is already resuming
+sessions and a re-seed would duplicate that resume.
 
 Rotations and re-plans only move the loop onto a model whose context window
 can hold the conversation it is about to receive: a candidate too small for
@@ -366,8 +369,23 @@ the same sources, reloads it, and re-applies the plan — so new free rows,
 price changes and retirements reach the loop with no manual command. The
 file's mtime is the clock and a successful refresh rewrites the file, so the
 check needs no extra state; a failed fetch (network down, a source error)
-keeps the current catalogue and tries again on the next beat; one fetch runs
-at a time. `DONT_STOP_CATALOGUE_REFRESH_HOURS` overrides the 24h cadence.
+keeps the current catalogue and waits 15 minutes before the next attempt —
+not the next beat, because a source down for an hour must not be hammered
+120 times. One fetch runs at a time. `DONT_STOP_CATALOGUE_REFRESH_HOURS`
+overrides the 24h cadence.
+
+The in-server refresh **skips the registry subprocess** on purpose. Reading
+reachability means spawning `opencode api get /api/model` with `execFileSync`,
+which blocks the caller's event loop — and that CLI has to talk back to the
+very server it runs in, so in-server it is a self-deadlock: the server cannot
+answer while it waits, the CLI declares the background service unresponsive,
+and its recovery restarts the service mid-refresh (the observed restart loop:
+sessions reload, instructions update, nothing progresses). The heartbeat
+passes `registry: false` and lets `applyReachability` re-derive reachability
+from `ctx.model.list()` in-process, which it already does at load. The
+standalone `scripts/update-catalogue.ts` is not the server, so it still reads
+the registry.
+
 Alibaba's inventory is the one source a refresh does not improve without a
 key — the declared free-tier table (`data/free-tiers.ts`) is still the
 authority for quota-backed rows.
@@ -446,13 +464,11 @@ session.execution.*        -> advance()  (only in the owning instance)
   count the iteration and the session's turn
   if the turn completed    -> reset the try budget (models tried, failures)
   if the turn merely errored into idleness, the budget survives it
-  read the last assistant turn
-  if checkpoint / complete -> a boundary: rotate a fresh session when due
-  rotate when due          -> boundary after real work, step budget, or context
-                              pressure; defers while subagents are live
-  otherwise:
-    re-plan                 -> re-rank, sweep for a better/available model, switch
-    send the continue prompt -> session goes busy, hang clock re-arms
+  if the step budget is hit -> compact the transcript (work untouched)
+  re-plan                  -> re-rank, sweep for a better/available model, switch
+  send the next prompt     -> session goes busy, hang clock re-arms; most turns
+                              get a short nudge, and every N turns (and right
+                              after a compaction) the full mission is restated
 ```
 
 ### Ownership and halting
@@ -466,10 +482,16 @@ running somewhere else.
 Two mechanisms enforce it:
 
 - **Owner heartbeat.** The owning instance stamps each loop's `ownerBeatAt`
-  every beat. Three missed beats means the owner is gone, and an orphaned loop
-  is halted on the spot rather than inherited: a loop is a conversation with
-  requests in flight in another process, and it cannot be resumed by whoever
-  reads the file next.
+  every beat. Three missed beats means the owner is gone. On the heartbeat an
+  orphaned loop is halted on the spot rather than inherited: a loop is a
+  conversation with requests in flight in another process, and it cannot be
+  resumed by whoever reads the file next. **Boot is the exception.** A service
+  restart kills the owner without its teardown, and the sessions themselves
+  survive in the shared store — so on load, an active loop with a stale owner
+  is *recovered*: the new instance adopts it and schedules a re-drive, which
+  stands down if opencode's own resume is already running the turn. A loop
+  whose session cannot be read at all is still halted. Halting every restart
+  orphan is what turned "the server restarted" into "the loop silently ended".
 - **Intent, not status.** Halting goes through `state.intent`, a control
   message carrying a sequence number. Every writer merges intents by that
   number, so a halt survives a heartbeat rewriting the rest of the file — the
@@ -499,31 +521,24 @@ loop's own session stays tracked so a later `start` can find it.
 
 ### Completion and boundaries
 
-The loop cannot know on its own whether a task is finished — that is a judgement
-about the work, and only the entity doing it has the context. So the loop asks:
-every session's opening prompt is appended with two instructions — reply with
-exactly `<loop-checkpoint/>` when a task packet or a batch of related tasks is
-finished, and exactly `<loop-complete/>` when the whole task is genuinely done.
-Reading for them is deterministic and costs no extra model call, which an
-"is it done?" probe would.
+There is no completion protocol. The loop does not ask the model to declare
+anything, reads no sentinel tokens, and nothing a model says can end it: a loop
+ends only when its owner halts it (owner, 2026-10-12). Models get completion
+judgements wrong (one declared a review-and-build sweep complete after
+compiling task files but before building anything), and an oracle token only
+invited a model that had lost the mission to park on it.
 
-**Neither sentinel stops the loop.** The plan is that a loop ends only when its
-owner halts it (owner, 2026-10-12) — they are *reports*, and models get
-completion judgements wrong (one declared a review-and-build sweep complete
-after compiling task files but before building anything). A boundary signal
-rotates the session when the session has done real work (see Session rotation);
-otherwise it is logged and surfaced through the loop's `lastResult` — a
-completion claim answered with `AFTER_COMPLETE_PROMPT`, which tells the model
-the policy plainly and turns the claim back into work (re-verify the final
-state, fix what is wrong or unverified, continue), and a checkpoint with the
-plain continue. A model that wants to stop the loop cannot; only the owner can.
+Instead the loop **keeps the mission in front of the model**. Most turns get a
+short nudge ("Continue."); every `reinjectEvery` turns (10 by default), and
+immediately after a step-budget compaction, the full opening prompt is
+restated. That is what fixes the "finished a few tasks and sat still" failure:
+the opening instructions age out of attention and compaction summarizes them
+away, so the one guaranteed-fresh message is the one that carries the mission.
 
-Nothing else is terminal either: the iteration budget, the consecutive-error
-budget, an exhausted chain and three interrupts are all reported but never stop
-— the loop waits for cooldowns, re-drives, and keeps working. A read failure is
-treated as *not complete*, so a broken message read keeps the loop working
-rather than ending it. `stop` — the halt command, the TUI key, the intent —
-is the one way out.
+Nothing is terminal: the iteration budget, the consecutive-error budget, an
+exhausted chain and three interrupts are all reported but never stop — the
+loop waits for cooldowns, re-drives, and keeps working. `stop` — the halt
+command, the TUI key, the intent — is the one way out.
 
 ### Re-planning between turns
 
@@ -551,16 +566,11 @@ without producing work. This replaces the summary-based handoff, which existed
 only to bridge the two sessions; a session that already wrote its work to disk
 does not need bridging.
 
-Three things trigger a rotation:
+Two things trigger a rotation:
 
-1. **A task boundary.** The model signals a finished unit of work — a task
-   packet or a batch (`<loop-checkpoint/>`), or everything (`<loop-complete/>`).
-   Either rotates, but only once the session has done real work (8 turns by
-   default): a claim on a just-started session is noise, and that session is
-   already fresh.
-2. **A session step budget.** 30 turns in one session, whatever the model says.
-   This is the backstop for a model that never signals a boundary.
-3. **Context pressure.** Usage at 80% of the effective window. This is not the
+1. **A session step budget.** 30 turns in one session. This is the backstop
+   for a model that never settles.
+2. **Context pressure.** Usage at 80% of the effective window. This is not the
    emergency mechanism — OpenCode's own auto-compaction is the backstop for
    that — it is what keeps the backstop theoretical. It matters most for the
    local fallback, where OpenCode's model metadata (a 3.5M native window) does
@@ -583,7 +593,7 @@ Three properties make rotation safe:
    rotating the parent under one orphans the child's context and leaves it
    writing into a session that no longer exists. The walk is transitive —
    grandchildren count — and a deferral is remembered and retried on the next
-   turn rather than losing the boundary.
+   turn rather than lost.
 3. **The threshold is the window the session can actually use.** A 128k model
    and a 1M model do not rotate at the same token count, so the fraction
    (default 0.8) is applied to the context size of the model actually in use.

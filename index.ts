@@ -280,18 +280,32 @@ export default {
     // the loop without a manual command. The file's mtime is the clock, a
     // failed fetch keeps the current catalogue, and one fetch at a time.
     let catalogueFetching = false
+    // A failed refresh waits before trying again. The heartbeat is 30s, so a
+    // source that is down for an hour would otherwise be hammered 120 times;
+    // a success clears the wait. (Retrying on the next beat was the old
+    // contract, and it is what turned one broken source into a permanent
+    // stream of attempts.)
+    const REFRESH_RETRY_MS = 15 * 60 * 1000
+    let refreshRetryAt = 0
     const refreshHours = Number(process.env.DONT_STOP_CATALOGUE_REFRESH_HOURS)
     const refreshIntervalMs = Number.isFinite(refreshHours) && refreshHours > 0
       ? refreshHours * 60 * 60 * 1000
       : undefined
     async function maybeRefreshCatalogue(): Promise<void> {
       if (catalogueFetching) return
+      if (Date.now() < refreshRetryAt) return
       if (!catalogueRefreshDue(CATALOGUE_FILE, Date.now(), refreshIntervalMs)) return
       catalogueFetching = true
       try {
         log.info("catalogue is stale; refreshing automatically")
-        const document = await fetchCatalogue()
+        // In-server refresh never runs the registry subprocess: `execFileSync`
+        // blocks this server while the CLI it spawns waits for this server to
+        // answer — the deadlock that made the background service look
+        // unresponsive and got it restarted. Reachability is re-derived
+        // in-process by `engine.discover()`/`applyReachability` instead.
+        const document = await fetchCatalogue({ registry: false })
         writeCatalogue(document)
+        refreshRetryAt = 0
         await engine.discover()
         await engine.refresh(true)
         log.info("automatic catalogue refresh applied")
@@ -299,7 +313,11 @@ export default {
       } catch (error) {
         // A failed refresh keeps the file it failed to replace: the loop
         // plans against the old catalogue, which is stale but working.
-        log.warn(`automatic catalogue refresh failed: ${messageOf(error)}; keeping the current catalogue`)
+        refreshRetryAt = Date.now() + REFRESH_RETRY_MS
+        log.warn(
+          `automatic catalogue refresh failed: ${messageOf(error)}; keeping the current catalogue ` +
+            `(next attempt in ${Math.round(REFRESH_RETRY_MS / 60000)}m)`,
+        )
       } finally {
         catalogueFetching = false
       }
@@ -308,9 +326,13 @@ export default {
     void engine
       .discover()
       // A loop left active in the state file belongs to an instance that is
-      // gone. It is halted here rather than resumed: a loop is a live
-      // conversation in another process, and this one never started it.
-      .then(() => engine.reapOrphanedLoops())
+      // gone — a service restart kills the owner without its teardown. On boot
+      // those loops are *recovered*: the new instance adopts the loop and
+      // continues it, because the session itself survives in the shared store
+      // and a restart is the expected way an owner dies. Only a loop whose
+      // session cannot be read at all is halted. (`reapOrphanedLoops` on the
+      // heartbeat still halts loops that go orphaned mid-run.)
+      .then(() => engine.recoverOrphanedLoops())
       .then(() => engine.refresh(true))
       .catch((error) => log.warn(`startup discovery failed: ${messageOf(error)}`))
 
@@ -458,7 +480,12 @@ export function runCommand(raw: string, env: CommandEnv): string {
     // Network-bound on purpose: it is an explicit command, not a heartbeat.
     void (async () => {
       try {
-        const document = await fetchCatalogue()
+        // In-server, the registry subprocess is skipped for the same reason
+        // the automatic refresh skips it: `execFileSync` would block this
+        // server while the CLI it spawns waits for this server to answer.
+        // For the full rebuild including the registry read, run the
+        // standalone `npx tsx scripts/update-catalogue.ts`.
+        const document = await fetchCatalogue({ registry: false })
         writeCatalogue(document)
         log.info(`catalogue rebuilt: ${document.models.length} models`)
         persist()

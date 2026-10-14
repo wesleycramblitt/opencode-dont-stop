@@ -23,6 +23,7 @@ export type ErrorKind =
   | "notfound"
   | "deprecated"
   | "context"
+  | "state"
   | "auth"
   | "network"
   | "other"
@@ -47,6 +48,13 @@ export interface ErrorAction {
   degrade: boolean
   /** Pin the session to a pool that avoids the failing capability. */
   restrict: null | "no-vision" | "no-tools" | "text-only"
+  /**
+   * Replace the session's transcript before continuing. The failure names
+   * state the transcript itself carries (a reasoning item the endpoint no
+   * longer holds), which only a compaction clears — the model is not at
+   * fault, so there is no cooldown and no rotation to pay.
+   */
+  compact?: boolean
   /** Stop the loop outright. */
   stop: boolean
   /**
@@ -133,6 +141,11 @@ const PATTERNS: Pattern[] = [
   // Deprecated leads notfound: "model has been deprecated" says the row is
   // gone for good, not merely missing.
   { kind: "deprecated", test: /deprecat/i, transient: false },
+  // Stale provider state leads notfound too: "reasoning item 'rs_…' was not
+  // found or has expired" is a fact about the transcript the request carries,
+  // not about the model — and reading it as `notfound` would cool the model
+  // for 24h over a transcript problem.
+  { kind: "state", test: /reasoning (item|state|block)|provider[ _-]?state|stale reasoning|['"]rs_[a-z0-9]{4,}['"]/i, transient: false },
   { kind: "context", test: /context ?(length|window|limit)|maximum context|too long|prompt is too (long|large)|exceeds? (the )?max(imum)? context|tokens? (exceed|limit)/i, transient: false },
   { kind: "capability", test: /does not support|unsupported|not support|capability|vision|image input|tool (call|use)|function call|invalid (model|modality)|modality|cannot process|no such tool/i, transient: false },
   { kind: "notfound", test: /not found|404|does not exist|no such model|unknown model|model .* not available|deleted|deprecated model/i, transient: false },
@@ -224,6 +237,10 @@ export function actionFor(error: ClassifiedError, mode: Mode): ErrorAction {
       reason: "free quota exhausted; model stays out of the free sweep",
     }
   }
+  // Stale provider state is a transcript problem, not the model's: an hour
+  // out of the sweep would punish a working model for it. Compaction is the
+  // recovery in every mode.
+  if (error.kind === "state") return action
   return {
     ...action,
     retry: false,
@@ -325,6 +342,23 @@ function actionForKind(kind: ErrorKind, message: string): ErrorAction {
         stop: false,
         retry: false,
         reason: "context exceeded; rotating to a larger-context model",
+      }
+
+    case "state":
+      return {
+        // The model is fine; the transcript's provider state is not. No
+        // cooldown and no rotation: compaction replaces the transcript that
+        // carries the dangling reference, and the engine re-drives the
+        // continue prompt against the compacted context. A second occurrence
+        // while compaction is rate-limited rotates (the engine's fallback).
+        cooldownMs: 0,
+        resweep: false,
+        degrade: false,
+        restrict: null,
+        stop: false,
+        retry: false,
+        compact: true,
+        reason: "stale reasoning state; compacting the transcript",
       }
 
     case "notfound":
@@ -456,6 +490,7 @@ export function describeError(kind: ErrorKind): string {
     case "capability": return "capability mismatch"
     case "notfound": return "model not found"
     case "deprecated": return "model deprecated"
+    case "state": return "stale reasoning state"
     case "auth": return "authorization failed"
     case "network": return "network error"
     case "other": return "unclassified error"

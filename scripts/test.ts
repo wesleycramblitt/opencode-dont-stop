@@ -22,7 +22,7 @@ import { clearCooldown, cooldown, meets, loadCatalogue, type Catalogue, type Cat
 import { rankForMode, profileFor } from "../lib/modes.ts"
 import { measureContext, descendantIDs, effectiveContext, ollamaServedContext, shouldRotate } from "../lib/rotation.ts"
 import { catalogueRefreshDue, parseAlibabaInventory, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
-import { LoopEngine, COMPLETION_SENTINEL, CHECKPOINT_SENTINEL, type EngineOptions } from "../lib/engine.ts"
+import { LoopEngine, CONTINUE_PROMPT, type EngineOptions } from "../lib/engine.ts"
 import { initialState, readState, type Mode, type PluginState } from "../lib/state.ts"
 import { FREE_TIERS } from "../data/free-tiers.ts"
 
@@ -155,6 +155,24 @@ test("the message outranks a mislabeled type or status", () => {
   // instead of rotating. The provider's own sentence wins.
   assert.equal(classify({ message: "Rate limit exceeded. Please try again later.", status: 402 }).kind, "rate")
   assert.equal(classify({ message: "The free quota has been exhausted: qwen3-turbo", status: 402 }).kind, "freequota")
+})
+
+test("stale reasoning state is its own kind: compact, never cool or rotate", () => {
+  // The observed shape: the provider refuses a reasoning item the transcript
+  // references because the endpoint no longer holds it. Reading it as
+  // `notfound` would cool a working model for 24h over a transcript problem.
+  const item = classify({ message: "Item 'rs_abc123' of type 'reasoning' was not found or has expired." })
+  assert.equal(item.kind, "state")
+  const referenced = classify({ message: "referenced reasoning item 'rs_abc123' was not found or has expired" })
+  assert.equal(referenced.kind, "state")
+
+  for (const mode of ["free", "cheap"] as const) {
+    const action = actionFor(item, mode)
+    assert.equal(action.compact, true, "the transcript is replaced")
+    assert.equal(action.cooldownMs, 0, "the model is not at fault")
+    assert.equal(action.resweep, false, "no rotation to pay")
+    assert.equal(action.retry, false)
+  }
 })
 
 test("free-mode failures: one try, one hour out, spent quotas out forever", () => {
@@ -384,7 +402,9 @@ test("discover re-asserts persisted cooldowns on a fresh catalogue", async () =>
 })
 
 test("a restarted session is re-seeded with the full loop prompt", async () => {
-  const { engine, state, fakes } = makeEngine("i1")
+  // reseedGraceMs: 0 exercises the detector directly; the default window
+  // suppresses it for the first 90s after boot (its own test below).
+  const { engine, state, fakes } = makeEngine("i1", { reseedGraceMs: 0 })
   const cat = catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })])
   injectCatalogue(engine, cat)
   armLoop(engine, state, "i1", "ses_loop", "free")
@@ -401,10 +421,109 @@ test("a restarted session is re-seeded with the full loop prompt", async () => {
   fakes.messages.push({ id: 1 })
   await reseed.maybeReseedRestarted("ses_loop")
   const text = fakes.prompts.at(-1)?.text ?? ""
-  assert.match(text, /^task/, "the loop prompt is re-injected")
-  assert.ok(text.includes(COMPLETION_SENTINEL), "the protocol instructions ride along")
+  assert.equal(text, "task", "the mission is re-injected, with nothing appended")
   assert.equal(state.loops["ses_loop"].turnStartedAt !== null, true, "the reseed starts a turn")
   assert.equal(state.loops["ses_loop"].lastResult, "session restarted; loop prompt re-injected")
+})
+
+test("the restart detector stands down during the boot grace", async () => {
+  const { engine, state, fakes } = makeEngine("i1") // default grace
+  const cat = catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  engine.observe({ type: "session.execution.failed", data: { sessionID: "ses_loop" } })
+  // Seed a count that clearly dropped: with the grace gone this would
+  // re-seed, so the no-op proves the boot window is what suppressed it.
+  ;(engine as unknown as { messageCounts: Map<string, number> }).messageCounts.set("ses_loop", 5)
+  fakes.messages.push({ id: 1 })
+  const reseed = engine as unknown as { maybeReseedRestarted(sessionID: string): Promise<void> }
+  await reseed.maybeReseedRestarted("ses_loop")
+  assert.equal(fakes.prompts.length, 0, "opencode's own resume owns the boot window")
+})
+
+test("a loop orphaned by a service restart is recovered, not halted", async () => {
+  const { engine, state, fakes } = makeEngine("i2")
+  const cat = catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  state.loops["ses_loop"].ownerBeatAt = Date.now() - 10 * 60 * 1000
+  fakes.messages.push({ id: 1 }, { id: 2 })
+
+  await engine.recoverOrphanedLoops(state)
+
+  assert.equal(state.loops["ses_loop"].status, "active", "the loop survives the restart")
+  assert.equal(state.loops["ses_loop"].owner, "i2", "the new instance adopts it")
+  assert.equal(state.loops["ses_loop"].lastResult, "recovered after restart; continuing")
+  assert.ok(
+    (engine as unknown as { redrives: Map<string, number> }).redrives.has("ses_loop"),
+    "a re-drive covers the case opencode does not resume",
+  )
+  assert.equal(fakes.interrupted.length, 0)
+})
+
+test("a loop whose session cannot be read is still halted on boot", async () => {
+  const { engine, state, fakes } = makeEngine("i2")
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  state.loops["ses_loop"].ownerBeatAt = Date.now() - 10 * 60 * 1000
+  ;(fakes.context as unknown as { session: { context: () => Promise<unknown> } }).session.context = async () => {
+    throw new Error("session gone")
+  }
+
+  await engine.recoverOrphanedLoops(state)
+
+  assert.equal(state.loops["ses_loop"].status, "stopped")
+  assert.equal(state.loops["ses_loop"].lastResult, "loop orphaned: the instance running it is gone")
+})
+
+test("a stale reasoning-state failure compacts the transcript and re-drives", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x" }),
+    row({ key: "b/y", providerID: "b", id: "y" }),
+  ])
+  injectCatalogue(engine, cat)
+  armLoop(engine, state, "i1", "ses_loop", "free")
+  const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!
+  tracked.model = { providerID: "a", id: "x" }
+
+  await engine.onError({
+    sessionID: "ses_loop",
+    message: "referenced reasoning item 'rs_abc123' was not found or has expired",
+  })
+
+  assert.deepEqual(fakes.compacted, ["ses_loop"], "the transcript carrying the dangling reference is replaced")
+  assert.ok(state.cooldowns["a/x"] === undefined, "the model is not cooled down")
+  assert.ok(
+    (engine as unknown as { redrives: Map<string, number> }).redrives.has("ses_loop"),
+    "the continue prompt is re-driven against the compacted context",
+  )
+})
+
+test("the loop nudges each turn and restates the mission on a cadence", async () => {
+  const { engine, state, fakes } = makeEngine("i1", { sessionSteps: 100, reinjectEvery: 2 })
+  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
+  armLoop(engine, state, "i1", "ses_loop", "free")
+
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  assert.equal(fakes.prompts.at(-1)?.text, CONTINUE_PROMPT, "a plain turn gets the short nudge")
+
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+  const prompt = fakes.prompts.at(-1)?.text ?? ""
+  assert.match(prompt, /^task/, "the mission is restated on the cadence")
+  assert.match(prompt, /Keep working\.$/)
+})
+
+test("a step-budget compaction re-anchors the full loop prompt", async () => {
+  const { engine, state, fakes } = makeEngine("i1", { sessionSteps: 1, reinjectEvery: 100 })
+  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
+  armLoop(engine, state, "i1", "ses_loop", "free")
+
+  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
+
+  assert.deepEqual(fakes.compacted, ["ses_loop"], "the step budget compacts the transcript")
+  const prompt = fakes.prompts.at(-1)?.text ?? ""
+  assert.match(prompt, /^task/, "the mission is re-injected after the compaction")
+  assert.match(prompt, /Keep working\.$/)
 })
 
 /* -------------------------------------------------------------------- catalogue */
@@ -921,56 +1040,10 @@ test("our own interrupt defers to the re-drive instead of advancing", async () =
   assert.ok((engine as unknown as { redriveAt: number | null }).redriveAt !== null)
 })
 
-test("a completion claim is reported and the loop keeps going — sentinels never stop it", async () => {
-  const { engine, state, fakes } = makeEngine("i1")
-  armLoop(engine, state, "i1", "ses_loop")
-  const canned = (text: string) => ({
-    session: {
-      ...fakeContext().context.session,
-      prompt: async (input: { sessionID: string; text: string }) => {
-        fakes.prompts.push(input)
-      },
-      context: async () => ({ data: [
-        { type: "user", text: "task" },
-        { type: "assistant", content: [{ type: "text", text }] },
-      ]}),
-    },
-  })
-
-  // A model that believes it is done emits the sentinel: the loop logs the
-  // claim, continues, and turns the claim back into work — it never stops.
-  ;(engine as unknown as { ctx: unknown }).ctx = canned(COMPLETION_SENTINEL)
-  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
-
-  assert.equal(state.loops["ses_loop"].status, "active")
-  assert.match(state.loops["ses_loop"].lastResult ?? "", /completion claimed.*continuing/)
-  const prompt = fakes.prompts[fakes.prompts.length - 1]
-  assert.ok(prompt.text.includes("only its owner halts it"), "the claim is turned back into work")
-
-  // A second sentinel on the next turn is a second report, not a stop either.
-  ;(engine as unknown as { ctx: unknown }).ctx = canned(`still confident ${COMPLETION_SENTINEL}`)
-  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
-  assert.equal(state.loops["ses_loop"].status, "active")
-  assert.equal(state.loops["ses_loop"].iterations, 2)
-})
-
 test("only a halt ends the loop", async () => {
-  const { engine, state, fakes } = makeEngine("i1")
+  const { engine, state } = makeEngine("i1")
   armLoop(engine, state, "i1", "ses_loop")
-  const canned = (text: string) => ({
-    session: {
-      ...fakeContext().context.session,
-      prompt: async (input: { sessionID: string; text: string }) => {
-        fakes.prompts.push(input)
-      },
-      context: async () => ({ data: [
-        { type: "user", text: "task" },
-        { type: "assistant", content: [{ type: "text", text }] },
-      ]}),
-    },
-  })
 
-  ;(engine as unknown as { ctx: unknown }).ctx = canned(COMPLETION_SENTINEL)
   await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
   assert.equal(state.loops["ses_loop"].status, "active")
 
@@ -982,7 +1055,7 @@ test("only a halt ends the loop", async () => {
 /* --------------------------------------------------------------- rotation */
 
 test("a session rotates at the turn budget, carrying the loop", async () => {
-  const { engine, state, fakes } = makeEngine("i1", { sessionSteps: 3, sessionMinSteps: 2 })
+  const { engine, state, fakes } = makeEngine("i1", { sessionSteps: 3 })
   injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
   armLoop(engine, state, "i1", "ses_loop", "free")
 
@@ -1004,14 +1077,13 @@ test("a session rotates at the turn budget, carrying the loop", async () => {
   const prompt = fakes.prompts[fakes.prompts.length - 1]
   assert.equal(prompt.sessionID, "ses_new")
   assert.match(prompt.text, /Original task: task/)
-  assert.match(prompt.text, /loop-checkpoint/)
   const created = fakes.created[fakes.created.length - 1]
   assert.equal(created.title, "task · loop 2", "the successor is named for its task and loop number")
   assert.deepEqual(fakes.removed, ["ses_loop"], "the retired session is deleted after rotation")
 })
 
 test("a failed delete of the retired session is non-fatal", async () => {
-  const { engine, state } = makeEngine("i1", { sessionSteps: 1, sessionMinSteps: 1 })
+  const { engine, state } = makeEngine("i1", { sessionSteps: 1 })
   injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
   armLoop(engine, state, "i1", "ses_loop")
   const broken = fakeContext()
@@ -1027,7 +1099,7 @@ test("a failed delete of the retired session is non-fatal", async () => {
 })
 
 test("the retired session delete retries once before giving up", async () => {
-  const { engine, state } = makeEngine("i1", { sessionSteps: 1, sessionMinSteps: 1 })
+  const { engine, state } = makeEngine("i1", { sessionSteps: 1 })
   injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
   armLoop(engine, state, "i1", "ses_loop")
   const flaky = fakeContext()
@@ -1044,39 +1116,8 @@ test("the retired session delete retries once before giving up", async () => {
   assert.ok(state.loops["ses_new"], "the rotation landed")
 })
 
-test("a task-boundary signal rotates only after real work in the session", async () => {
-  const { engine, state, fakes } = makeEngine("i1", { sessionMinSteps: 2, sessionSteps: 30 })
-  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
-  armLoop(engine, state, "i1", "ses_loop", "free")
-  const canned = (text: string) => ({
-    session: {
-      ...fakeContext().context.session,
-      prompt: async (input: { sessionID: string; text: string }) => {
-        fakes.prompts.push(input)
-      },
-      context: async () => ({ data: [
-        { type: "user", text: "task" },
-        { type: "assistant", content: [{ type: "text", text }] },
-      ]}),
-    },
-  })
-
-  // First turn: the checkpoint is below the floor, so it is reported and the
-  // loop continues in place.
-  ;(engine as unknown as { ctx: unknown }).ctx = canned(`packet done ${CHECKPOINT_SENTINEL}`)
-  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
-  assert.ok(state.loops["ses_loop"])
-  assert.match(state.loops["ses_loop"].lastResult ?? "", /task boundary claimed/)
-
-  // The second turn reaches the floor: the same signal now rotates.
-  await engine.onTurnEnd("ses_loop", "session.execution.succeeded")
-  assert.equal(state.loops["ses_loop"], undefined)
-  assert.ok(state.loops["ses_new"])
-  assert.match(state.loops["ses_new"].lastResult ?? "", /task boundary/)
-})
-
 test("a rotation defers under a live subagent and is retried after", async () => {
-  const { engine, state, fakes } = makeEngine("i1", { sessionSteps: 1, sessionMinSteps: 1 })
+  const { engine, state, fakes } = makeEngine("i1", { sessionSteps: 1 })
   injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
   armLoop(engine, state, "i1", "ses_loop", "free")
 
@@ -1117,7 +1158,7 @@ test("a rotation defers under a live subagent and is retried after", async () =>
 })
 
 test("context pressure rotates before the window fills", async () => {
-  const { engine, state } = makeEngine("i1", { sessionSteps: 100, sessionMinSteps: 100 })
+  const { engine, state } = makeEngine("i1", { sessionSteps: 100 })
   injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x", context: 1_000 })]))
   armLoop(engine, state, "i1", "ses_loop", "free")
   const tracked = engine.trackedSessions().find((s) => s.sessionID === "ses_loop")!

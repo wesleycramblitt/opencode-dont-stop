@@ -8,12 +8,10 @@
  * repository is the state — plans, task files, the codebase index — and a
  * summary of a session that already wrote its work to disk is redundant.
  *
- * Three things decide when to rotate, all in `lib/engine.ts`:
+ * Two things decide when to rotate, all in `lib/engine.ts`:
  *
- * 1. **A task boundary.** The model says a unit of work is done
- *    (`<loop-checkpoint/>`), or that everything is done (`<loop-complete/>`).
- * 2. **A session step budget.** Turns spent in one session.
- * 3. **Context pressure.** Usage at a fraction of the effective window, so
+ * 1. **A session step budget.** Turns spent in one session.
+ * 2. **Context pressure.** Usage at a fraction of the effective window, so
  *    the emergency backstop — OpenCode's own auto-compaction — stays
  *    theoretical rather than being the mechanism that saves a session.
  *

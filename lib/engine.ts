@@ -14,9 +14,10 @@
  * *the loop may only touch what it owns*:
  *
  * - **Ownership.** A loop belongs to the instance that started it (`owner`).
- *   Advancing, interrupting and rotating happen only there, so a second
- *   opencode process — or a fresh one after a restart — never adopts a loop
- *   it did not start, and an orphaned loop is halted rather than inherited.
+ *   Advancing, interrupting and rotating happen only there, so a second live
+ *   opencode process reports a loop but never drives it. A loop left behind by
+ *   a dead owner is recovered on boot: adopted when its session still exists,
+ *   halted when it does not.
  * - **A budget per failure, not per recovery.** Every model gets one try per
  *   episode — rotation moves to a model that has not been attempted since the
  *   last completed turn, so a chain of ten is walked and then stops instead of
@@ -86,14 +87,14 @@ export interface EngineOptions {
   seedSessions?: string[]
   /** Hard cap on iterations, so a loop cannot run forever. */
   maxIterations?: number
-  /** Token the model emits to declare the task finished. */
-  completionSentinel?: string
   /** Fraction of the effective context window at which to rotate. */
   rotationThreshold?: number
   /** Turns in one session before a fresh one is started. */
   sessionSteps?: number
-  /** Turns a session must have done before a boundary signal rotates it. */
-  sessionMinSteps?: number
+  /** How often to re-inject the full loop prompt into an active session.
+   *  Reinjection keeps the mission in front of the model once per-turn
+   *  instructions age out of attention (or get summarized by compaction). */
+  reinjectEvery?: number
   /** Identifies this process as the loop's owner. Generated when omitted. */
   instanceID?: string
   /**
@@ -109,6 +110,12 @@ export interface EngineOptions {
   redriveDelayMs?: number
   /** How long a model that hung stays out of the chain. */
   hangCooldownMs?: number
+  /**
+   * Boot window in which the restart detector stands down, so a re-seed does
+   * not race opencode's own session resume after a service restart. Defaults
+   * to DEFAULT_RESEED_GRACE_MS; tests pass 0.
+   */
+  reseedGraceMs?: number
 }
 
 /**
@@ -125,17 +132,19 @@ export const DEFAULT_MAX_ITERATIONS = 100
  *
  * A long conversation degrades the model at the work, not just its speed, and
  * a new session with the same prompt cures it. This budget is the backstop for
- * models that never signal a task boundary; a boundary rotates sooner.
+ * a conversation that never otherwise settles.
  */
 export const DEFAULT_SESSION_STEPS = 30
 
 /**
- * Turns a session must complete before a boundary signal rotates it.
+ * How many turns between full-prompt reinjections.
  *
- * A boundary claimed on a just-started session is noise — that session is
- * already fresh — so only a claim reached after real work counts.
+ * The model drifts once the opening instructions age out of attention or get
+ * summarized by compaction, so the mission is restated on this cadence (and
+ * immediately after a compaction). Between reinjections a short nudge is
+ * enough while the context still holds the task.
  */
-export const DEFAULT_SESSION_MIN_STEPS = 8
+export const DEFAULT_REINJECT_EVERY = 10
 
 /**
  * How long to wait before re-driving the loop — after cancelling a hung turn,
@@ -155,12 +164,24 @@ export const DEFAULT_REDRIVE_DELAY_MS = 20_000
 export const DEFAULT_HANG_COOLDOWN_MS = 10 * 60_000
 
 /**
+ * How long after boot the restart detector stands down.
+ *
+ * A service restart resumes suspended sessions and re-appends instruction
+ * messages, so a session's message count can be in flux while opencode settles.
+ * A re-seed that races opencode's own resume is a duplicate prompt, not a
+ * recovery, and the wait costs nothing: the resume is already re-driving the
+ * session. Tests pass 0 to exercise the detector directly.
+ */
+export const DEFAULT_RESEED_GRACE_MS = 90_000
+
+/**
  * How long a loop session waits before a second compaction request.
  *
  * Compaction is requested when no candidate model can hold the session's
- * context, and the server compacts at the next step boundary. After one
- * request the transcript is on its way down, so a second request within the
- * window is a duplicate, not a new need.
+ * context, or when the transcript carries provider state the endpoint no
+ * longer honors (a stale reasoning item); the server compacts at the next
+ * step boundary. After one request the transcript is on its way down, so a
+ * second request within the window is a duplicate, not a new need.
  */
 export const COMPACTION_REQUEST_COOLDOWN_MS = 5 * 60_000
 
@@ -195,66 +216,15 @@ export const RETRY_INTERRUPT_COOLDOWN_MS = 45_000
 export const LEASE_GRACE_BEATS = 3
 
 /**
- * The completion sentinel.
+ * The loop drive prompt.
  *
- * A *report*, never a stop. The loop cannot know on its own whether a task is
- * finished — that is a judgement about the work, and the only entity with the
- * context is the model doing it. So the prompt instructs the model to emit
- * this exact token when it believes the task is complete; reading for it is
- * deterministic and needs no extra model call. But the owner's policy is that
- * a loop ends only when the owner halts it, so the claim is logged, surfaced
- * through `lastResult`, and answered with `AFTER_COMPLETE_PROMPT` — the loop
- * keeps working. A model that wants to stop the loop cannot; only its owner
- * can.
+ * Short — just tells the model to keep going. No sentinels, no boundary tokens,
+ * no completion protocol. The full mission lives in the prompt that gets
+ * reinjected periodically (see reinjectPromptThreshold). Reinjection is what
+ * keeps the model on track once per-turn instructions age out of attention
+ * (or get summarized away by compaction).
  */
-export const COMPLETION_SENTINEL = "<loop-complete/>"
-
-/** Instruction appended to every loop prompt so the model knows the protocol. */
-export const SENTINEL_INSTRUCTION =
-  `\n\nWhen the task above is fully complete, reply with exactly ${COMPLETION_SENTINEL} ` +
-  `and nothing else. Do not emit it while work remains.`
-
-/**
- * The task-boundary sentinel.
- *
- * The completion sentinel means "the whole task is done"; in a loop whose task
- * is an ongoing sweep, that signal is rare. This one is the finer boundary: the
- * prompt asks for it when a task packet, or a batch of related tasks, is
- * finished. The loop answers it by rotating to a fresh session — the work is on
- * disk, and the new session re-reads it — which is the natural point to shed a
- * long conversation.
- */
-export const CHECKPOINT_SENTINEL = "<loop-checkpoint/>"
-
-/** Asked for at the same time as the completion sentinel, in every session. */
-export const CHECKPOINT_INSTRUCTION =
-  `\n\nWhen you finish a task packet, or a batch of related tasks, reply with exactly ` +
-  `${CHECKPOINT_SENTINEL} and nothing else. The loop continues in a fresh session from there; ` +
-  `do not emit it while work remains in the current unit.`
-
-/**
- * Sent to advance a loop that has not finished. Deliberately short: the session
- * already holds the full task context, and a long standing instruction tends to
- * make the model restart rather than continue.
- */
-export const CONTINUE_PROMPT = "Continue. If the task is now fully complete, reply with only " + COMPLETION_SENTINEL
-
-/**
- * Sent after a model claims completion.
- *
- * The sentinel is a report, never a stop: the loop only ends when its owner
- * halts it, and a model that believes the task is done must keep working
- * rather than park on the marker. This prompt acknowledges the claim, states
- * the policy explicitly (so the model does not just emit the sentinel again),
- * and points it back at the work: verify the final state, fix what is wrong
- * or unverified, and continue.
- */
-export const AFTER_COMPLETE_PROMPT =
-  `You signalled completion with ${COMPLETION_SENTINEL}, but this loop does not ` +
-  `stop on its own — only its owner halts it. Verify the final state once more ` +
-  `and continue the underlying task: fix anything still wrong, incomplete, or ` +
-  `unverified, and carry on working. Do not reply with ${COMPLETION_SENTINEL} ` +
-  `again; reply with the work.`
+export const CONTINUE_PROMPT = "Continue."
 
 /**
  * What a rotation attempt did.
@@ -272,19 +242,7 @@ export class LoopEngine {
   private readonly tracked = new Map<string, TrackedSession>()
   private readonly clocks: ClockSet
   private restrictions: Record<string, Requirements> = {}
-  /**
-   * Models that have already had a try since the last completed turn, keyed
-   * `provider/model`. Rotation only moves to an *untried* model, so a chain of
-   * ten gives ten tries and then stops instead of cycling through the same few
-   * forever. Unreachable and cooling-down models never enter this set: they are
-   * filtered out of the chain before rotation sees them, so they cost nothing.
-   */
   private tried = new Set<string>()
-  /**
-   * Failures per model this episode, keyed `provider/model`. One is a flake
-   * worth a second attempt on the same model; two means rotate. Cleared with
-   * the episode.
-   */
   private retries: Record<string, number> = {}
   /**
    * Whether the turn that just ended died of an error rather than completing,
@@ -329,19 +287,23 @@ export class LoopEngine {
   private advancing = new Set<string>()
   /** Whether a foreign loop has already been reported, so it is said once. */
   private reportedForeignLoop = false
+  /**
+   * When this engine loaded. The restart detector stands down for a short
+   * window after boot (`reseedGraceMs`) because a service restart resumes
+   * sessions through opencode's own machinery.
+   */
+  private readonly startedAt = Date.now()
 
   private readonly maxIterations: number
-  private readonly sentinel: string
   private readonly rotationThreshold: number
   private readonly sessionSteps: number
-  private readonly sessionMinSteps: number
+  private readonly reinjectEvery: number
   private readonly redriveDelayMs: number
   private readonly hangCooldownMs: number
   private readonly leaseGraceMs: number
+  private readonly reseedGraceMs: number
   /** The machine's GPU profile for local fit checks. */
   private readonly hardware: HardwareProfile
-  /** Rotations a live subagent deferred, retried on the next turn end. */
-  private readonly pendingRotation = new Map<string, string>()
   /**
    * When each loop session last compacted. Compaction removes messages, which
    * otherwise reads as a session restart; the restart detector stands down
@@ -369,12 +331,12 @@ export class LoopEngine {
     this.instanceID = options.instanceID ?? newInstanceID()
     this.appliedIntent = state.intent?.seq ?? 0
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS
-    this.sentinel = options.completionSentinel ?? COMPLETION_SENTINEL
     this.rotationThreshold = options.rotationThreshold ?? DEFAULT_ROTATION_THRESHOLD
     this.sessionSteps = options.sessionSteps ?? DEFAULT_SESSION_STEPS
-    this.sessionMinSteps = options.sessionMinSteps ?? DEFAULT_SESSION_MIN_STEPS
+    this.reinjectEvery = options.reinjectEvery ?? DEFAULT_REINJECT_EVERY
     this.redriveDelayMs = options.redriveDelayMs ?? DEFAULT_REDRIVE_DELAY_MS
     this.hangCooldownMs = options.hangCooldownMs ?? DEFAULT_HANG_COOLDOWN_MS
+    this.reseedGraceMs = options.reseedGraceMs ?? DEFAULT_RESEED_GRACE_MS
     this.hardware = options.hardware ?? HARDWARE_4090
     this.leaseGraceMs = clocks.intervalMs * LEASE_GRACE_BEATS
     for (const id of options.seedSessions ?? []) {
@@ -1091,17 +1053,21 @@ export class LoopEngine {
    * events belong to the user's new text, and the loop would wait forever.
    * The restart is detected by the message count dropping below the last
    * count the engine saw, and the recovery is to re-inject the FULL loop
-   * prompt — the same text the loop opened with, sentinel instructions and
-   * all — which is what "restart session" is supposed to do.
+   * prompt — the same text the loop opened with — which is what "restart
+   * session" is supposed to do.
    *
    * Compaction also removes messages, but it preserves the work, so a recent
    * compaction suppresses the check. An unreadable session keeps its old
-   * baseline (no reseed on a read error, and no false drop later).
+   * baseline (no reseed on a read error, and no false drop later). A boot
+   * window (`reseedGraceMs`) suppresses the check too: a service restart
+   * resumes sessions through opencode's own SessionRestart, and a re-seed
+   * racing that resume would send the loop prompt twice.
    */
   private async maybeReseedRestarted(sessionID: string): Promise<void> {
     const loop = this.loopFor(sessionID)
     if (!loop || !this.ownsLoop(sessionID)) return
     if (loop.prompt.trim().length === 0) return
+    if (Date.now() - this.startedAt < this.reseedGraceMs) return
     // A running turn cannot have been restarted underneath us; the ending
     // event will flow, and the next beat's read sees the drop.
     if (this.clocks.peek(sessionID)?.activity.running) return
@@ -1115,7 +1081,7 @@ export class LoopEngine {
     if (previous === undefined || count >= previous) return
 
     this.log.warn(`session ${sessionID} restarted (${previous} -> ${count} messages); re-injecting the loop prompt`)
-    await this.sendPrompt(sessionID, `${loop.prompt}${SENTINEL_INSTRUCTION}${CHECKPOINT_INSTRUCTION}`)
+    await this.sendPrompt(sessionID, loop.prompt)
     loop.lastResult = "session restarted; loop prompt re-injected"
     this.emit()
   }
@@ -1248,6 +1214,65 @@ export class LoopEngine {
   }
 
   /**
+   * Boot recovery for loops whose owner died with the server.
+   *
+   * `reapOrphanedLoops` halts an orphan mid-run: a loop is a conversation in
+   * another process, and an owner silent for three beats is gone. Boot is
+   * different. A service restart kills the owner without its teardown, and
+   * the sessions themselves survive in the shared store — so the new instance
+   * adopts the loop instead of halting it, because halting is what turned
+   * "the server restarted" into "the loop silently ended" (the observed
+   * symptom: sessions resume, nothing happens).
+   *
+   * Adoption is gated on the session being readable: a loop whose session is
+   * gone has nothing to drive, and is halted exactly as before. The adopted
+   * loop gets a re-drive, so if opencode's own resume does not start a turn
+   * the loop still continues; if the resume is already running, the re-drive
+   * stands down when the turn-start event arrives.
+   */
+  async recoverOrphanedLoops(onDisk: PluginState = readState()): Promise<void> {
+    for (const [sessionID, disk] of Object.entries(onDisk.loops)) {
+      if (!disk || disk.status !== "active") continue
+
+      const memory = this.state.loops[sessionID]
+      if (memory?.owner === this.instanceID || disk.owner === this.instanceID) continue
+
+      const beatAt = disk.ownerBeatAt ?? 0
+      if (beatAt > 0 && Date.now() - beatAt <= this.leaseGraceMs) {
+        // A live owner elsewhere: report once, exactly as the reaper does.
+        if (!this.reportedForeignLoop) {
+          this.reportedForeignLoop = true
+          this.log.info(
+            `a loop is running on ${sessionID} under instance ${disk.owner}; this instance reports but does not drive it`,
+          )
+        }
+        continue
+      }
+
+      const count = await this.messageCount(sessionID)
+      if (count < 0) {
+        this.log.warn(`loop on ${sessionID} cannot be recovered: its session is unreadable; halting it`)
+        await this.stop("loop orphaned: the instance running it is gone", sessionID)
+        continue
+      }
+
+      this.state.loops[sessionID] = {
+        ...disk,
+        owner: this.instanceID,
+        ownerBeatAt: Date.now(),
+        lastResult: "recovered after restart; continuing",
+      }
+      // Do not clobber an agent an event already attributed: track() replaces
+      // the record's agent, and a boot-time default would outvote the event.
+      if (!this.tracked.has(sessionID)) this.track(sessionID)
+      this.messageCounts.set(sessionID, count)
+      this.log.warn(`recovered loop on ${sessionID} left by instance ${disk.owner ?? "none"}; adopting it`)
+      this.redrives.set(sessionID, Date.now() + this.redriveDelayMs)
+      this.emit()
+    }
+  }
+
+  /**
    * Whether two different paid providers are both out of money, right now.
    *
    * Marks older than the window are stale — an account resettled is a mark
@@ -1364,6 +1389,30 @@ export class LoopEngine {
       loop.consecutiveErrors = 0
     }
 
+    // Stale provider state (an expired reasoning item the endpoint no longer
+    // holds) is a fact about the transcript, not the model: no cooldown and
+    // no rotation by default. Compaction replaces the transcript carrying the
+    // dangling reference, and the re-drive runs the continue prompt against
+    // the compacted context. When compaction is already rate-limited — it did
+    // not clear the state — the loop pays a rotation instead of spinning on
+    // the same request.
+    if (action.compact && ownsThis && input.sessionID) {
+      const compacted = await this.compactSession(input.sessionID)
+      if (compacted) {
+        this.redrives.set(input.sessionID, Date.now() + this.redriveDelayMs)
+        this.emit()
+        return action
+      }
+      this.log.warn(`compaction unavailable for ${input.sessionID}; rotating past the stale state`)
+      const outcome = await this.rotate(input.sessionID, classified.kind)
+      if (outcome !== "moved" && outcome !== "not-ours") {
+        this.log.warn(`no untried model left for ${input.sessionID}; waiting for cooldowns instead of stopping (${outcome})`)
+        if (!this.redrives.has(input.sessionID)) this.redrives.set(input.sessionID, Date.now() + this.redriveDelayMs)
+      }
+      this.emit()
+      return action
+    }
+
     if (willRetry && key) {
       this.retries[key] = failures + 1
       this.log.info(`retrying ${key} once after ${classified.kind} before rotating`)
@@ -1388,7 +1437,7 @@ export class LoopEngine {
   }
 
   private consecutive(error: ClassifiedError): boolean {
-    return error.kind === "other" || error.kind === "auth" || error.kind === "notfound"
+    return error.kind === "other" || error.kind === "auth" || error.kind === "notfound" || error.kind === "state"
   }
 
   private expireCooldowns(): void {
@@ -1532,12 +1581,14 @@ export class LoopEngine {
   }
 
   /**
-   * Request compaction of a loop session no candidate can hold.
+   * Request compaction of a loop session's transcript.
    *
-   * Best-effort and rate-limited per session: the server admits the request
-   * and compacts at the next step boundary — the continue prompt that follows
-   * this rotation — so the next turn runs on a transcript small enough for
-   * any remaining candidate.
+   * Two callers, one action: a session no candidate model can hold, and a
+   * session whose transcript carries provider state the endpoint no longer
+   * honors (a stale reasoning item). Best-effort and rate-limited per session:
+   * the server admits the request and compacts at the next step boundary — the
+   * continue prompt that follows — so the next turn runs on a transcript that
+   * fits, or that no longer references the expired state.
    */
   private async compactSession(sessionID: string): Promise<boolean> {
     const last = this.compactionRequests.get(sessionID) ?? 0
@@ -1548,7 +1599,7 @@ export class LoopEngine {
         session?: { compact?(input: { sessionID: string }): Promise<unknown> }
       }
       await api.session?.compact?.({ sessionID })
-      this.log.info(`compacting ${sessionID}: no candidate model can hold its context`)
+      this.log.info(`compacting ${sessionID}: transcript down, work untouched`)
       return true
     } catch (error) {
       this.log.warn(`compaction failed on ${sessionID}: ${msg(error)}`)
@@ -1649,21 +1700,19 @@ export class LoopEngine {
    * turn it goes idle; rather than treating that as the end, the loop decides:
    *
    * 1. Count the completed iteration and the session's turn.
-   * 2. Read the last assistant turn for a boundary signal — the task
-   *    checkpoint or the completion sentinel. Both are *reported*, never
-   *    acted on as stops: a loop ends only when its owner halts it.
-   * 3. Rotate to a fresh session when one is due: a boundary signal after
-   *    real work in this session, the session step budget, or context
-   *    pressure. The successor carries no history — the repository is the
-   *    state — and the rotation defers while subagents are live.
-   * 4. Report (but never act on) a spent iteration budget or error budget.
-   * 5. Otherwise **re-plan** — re-rank the catalogue, sweep for a model that
-   *    has become available or a better one for the task, and switch the
-   *    session if the answer changed. This is the "continually evaluate on each
-   *    turn" contract, and it runs before the prompt so the next turn is already
-   *    on the current best model.
-   * 6. Send the next prompt, which makes the session busy again and re-arms the
-   *    hang clock.
+   * 2. Compact when the session step budget is exceeded, so a long
+   *    conversation is trimmed rather than abandoned.
+   * 3. **Re-plan** — re-rank the catalogue, sweep for a model that has become
+   *    available or a better one for the task, and switch the session if the
+   *    answer changed. This is the "continually evaluate on each turn"
+   *    contract, and it runs before the prompt so the next turn is already on
+   *    the current best model.
+   * 4. Send the next prompt. Most turns get a short nudge; every
+   *    `reinjectEvery` turns — and right after a compaction — the full loop
+   *    prompt is restated, because the mission drifts out of attention as the
+   *    conversation grows. There is no completion protocol: the model is never
+   *    asked to declare the work done, and nothing but the owner halts the
+   *    loop.
    *
    * `advancing` guards the re-entrancy: an idle event can arrive while a prompt
    * is in flight, and two prompts for one turn would double the work and
@@ -1700,20 +1749,6 @@ export class LoopEngine {
         this.log.warn(`iteration ${iteration} reached the ${this.maxIterations} budget; continuing`)
       }
 
-      const lastText = await this.lastAssistantText(sessionID)
-      const claimed = lastText.includes(this.sentinel)
-      const checkpointed = lastText.includes(CHECKPOINT_SENTINEL)
-      const boundary = claimed || checkpointed
-      if (boundary) {
-        // A boundary claim is a report, never a stop: the loop only ends when
-        // its owner halts it (owner policy). It is logged so the owner can
-        // see it — and then either a rotation starts a fresh session from the
-        // boundary, or the loop continues with a prompt that turns a
-        // completion claim back into work.
-        const what = claimed ? "completion" : "task boundary"
-        this.log.info(`${what} claimed on ${sessionID} at iteration ${iteration}; continuing (loops end only by halt)`)
-      }
-
       if (loop.consecutiveErrors >= 5) {
         // Not a stop (owner, 2026-10-11): the loop survives its own error
         // streaks. The count is reported so the condition is visible.
@@ -1722,8 +1757,9 @@ export class LoopEngine {
 
       // Compact when the step budget is exceeded — keep one session,
       // trim context, rather than rotating to a new session.
+      let compactedNow = false
       if (loop.sessionIterations >= this.sessionSteps) {
-        await this.compactSession(sessionID)
+        compactedNow = await this.compactSession(sessionID)
         loop.sessionIterations = 0
         this.log.info(`compacted ${sessionID}: step budget exceeded, reset sessionIterations`)
       }
@@ -1732,17 +1768,15 @@ export class LoopEngine {
       // model rather than whatever happened to be selected earlier.
       await this.refresh(false)
 
-      // A fresh completion claim is pointed back at the work; anything else
-      // gets the plain continue.
-      await this.sendPrompt(sessionID, claimed ? AFTER_COMPLETE_PROMPT : CONTINUE_PROMPT)
+      // The next prompt. Compaction summarizes the opening prompt away, and
+      // attention to it fades as the conversation grows, so the full mission is
+      // restated on a cadence (and immediately after a compaction). Between
+      // restatements the short nudge is enough.
+      const reinject =
+        compactedNow || (this.reinjectEvery > 0 && iteration % this.reinjectEvery === 0)
+      await this.sendPrompt(sessionID, reinject ? `${loop.prompt}\n\nKeep working.` : CONTINUE_PROMPT)
       this.clocks.clocksFor(sessionID).start(Date.now())
-      // A deferred rotation is worth surfacing: the loop is continuing in a
-      // session that wanted a fresh one, and the reason (usually a live
-      // subagent) is the thing a user would want to know. The boundary note
-      // rides along too, so a claim is visible in the status after the turn
-      // settles rather than only in the log.
-      const note = claimed ? "completion claimed, " : checkpointed ? "task boundary claimed, " : ""
-      loop.lastResult = `iteration ${iteration} done; ${note}continuing`
+      loop.lastResult = `iteration ${iteration} done; continuing`
       this.log.info(`loop iteration ${iteration} complete; continuing`)
       this.emit()
     } catch (error) {
@@ -1791,34 +1825,13 @@ export class LoopEngine {
   }
 
   /**
-   * Read the session's messages and return the last assistant turn's text.
-   *
-   * Returns an empty string on any failure: a model that cannot be read is
-   * treated as "not complete" rather than "complete", so the loop keeps going
-   * and stops on its budget instead of halting on a read error.
-   */
-  private async lastAssistantText(sessionID: string): Promise<string> {
-    try {
-      const api = this.ctx as unknown as {
-        session: { context(input: { sessionID: string }): Promise<unknown> }
-      }
-      const messages = (await api.session.context({ sessionID })) as unknown
-      return extractAssistantText(messages)
-    } catch (error) {
-      this.log.quiet("info", `could not read messages for ${sessionID}: ${msg(error)}`)
-      return ""
-    }
-  }
-
-  /**
    * Why this session should rotate now, or null.
    *
-   * A boundary signal is one-shot — the model will not repeat it on the next
-   * turn — so a rotation deferred by a live subagent is retried first, before
-   * any fresh reason is considered.
+   * The session step budget and context pressure are the triggers; there is no
+   * boundary signal any more (the loop asks the model for no tokens), so this
+   * is only consulted when a rotation path is restored.
    */
-  private async rotationReason(sessionID: string, loop: LoopState, boundary: boolean): Promise<string | null> {
-    if (boundary && loop.sessionIterations >= this.sessionMinSteps) return "task boundary"
+  private async rotationReason(sessionID: string, loop: LoopState): Promise<string | null> {
     if (loop.sessionIterations >= this.sessionSteps) return "session budget"
     const limit = await this.contextLimitFor(sessionID)
     if (limit <= 0) return null
@@ -1844,7 +1857,7 @@ private rotationTitle(loop: LoopState): string {
   return task.slice(0, 70)
 }
 
-/** The seed for a rotated session: the loop's own prompt, plus the protocol. */
+/** The seed for a rotated session: the loop's own prompt, framed as a fresh start. */
   private rotationSeed(prompt: string): string {
     return (
       `A previous session finished a stretch of work and was retired to keep context fresh. ` +
@@ -1852,9 +1865,7 @@ private rotationTitle(loop: LoopState): string {
       `from the plans and task files, reading only as much as you need — the retired session ` +
       `filled its window, so do not re-read large material wholesale and leave room in this one ` +
       `for the work itself.\n\n` +
-      `Original task: ${prompt.trim() || "(none recorded)"}` +
-      SENTINEL_INSTRUCTION +
-      CHECKPOINT_INSTRUCTION
+      `Original task: ${prompt.trim() || "(none recorded)"}`
     )
   }
 
@@ -1950,11 +1961,10 @@ private rotationTitle(loop: LoopState): string {
     // Plan first so the opening turn already runs on the right model.
     await this.refresh(true)
 
-    // Then send the opening prompt. The protocol instructions are appended so
-    // the model knows how to declare a finished unit (which rotates the
-    // session) and a finished task (which is reported, never a stop).
+    // Then send the opening prompt: the mission itself, with nothing appended.
+    // There is no protocol to teach — the loop just keeps prompting.
     try {
-      await this.sendPrompt(sessionID, `${prompt}${SENTINEL_INSTRUCTION}${CHECKPOINT_INSTRUCTION}`)
+      await this.sendPrompt(sessionID, prompt)
       this.clocks.clocksFor(sessionID).start(Date.now())
       // The opening turn's message count is the restart detector's baseline:
       // a session that later drops below it was restarted, not edited.
@@ -2116,62 +2126,6 @@ function restrictionRequirements(restrict: "no-vision" | "no-tools" | "text-only
 
 function describe(error: ClassifiedError): string {
   return error.message || error.kind
-}
-
-/**
- * Pull the last assistant turn's text out of a session context response.
- *
- * The response is an array of messages, each carrying a `role` (v2 spells it
- * `type`) and parts under `content` (v2) or `parts` (older shapes). Only text
- * parts contribute: reasoning parts are not the answer, and a model that
- * thinks through the completion sentinel must not be read as having emitted
- * it.
- *
- * Deliberately tolerant of shape: an unexpected structure returns an empty
- * string rather than throwing, and an empty string means "not complete", which
- * keeps the loop running to its budget instead of stopping on a parse failure.
- */
-function extractAssistantText(messages: unknown): string {
-  if (!Array.isArray(messages)) {
-    // Some APIs wrap the array in `{ data: [...] }`.
-    const wrapped = messages as { data?: unknown } | null
-    if (wrapped && Array.isArray(wrapped.data)) return extractAssistantText(wrapped.data)
-    return ""
-  }
-
-  let text = ""
-  for (const message of messages) {
-    if (!message || typeof message !== "object") continue
-    const record = message as Record<string, unknown>
-    const role = record.role ?? record.type
-    if (role !== "assistant" && role !== "agent") continue
-
-    const collected = textParts(record.content)
-    if (collected.length === 0) {
-      // Older shape: parts under `parts` instead of `content`.
-      const legacy = textParts(record.parts)
-      if (legacy.length > 0) text = legacy
-    } else {
-      text = collected
-    }
-    if (typeof record.text === "string") text = record.text
-  }
-  return text
-}
-
-/** Concatenate the text parts of a message, skipping reasoning and tool parts. */
-function textParts(value: unknown): string {
-  if (!Array.isArray(value)) return ""
-  let out = ""
-  for (const part of value) {
-    if (!part || typeof part !== "object") continue
-    const p = part as Record<string, unknown>
-    const type = p.type
-    if (type !== undefined && type !== "text") continue
-    if (typeof p.text === "string") out += p.text
-    else if (typeof p.content === "string") out += p.content
-  }
-  return out
 }
 
 function msg(error: unknown): string {
