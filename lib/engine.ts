@@ -68,6 +68,7 @@ import { applyAgentDefaults, applySessionModels, sameSlot, slotFrom, type ApplyC
 import type { Logger } from "./log.ts"
 import { bumpIntent, MODES, readState, type LoopState, type Mode, type ModelSlot, type PluginState } from "./state.ts"
 import { eventSignals, TURN_END_TYPES, type EventError, type SessionEvent } from "./events.ts"
+import { configuredModels } from "./fetch.ts"
 
 /** A session the engine is tracking for the loop. */
 export interface TrackedSession {
@@ -701,8 +702,15 @@ export class LoopEngine {
    * model whose provider has no key — `alibaba/qwen3.7-flash` is the cheapest
    * text+tool model in models.dev and simply cannot be used here.
    *
-   * A failure to list models leaves reachability untouched rather than
-   * clearing it, so a transient API error cannot empty every mode.
+   * A provider-level configured-models block (opencode.json) takes priority:
+   * models belonging to that provider but absent from the block are always
+   * marked unreachable, regardless of what the registry returns. This prevents
+   * off-limits offerings (e.g. `qwen-turbo` when only `qwen3.7-flash` is set
+   * up) from leaking into any mode. Providers without a models block fall
+   * through to the registry check.
+   *
+   * A failure to list models or read config leaves reachability untouched
+   * rather than clearing it, so a transient API error cannot empty every mode.
    */
   private async applyReachability(): Promise<void> {
     if (!this.catalogue) return
@@ -719,10 +727,25 @@ export class LoopEngine {
       if (!Array.isArray(data) || data.length === 0) return
 
       const usable = new Set(data.map((m) => `${m.providerID ?? ""}/${m.id ?? ""}`))
+      // Provider-level configured-models overlay: when present, only listed ids
+      // are reachable (providers without a models block fall through).
+      const configuredSetByProvider = (() => {
+        try {
+          const cfg = configuredModels()
+          return cfg
+        } catch {
+          return null
+        }
+      })()
       let reachable = 0
       let unroutable = 0
       for (const model of this.catalogue.models) {
-        model.reachable = usable.has(`${model.providerID}/${model.id}`)
+        const configuredIds = configuredSetByProvider?.get(model.providerID)
+        if (configuredIds && !configuredIds.has(model.id)) {
+          model.reachable = false
+        } else {
+          model.reachable = usable.has(`${model.providerID}/${model.id}`)
+        }
         if (model.reachable) reachable++
         else unroutable++
       }

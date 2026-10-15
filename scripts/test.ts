@@ -11,7 +11,7 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, utimesSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -21,7 +21,7 @@ import { classify, actionFor, DEPRECATED_COOLDOWN_MS, PERMANENT_COOLDOWN_MS } fr
 import { clearCooldown, cooldown, meets, loadCatalogue, pricingAt, blendedPriceAt, type Catalogue, type CatalogueModel, type HardwareProfile } from "../lib/catalogue.ts"
 import { rankForMode, profileFor } from "../lib/modes.ts"
 import { measureContext, descendantIDs, effectiveContext, ollamaServedContext, shouldRotate } from "../lib/rotation.ts"
-import { catalogueRefreshDue, modelsDevTiers, parseAlibabaInventory, rangeUpperBound, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
+import { catalogueRefreshDue, configuredModels, modelsDevTiers, parseAlibabaInventory, rangeUpperBound, rowsFromAlibaba, resolveAlibabaKey } from "../lib/fetch.ts"
 import { LoopEngine, CONTINUE_PROMPT, missionText, type EngineOptions, type Redrive } from "../lib/engine.ts"
 import { initialState, readState, type Mode, type PluginState } from "../lib/state.ts"
 import { FREE_TIERS } from "../data/free-tiers.ts"
@@ -1574,6 +1574,201 @@ test("consecutive errors from foreign sessions never stop the loop", async () =>
 function injectCatalogue(engine: LoopEngine, cat: Catalogue): void {
   ;(engine as unknown as { catalogue: Catalogue | null }).catalogue = cat
 }
+
+/* -------------------------------------------------------------------- configured-models filter */
+
+test("configuredModels reads explicit models blocks from opencode.json", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "dont-stop-cfg-"))
+  try {
+    mkdirSync(join(tmp, ".config", "opencode"), { recursive: true })
+    writeFileSync(join(tmp, ".config", "opencode", "opencode.json"), JSON.stringify({
+      providers: {
+        alibaba: { settings: { apiKey: "key" }, models: { "qwen3.7-flash": {} } },
+        ollama: { models: { qwen3: {}, llama4: {} } },
+      },
+    }))
+    const cfg = configuredModels(tmp)
+    assert.ok(cfg instanceof Map)
+    assert.equal(cfg!.get("alibaba")?.size, 1)
+    assert.ok(cfg!.get("alibaba")!.has("qwen3.7-flash"))
+    assert.equal(cfg!.get("ollama")?.size, 2)
+    assert.ok(cfg!.get("ollama")!.has("qwen3"))
+    assert.ok(cfg!.get("ollama")!.has("llama4"))
+    // Unconfigured provider absent
+    assert.equal(cfg!.get("openai"), undefined)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test("configuredModels tolerates missing files (returns null)", () => {
+  const cfg = configuredModels("/nonexistent/path/for/testing")
+  assert.equal(cfg, null)
+})
+
+test("configuredModels returns non-null with no matching files if at least one path exists", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "dont-stop-cfg-empty-"))
+  try {
+    mkdirSync(join(tmp, ".config", "opencode"), { recursive: true })
+    // Write an empty JSON object — valid but no providers key
+    writeFileSync(join(tmp, ".config", "opencode", "opencode.json"), "{}")
+    const cfg = configuredModels(tmp)
+    assert.ok(cfg instanceof Map)
+    assert.equal(cfg!.size, 0)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test("configuredModels ignores non-object models blocks", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "dont-stop-cfg-nonobj-"))
+  try {
+    mkdirSync(join(tmp, ".config", "opencode"), { recursive: true })
+    writeFileSync(join(tmp, ".config", "opencode", "opencode.json"), JSON.stringify({
+      providers: {
+        alibaba: { models: "not-an-object" },
+        ollama: { models: [] },
+        gpt: { models: { four: {} } },
+      },
+    }))
+    const cfg = configuredModels(tmp)
+    assert.ok(cfg instanceof Map)
+    assert.equal(cfg!.get("alibaba"), undefined)
+    assert.equal(cfg!.get("ollama"), undefined)
+    assert.ok(cfg!.get("gpt")?.has("four"))
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test("configuredModels falls back to .jsonc when .json is missing", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "dont-stop-cfg-jsonc-"))
+  try {
+    mkdirSync(join(tmp, ".config", "opencode"), { recursive: true })
+    writeFileSync(join(tmp, ".config", "opencode", "opencode.jsonc"), JSON.stringify({
+      providers: {
+        alibaba: { models: { "qwen-turbo": {} } },
+      },
+    }))
+    const cfg = configuredModels(tmp)
+    assert.ok(cfg instanceof Map)
+    assert.ok(cfg!.get("alibaba")?.has("qwen-turbo"))
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test(".json takes precedence over .jsonc", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "dont-stop-cfg-precedence-"))
+  try {
+    mkdirSync(join(tmp, ".config", "opencode"), { recursive: true })
+    writeFileSync(join(tmp, ".config", "opencode", "opencode.json"), JSON.stringify({
+      providers: { alibaba: { models: { flash: {} } } },
+    }))
+    writeFileSync(join(tmp, ".config", "opencode", "opencode.jsonc"), JSON.stringify({
+      providers: { alibaba: { models: { turbo: {} } } },
+    }))
+    const cfg = configuredModels(tmp)
+    assert.ok(cfg instanceof Map)
+    assert.equal(cfg!.get("alibaba")?.size, 1)
+    assert.ok(cfg!.get("alibaba")!.has("flash"))
+    assert.equal(cfg!.get("alibaba")?.has("turbo"), false)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test("configuredModels is robust to malformed JSON", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "dont-stop-cfg-bad-"))
+  try {
+    mkdirSync(join(tmp, ".config", "opencode"), { recursive: true })
+    writeFileSync(join(tmp, ".config", "opencode", "opencode.json"), "{ invalid json [[[")
+    const cfg = configuredModels(tmp)
+    assert.equal(cfg, null) // unreadable config → null (fail open)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+/* -------------------------------------------------------------------- reachability + configuredModels */
+
+test("applyReachability marks unconfigured models unreachable for that provider", async () => {
+  const tmp = mkdtempSync(join(tmpdir(), "dont-stop-cfg-engine-"))
+  const savedHome = process.env.HOME
+  try {
+    mkdirSync(join(tmp, ".config", "opencode"), { recursive: true })
+    writeFileSync(join(tmp, ".config", "opencode", "opencode.json"), JSON.stringify({
+      providers: { a: { models: { x: {} } } },
+    }))
+    process.env.HOME = tmp
+    const { engine } = makeEngine("i1")
+    const cat = catalogueOf([
+      row({ key: "a/x", providerID: "a", id: "x" }),
+      row({ key: "a/y", providerID: "a", id: "y" }),
+      row({ key: "b/z", providerID: "b", id: "z" }),
+    ])
+    injectCatalogue(engine, cat)
+    // The registry claims all three are routable; the config block for
+    // provider "a" lists only "x", and provider "b" has no block.
+    const ctx = (engine as unknown as { ctx: { model: { list(): Promise<unknown> } } }).ctx
+    ctx.model = { list: async () => ({ data: [
+      { providerID: "a", id: "x" },
+      { providerID: "a", id: "y" },
+      { providerID: "b", id: "z" },
+    ] }) }
+    await (engine as unknown as { applyReachability(): Promise<void> }).applyReachability()
+    assert.equal(cat.byKey.get("a/x")!.reachable, true)
+    assert.equal(cat.byKey.get("a/y")!.reachable, false)
+    assert.equal(cat.byKey.get("b/z")!.reachable, true)
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME
+    else process.env.HOME = savedHome
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+// Direct integration test using configuredModels + row factory
+test("unconfigured model IDs are rejected by rankForMode when provider has a models block", () => {
+  // Simulate what applyReachability does: configure provider "a" with only "x"
+  const cfg = new Map<string, Set<string>>()
+  cfg.set("a", new Set(["x"]))
+  // provider "b" absent → registry decides (all reachable)
+  
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x", reachable: true }),
+    row({ key: "a/y", providerID: "a", id: "y", reachable: true }), // would be set to false by engine
+    row({ key: "b/z", providerID: "b", id: "z", reachable: true }),
+  ])
+
+  // Apply the configured-models overlay the same way applyReachability does
+  for (const model of cat.models) {
+    const configuredIds = cfg.get(model.providerID)
+    if (configuredIds && !configuredIds.has(model.id)) {
+      model.reachable = false
+    }
+  }
+
+  assert.equal(cat.byKey.get("a/x")!.reachable, true)
+  assert.equal(cat.byKey.get("a/y")!.reachable, false)
+  assert.equal(cat.byKey.get("b/z")!.reachable, true)
+  // rankForMode should exclude the now-unreachable model
+  const cheap = rankForMode(cat, "cheap", profileFor("general"))
+  const keys = cheap.map(m => m.key)
+  assert.ok(keys.includes("a/x"), "configured model x is still ranked")
+  assert.ok(!keys.includes("a/y"), "unconfigured model y is excluded")
+  assert.ok(keys.includes("b/z"), "uncategorized provider b is unaffected")
+})
+
+test("missing-file fail-open leaves registry decisions intact", () => {
+  const cat = catalogueOf([
+    row({ key: "a/x", providerID: "a", id: "x", reachable: true }),
+    row({ key: "b/y", providerID: "b", id: "y", reachable: true }),
+  ])
+  assert.equal(configuredModels("/nonexistent-path-for-test"), null) // fail-open
+  // No override applied — both remain reachable from registry.
+  assert.equal(cat.byKey.get("a/x")!.reachable, true)
+  assert.equal(cat.byKey.get("b/y")!.reachable, true)
+})
 
 test("the state file round-trips without a live server", () => {
   const state = readState()

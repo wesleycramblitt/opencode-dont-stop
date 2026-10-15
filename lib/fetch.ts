@@ -794,6 +794,51 @@ function keyFromConfig(home: string): string | null {
 }
 
 /**
+ * Read per-provider model blocks from the global opencode config files.
+ *
+ * Returns a map of provider → set of configured model IDs. A provider with
+ * no `models` block is absent from the map; `null` means no config file
+ * could be read at all (fail open). The first parseable file wins — mirroring
+ * `keyFromConfig` — so `opencode.json` takes precedence over `opencode.jsonc`
+ * and an unreadable file falls through to the next candidate. Only top-level
+ * string keys are collected; non-object or missing `models` blocks are
+ * silently skipped.
+ */
+export function configuredModels(home: string = process.env.HOME ?? ""): Map<string, Set<string>> | null {
+  const candidates = [
+    join(home, ".config", "opencode", "opencode.json"),
+    join(home, ".config", "opencode", "opencode.jsonc"),
+  ]
+  for (const file of candidates) {
+    if (!existsSync(file)) continue
+    let parsed: { providers?: unknown }
+    try {
+      parsed = JSON.parse(readFileSync(file, "utf8")) as { providers?: unknown }
+    } catch {
+      continue
+    }
+    if (!parsed || typeof parsed !== "object") continue
+    const providers = (parsed as { providers?: unknown }).providers
+    if (!providers || typeof providers !== "object" || Array.isArray(providers)) {
+      return new Map()
+    }
+    const result = new Map<string, Set<string>>()
+    for (const [providerID, value] of Object.entries(providers as Record<string, unknown>)) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const models = (value as { models?: unknown }).models
+        if (models && typeof models === "object" && !Array.isArray(models)) {
+          const ids = new Set<string>(Object.keys(models as Record<string, unknown>))
+          if (ids.size > 0) result.set(providerID, ids)
+        }
+      }
+    }
+    return result
+  }
+  // No candidate file existed, or none parsed — fail open.
+  return null
+}
+
+/**
  * Parse one inventory payload into model entries. Pure, so it can be tested
  * against a fixture. Handles both the Model Studio shape
  * (`output.models[].model`) and the OpenAI-compatible shape (`data[].id`),
