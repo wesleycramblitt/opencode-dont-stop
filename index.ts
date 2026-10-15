@@ -29,6 +29,7 @@ import {
 } from "./lib/state.ts"
 import { exportSummary, hardwareFromEnv } from "./lib/catalogue.ts"
 import { describeMode } from "./lib/modes.ts"
+import { loadDefaultPrompt } from "./lib/default-prompt.ts"
 import { DEFAULT_CLOCKS } from "./lib/clocks.ts"
 
 /* -------------------------------------------------------------------- types */
@@ -442,9 +443,11 @@ export function runCommand(raw: string, env: CommandEnv): string {
       void engine.start(target, prior.prompt).then(persist)
       return `loop restarted on ${target} with the stored prompt (mode: ${state.mode})`
     }
-    log.warn("start had no prompt and no stored loop prompt to resume")
-    persist()
-    return "usage: dont-stop-set start <prompt> | start --prompt-file <path>"
+    // No stored prompt — fall through to the plugin-shipped default so a bare
+    // `start` always works and never prints usage.
+    const fallback = loadDefaultPrompt(baseDir)
+    void engine.start(target, fallback).then(persist)
+    return `loop started on ${target} using the default prompt (mode: ${state.mode})`
   }
 
   if (verb === "stop") {

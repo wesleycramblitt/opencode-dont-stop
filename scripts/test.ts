@@ -25,6 +25,8 @@ import { catalogueRefreshDue, configuredModels, modelsDevTiers, parseAlibabaInve
 import { LoopEngine, CONTINUE_PROMPT, missionText, type EngineOptions, type Redrive } from "../lib/engine.ts"
 import { initialState, readState, type Mode, type PluginState } from "../lib/state.ts"
 import { FREE_TIERS } from "../data/free-tiers.ts"
+import { loadDefaultPrompt, resetDefaultPromptCache } from "../lib/default-prompt.ts"
+import { runCommand } from "../index.ts"
 
 /** Wait for a real timer (the engine's re-drive timers) to fire. */
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -1774,4 +1776,108 @@ test("the state file round-trips without a live server", () => {
   const state = readState()
   assert.ok(Array.isArray(state.log))
   assert.ok(typeof state.mode === "string")
+})
+
+/* ----------------------------------------------------- default prompt loader */
+
+test("loader returns content when the shipped file exists", () => {
+  // The first call in any process hits the file; cache is module-level.
+  resetDefaultPromptCache()
+  const result = loadDefaultPrompt()
+  assert.ok(result.length > 100, "default prompt loaded is substantive")
+  assert.match(result, /survey/i, "mentions survey in workflow")
+  assert.match(result, /STATUS.*NEXT|NEXT.*STATUS/i, "mentions STATUS/NEXT requirement")
+})
+
+test("loader falls back to inline constant when file is missing", () => {
+  // Create a temp dir with no default-loop-prompt.md inside
+  resetDefaultPromptCache()
+  const dir = mkdtempSync(join(tmpdir(), "dont-stop-default-"))
+  const result = loadDefaultPrompt(dir)
+  assert.ok(result.length > 0, "fallback is non-empty")
+  assert.match(result, /autonomous steward/i, "fallback describes the role")
+  rmSync(dir, { recursive: true, force: true })
+})
+
+/* ------------------------------------------------------------------ start precedence */
+
+test("start precedence: text > stored > default", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  injectCatalogue(engine, catalogueOf([row({ key: "a/x", providerID: "a", id: "x" })]))
+
+  // Setup: store a prior loop so stored prompt exists
+  armLoop(engine, state, "i1", "ses_prior", "free")
+
+  const env = {
+    state,
+    engine,
+    log: { info: () => {}, warn: () => {}, error: () => {}, quiet: () => {} },
+    persist: () => {},
+    sessionID: undefined,
+    baseDir: undefined,
+  }
+
+  // 1) Text wins over stored
+  const r1 = runCommand("start my custom prompt", env)
+  await sleep(10)
+  assert.ok(fakes.prompts.some(p => p.text === "my custom prompt"), "text input takes priority")
+
+  // 2) Stored prompt wins over default when no text
+  // Reset fake prompts. Step 1 overwrote the stored prompt, so restore it.
+  state.loops["ses_prior"]!.prompt = "task"
+  fakes.prompts.splice(0, fakes.prompts.length)
+  const r2 = runCommand("start", env)
+  await sleep(10)
+  // The stored prompt from ses_prior should be used
+  const storedCapture = fakes.prompts.find(p => p.text === "task")
+  assert.ok(storedCapture, "stored prompt is used when no text given")
+
+  // 3) Default is used when no stored and no text
+  // Remove the stored loop
+  delete state.loops["ses_prior"]
+  fakes.prompts.splice(0, fakes.prompts.length)
+  const r3 = runCommand("start", env)
+  await sleep(10)
+  assert.ok(r3.includes("default prompt"), "response mentions default prompt was used")
+  assert.ok(fakes.prompts.length > 0, "default prompt was sent to the engine")
+})
+
+test("bare start without any session errors appropriately", () => {
+  const { engine, state } = makeEngine("i1")
+  const env = {
+    state,
+    engine,
+    log: { info: () => {}, warn: () => {}, error: () => {}, quiet: () => {} },
+    persist: () => {},
+    sessionID: undefined,
+    baseDir: undefined,
+  }
+  const r = runCommand("start", env)
+  assert.equal(r, "error: no session to run the loop on")
+})
+
+test("--prompt-file PATH takes highest precedence over stored and default", async () => {
+  const { engine, state, fakes } = makeEngine("i1")
+  // Set up a stored loop
+  armLoop(engine, state, "i1", "ses_prior", "free")
+
+  const tmp = mkdtempSync(join(tmpdir(), "dont-stop-pf-"))
+  writeFileSync(join(tmp, "custom.prompt.md"), "# Custom\nDo my thing.")
+  try {
+    const env = {
+      state,
+      engine,
+      log: { info: () => {}, warn: () => {}, error: () => {}, quiet: () => {} },
+      persist: () => {},
+      sessionID: undefined,
+      baseDir: tmp,
+    }
+    const r = runCommand("start --prompt-file custom.prompt.md", env)
+    await sleep(10)
+    assert.ok(r.includes("custom.prompt.md"), "response shows file path")
+    const captured = fakes.prompts.find(p => p.text.includes("# Custom"))
+    assert.ok(captured, "file prompt was used, not stored or default")
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
