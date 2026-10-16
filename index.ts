@@ -64,7 +64,6 @@ function readPromptFile(path: string, baseDir?: string): string {
   return trimmed
 }
 
-// Actually let me just do this right with proper ESM imports
 export default {
   id: "dont-stop",
 
@@ -202,6 +201,16 @@ export default {
     log.info(
       `dont-stop starting as instance ${engine.instanceID}`,
     )
+
+    // Replay any halt that survived a service restart before adopting
+    // orphans. Otherwise a fresh instance adopts active loops that the
+    // halt should have stopped, leaving the TUI stuck on "halting…".
+    try {
+      const before = readState()
+      if (await engine.applyIntent(before)) persist()
+    } catch (error) {
+      log.warn(`startup intent replay failed: ${messageOf(error)}`)
+    }
 
     // Start recovery on boot — adopt orphaned loops, re-seed restarted sessions.
     void engine

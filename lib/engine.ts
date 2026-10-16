@@ -210,7 +210,12 @@ export class LoopEngine {
     const clocks = options.clocks ?? DEFAULT_CLOCKS
     this.clocks = new ClockSet(clocks)
     this.instanceID = options.instanceID ?? newInstanceID()
-    this.appliedIntent = state.intent?.seq ?? 0
+    // Start with no intent applied so a halt that survived a service restart
+    // is replayed by the next live instance. Re-applying a halt that already
+    // stopped its targets is harmless (no active targets, just a log), but
+    // dropping it leaves the TUI stuck on "halting…" with active loops that
+    // will never be stopped.
+    this.appliedIntent = 0
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS
     this.rotationThreshold = options.rotationThreshold ?? DEFAULT_ROTATION_THRESHOLD
     this.sessionSteps = options.sessionSteps ?? DEFAULT_SESSION_STEPS
@@ -549,8 +554,12 @@ export class LoopEngine {
       for (const [id, diskRow] of Object.entries(onDisk.loops)) {
         const local = this.state.loops[id]
         if (!local) this.state.loops[id] = diskRow
-        else if (local.owner !== this.instanceID && (diskRow.ownerBeatAt ?? 0) > (local.ownerBeatAt ?? 0)) {
-          this.state.loops[id] = diskRow
+        else if (local.owner !== this.instanceID) {
+          if (local.status === "stopped" && diskRow.status === "active") {
+            // halt/retirement in memory must not be reverted by stale disk
+          } else if ((diskRow.ownerBeatAt ?? 0) > (local.ownerBeatAt ?? 0)) {
+            this.state.loops[id] = diskRow
+          }
         }
       }
     }
@@ -961,8 +970,12 @@ export class LoopEngine {
         unsettled = true
         loop.status = "stopped"
         loop.lastResult = reason
-        loop.owner = null
-        loop.ownerBeatAt = 0
+        // Keep ownership so writeState and beat merges prefer this stopped
+        // row over the stale active row still on disk. An orphaned loop
+        // halted by a new instance would otherwise be resurrected because
+        // writeState always defers non-owned rows to disk.
+        loop.owner = this.instanceID
+        loop.ownerBeatAt = Date.now()
         loop.rotations = 0
         loop.turnStartedAt = null
       }

@@ -258,14 +258,20 @@ export function writeState(state: PluginState, ownInstanceID?: string): void {
           continue
         }
         // An instance only keeps authority for rows it owns. A row it does
-        // not own always defers to what is on disk, so a stale instance never
-        // clobbers the owner's progress.
+        // not own normally defers to disk, so a stale instance never
+        // clobbers the owner's progress. The exception is a locally-stopped
+        // row (halt or retirement) that must not be resurrected by a stale
+        // active row still on disk.
         if (local.owner === ownInstanceID) {
           if ((diskRow.ownerBeatAt ?? 0) > (local.ownerBeatAt ?? 0)) {
             state.loops[sid] = diskRow
           }
         } else {
-          state.loops[sid] = diskRow
+          if (local.status === "stopped" && diskRow.status === "active") {
+            // keep the halt/retirement
+          } else {
+            state.loops[sid] = diskRow
+          }
         }
       }
     }

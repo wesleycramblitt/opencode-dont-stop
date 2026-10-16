@@ -248,10 +248,17 @@ function DontStopFooter(props: { state: () => PluginState; sessionID: string | n
         const state = props.state()
         const loop = loopForFooter(state, props.sessionID)
         const active = loop?.status === "active"
-        const halting =
+        // A halt is shown as "halting…" only while it is fresh. If the
+        // engine fails to act (service restart dropped the intent, write
+        // merge reverted it, etc.) the footer would otherwise be stuck on
+        // "halting…" forever for an active loop. After a grace window we
+        // fall back to the normal active rendering so the UI stays usable
+        // and the next halt can be retried.
+        const pendingHalt =
           active &&
           state.intent.action === "halt" &&
           state.intent.at > (loop!.startedAt ?? 0)
+        const halting = pendingHalt && Date.now() - state.intent.at < 90_000
         if (!active) return <text fg="gray">idle</text>
         if (halting) return <text fg="yellow">halting…</text>
         return (
