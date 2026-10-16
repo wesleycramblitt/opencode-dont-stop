@@ -227,7 +227,8 @@ export default {
       // disk for the next instance to adopt (recoverOrphanedLoops handles the
       // truly-dead case after the grace window expires).
       if (ownedActive.length > 0 && Date.now() - setupAt > 30_000) {
-        void engine.stop("plugin unloaded").finally(() => {
+        log.warn(`plugin unloading after ${Math.round((Date.now() - setupAt) / 1000)}s; stopping ${ownedActive.length} owned loop(s)`)
+        void engine.stop("loop stopped: plugin unloaded").finally(() => {
           persist()
         })
       } else {

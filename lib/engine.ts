@@ -120,6 +120,9 @@ export interface EngineOptions {
 
 /**
  * The iteration count at which the loop reports a runaway.
+ *
+ * Report-only by design: reaching it logs a warning and the loop continues.
+ * There is no iteration cap — a budget would silently halt long-running work.
  */
 export const DEFAULT_MAX_ITERATIONS = 100
 
@@ -401,9 +404,29 @@ export class LoopEngine {
     this.state.intent = intent
 
     if (intent.action === "halt") {
-      if (this.loops().every((l) => l.status !== "active")) return true
-      this.log.info(`halt requested (intent ${intent.seq})`)
-      await this.stop(`halted by intent ${intent.seq}`)
+      const actives = Object.entries(this.state.loops).filter(([, l]) => l.status === "active")
+      if (actives.length === 0) return true
+      // A halt applies only to loops its request postdates (mirroring the
+      // TUI's `halting…` condition: `intent.at > loop.startedAt`). Loops
+      // started after the request — including ones started by a fresh instance
+      // that re-reads this intent from disk — are new work, not targets, so a
+      // stale halt can never kill a new loop. An intent without a timestamp
+      // falls back to halting everything rather than dropping the request.
+      const issuedAt = intent.at ?? 0
+      const targets = issuedAt > 0
+        ? actives.filter(([, l]) => (l.startedAt ?? 0) < issuedAt)
+        : actives
+      if (targets.length === 0) {
+        this.log.info(`halt intent ${intent.seq} postdates every active loop; ignoring it`)
+        return true
+      }
+      this.log.warn(`halt intent ${intent.seq} halting ${targets.length} loop(s) started before the request`)
+      // announce=false: the request is already the newest word on the control
+      // plane, so re-bumping a fresh halt here would mint a poison intent that
+      // outlives the loops it stopped and re-fires on later ones.
+      for (const [sessionID] of targets) {
+        await this.stop(`halted by intent ${intent.seq}`, sessionID, onDisk, false)
+      }
     }
     return true
   }
@@ -428,11 +451,12 @@ export class LoopEngine {
         continue
       }
 
+      const stale = beatAt > 0 ? `${Math.round((Date.now() - beatAt) / 1000)}s` : "never"
       this.log.warn(
         `loop on ${sessionID} is orphaned ` +
-          `(owner ${disk.owner ?? "none"} last beat ${beatAt > 0 ? `${Math.round((Date.now() - beatAt) / 1000)}s` : "never"} ago)`,
+          `(owner ${disk.owner ?? "none"} last beat ${stale} ago); reaping it`,
       )
-      await this.stop("loop orphaned: the instance running it is gone", sessionID)
+      await this.stop("loop orphaned: owner heartbeat expired; reaped", sessionID)
     }
   }
 
@@ -696,6 +720,8 @@ export class LoopEngine {
       this.emit()
 
       if (iteration >= this.maxIterations) {
+        // Deliberately not a halt: the budget only reports, so a loop doing
+        // long but healthy work is never capped into silence.
         this.log.warn(`iteration ${iteration} reached the ${this.maxIterations} budget; continuing`)
       }
 
@@ -803,8 +829,20 @@ export class LoopEngine {
       return
     }
 
+    // Retire the old row in place — never delete it. writeState merges rows
+    // from disk that memory is missing, so a deleted row is resurrected as
+    // active on the next persist and driven alongside its successor. The
+    // retired row keeps its owner and a fresh beat so the merge prefers this
+    // stopped row over the active one still on disk.
     loop.status = "stopped"
     loop.lastResult = `rotated to ${result.newSessionID} after ${loop.sessionIterations} turns`
+    loop.ownerBeatAt = Date.now()
+    loop.turnStartedAt = null
+    this.log.info(
+      `loop on ${sessionID} rotated to ${result.newSessionID} after ${loop.sessionIterations} turns; ` +
+        `old session retired${result.deletedOld ? " and deleted" : ""}` +
+        `${result.deleteError ? ` (delete failed: ${result.deleteError})` : ""}`,
+    )
 
     const newLoop: LoopState = {
       ...loop,
@@ -819,9 +857,13 @@ export class LoopEngine {
       owner: this.instanceID,
       ownerBeatAt: Date.now(),
     }
-    delete this.state.loops[sessionID]
     this.state.loops[newLoop.sessionID!] = newLoop
 
+    this.clearRedrive(sessionID)
+    this.armedSessions.delete(sessionID)
+    this.hangInterrupts.delete(sessionID)
+    this.turnToolUse.delete(sessionID)
+    this.lastReinjections.delete(sessionID)
     this.messageCounts.delete(sessionID)
     this.messageCounts.set(newLoop.sessionID!, 0)
 
@@ -902,7 +944,7 @@ export class LoopEngine {
     this.emit()
   }
 
-  async stop(reason: string, sessionID?: string, onDiskArg?: PluginState): Promise<void> {
+  async stop(reason: string, sessionID?: string, onDiskArg?: PluginState, announce = true): Promise<void> {
     const onDiskLoops = (onDiskArg ?? readState()).loops
     const targets = sessionID ? (this.state.loops[sessionID] ? [sessionID] : []) : Object.keys(this.state.loops)
     let acted = false
@@ -940,8 +982,11 @@ export class LoopEngine {
     }
     if (acted) this.resetEpisode()
 
-    if (unsettled) {
+    if (unsettled && announce) {
       this.appliedIntent = bumpIntent(this.state, "halt").seq
+      this.log.info(`loop${targets.length > 1 ? "s" : ""} stopped: ${reason}`)
+      this.emit()
+    } else if (unsettled) {
       this.log.info(`loop${targets.length > 1 ? "s" : ""} stopped: ${reason}`)
       this.emit()
     }
