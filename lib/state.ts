@@ -1,29 +1,21 @@
 /**
- * Shared durable state for dont-stop.
+ * dont-stop — Shared durable state for the loop plugin.
  *
- * This file is the bridge between the two halves of the plugin. The server
- * entrypoint (`index.ts`) owns the engine and writes state here on every
- * meaningful change; the terminal entrypoint (`tui.ts`) reads it to render
- * status. Only fields the terminal can legitimately initiate (mode, loop
- * start/stop) are reconciled back, which is why writes are atomic-ish and
- * always full-object: the reader never has to guess at partial state.
+ * This file is the bridge between the server half (index.ts) and the terminal
+ * half (tui.tsx). The server owns the engine and writes state here on every
+ * meaningful change; the terminal reads it to render status. Only loop fields
+ * live here now — modes were removed entirely (owned exclusively by the
+ * sibling model-selector plugin); model selection, ranking, cooldowns, funds
+ * tracking also live there, which owns that contract.
+ *
+ * Fields the terminal can legitimately initiate (loop start/stop via intent)
+ * are reconciled back, which is why writes are atomic-ish and always full-object:
+ * the reader never has to guess at partial state.
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-
-import { PERMANENT_COOLDOWN_MS } from "./errors.ts"
-
-export const MODES = ["free", "cheap", "local", "power", "stop"] as const
-export type Mode = (typeof MODES)[number]
-
-/** One model slot. Mirrors `Model.Ref` with an optional variant. */
-export interface ModelSlot {
-  providerID: string
-  id: string
-  variant?: string
-}
 
 export interface LogEntry {
   t: number
@@ -31,12 +23,17 @@ export interface LogEntry {
   message: string
 }
 
+/**
+ * State of one loop iteration record. The loop runs in a single session,
+ * records its progress, and survives across restarts through this file.
+ */
 export interface LoopState {
   status: "active" | "stopped"
+  /** The session this loop drives. Null when the loop has not started yet. */
   sessionID: string | null
   /**
-   * The loop runs in a single session. Kept for backwards compatibility;
-   * always 1 since we no longer rotate sessions.
+   * Kept for backwards compatibility; always 1 since we no longer rotate sessions.
+   * Session rotation is handled by model-selector's own logic.
    */
   sessionNumber: number
   prompt: string
@@ -64,23 +61,11 @@ export interface LoopState {
   ownerBeatAt: number
   /** Model rotations bought since the last completed turn. */
   rotations: number
-  /**
-   * The mode THIS loop runs in. Per-session (owner, 2026-10-12): two sessions
-   * may want different things — free for one, cheap for another — and the
-   * state file is shared, so the mode lives with the loop, not above it.
-   */
-  mode: Mode
-  /** Whether this loop's mode was degraded away and waits for the user. */
-  degraded: boolean
-  /** The mode this loop degraded from, for the status line. */
-  preferredMode: Mode | null
   /** Consecutive errors this loop's session survived (reported, never fatal). */
   consecutiveErrors: number
   /**
    * When the loop's in-flight turn started (epoch ms), or null when the loop
-   * is between turns. Set when a prompt is sent, cleared when its turn ends —
-   * so the status and footer can say "working" instead of looking hung while
-   * a slow turn (first token on a local model, a long generation) runs.
+   * is between turns. Set when a prompt is sent, cleared when its turn ends.
    */
   turnStartedAt: number | null
 }
@@ -103,49 +88,8 @@ export interface Loops {
 export interface Intent {
   /** Monotonic across every writer. The highest `seq` is the newest word. */
   seq: number
-  action: "none" | "start" | "halt" | "mode"
-  /** The mode a "mode" intent names. */
-  mode?: Mode
+  action: "none" | "start" | "halt"
   at: number
-}
-
-export interface Cooldowns {
-  /** modelKey -> epoch ms after which the model may be tried again */
-  [key: string]: number
-}
-
-/**
- * Per-provider insufficient-funds markers: providerID -> epoch ms of the
- * newest funds failure seen on that provider's model. A mode degrades only
- * when two *different* paid providers are both marked fresh — the owner's
- * rule (2026-10-12) is that one provider being out of money is a rotation,
- * not a mode change.
- */
-export interface FundsProviders {
-  [providerID: string]: number
-}
-
-export interface PluginState {
-  version: number
-  /**
-   * The default mode: what a NEW loop starts in, and what the agent-defaults
-   * plan uses while no loop is active. A running loop's mode lives on the
-   * loop itself (per-session, owner 2026-10-12).
-   */
-  mode: Mode
-  loops: Loops
-  /** The newest control instruction. Written by any half, applied by the owner. */
-  intent: Intent
-  /** The main session's model. */
-  main: ModelSlot | null
-  /** Per-agent-type model assignments, keyed by agent id. */
-  agentModels: Record<string, ModelSlot>
-  cooldowns: Cooldowns
-  /** Which providers are known to be out of money, and when (see FundsProviders). */
-  fundsProviders: FundsProviders
-  lastEvent: string | null
-  log: LogEntry[]
-  updated: number
 }
 
 /**
@@ -162,6 +106,10 @@ export function dontStopDisabled(): boolean {
   return value !== undefined && value !== "" && value !== "0"
 }
 
+/**
+ * Path to the don't stop state JSON file. Lives under ~/.config/opencode
+ * alongside opencode.json so the operator can find it easily.
+ */
 export function statePath(): string {
   return join(homedir(), ".config", "opencode", "dont-stop-state.json")
 }
@@ -169,21 +117,15 @@ export function statePath(): string {
 export function initialState(): PluginState {
   return {
     version: 1,
-    mode: "free",
     loops: {},
     intent: { seq: 0, action: "none", at: 0 },
-    main: null,
-    agentModels: {},
-    cooldowns: {},
-    fundsProviders: {},
-    lastEvent: null,
     log: [],
     updated: Date.now(),
   }
 }
 
 /** One loop, from the pieces the rest of the file can carry. */
-function loopState(mode: Mode): LoopState {
+function loopState(): LoopState {
   return {
     status: "stopped",
     sessionID: null,
@@ -196,9 +138,6 @@ function loopState(mode: Mode): LoopState {
     owner: null,
     ownerBeatAt: 0,
     rotations: 0,
-    mode,
-    degraded: false,
-    preferredMode: null,
     consecutiveErrors: 0,
     turnStartedAt: null,
   }
@@ -222,54 +161,57 @@ export function readState(): PluginState {
  * for the fields it names.
  *
  * One migration rides along: files written by a pre-per-session plugin carry
- * a single `loop` and global `degraded`/`preferredMode`/`consecutiveErrors`
- * instead of the `loops` map. They are folded into a per-session entry when
- * the map is empty, so the loop that was running survives the upgrade.
+ * a single `loop` instead of the `loops` map. It is folded into a per-session
+ * entry when the map is empty, so the loop that was running survives the
+ * upgrade.
+ *
+ * Stale keys from the removed modes concept (a top-level `mode`, per-loop
+ * `mode`/`degraded`/`preferredMode`, a `"mode"` intent action with its `mode`
+ * field) are tolerated and dropped, so the next persist cleans the file.
  */
 function mergeState(base: PluginState, patch: Partial<PluginState>): PluginState {
-  const next: PluginState = { ...base, ...patch }
-  next.loops = { ...patch.loops }
+  const { mode: _droppedTopMode, ...modeFreePatch } = patch as Partial<PluginState> & { mode?: unknown }
+  const next: PluginState = { ...base, ...modeFreePatch }
+  delete (next as unknown as Record<string, unknown>).mode
+  next.loops = { ...(modeFreePatch.loops ?? {}) }
   // Normalize per-session rows: files written before a field existed carry
   // only the pieces their writer knew, so each row is completed over the
-  // factory default.
+  // factory default. Stale mode keys ride along in old rows and are stripped.
   for (const [sessionID, row] of Object.entries(next.loops)) {
-    if (row) next.loops[sessionID] = { ...loopState(row.mode ?? base.mode), ...row }
+    if (row) {
+      const { mode: _m, degraded: _d, preferredMode: _p, ...modelessRow } = row as LoopState & {
+        mode?: unknown
+        degraded?: unknown
+        preferredMode?: unknown
+      }
+      next.loops[sessionID] = { ...loopState(), ...modelessRow }
+    }
   }
   if (Object.keys(next.loops).length === 0) {
     // The pre-per-session file carried a single `loop` plus global
-    // degraded/preferredMode/consecutiveErrors; that shape is not in the
-    // type anymore, so the read is typed loosely on purpose.
+    // consecutiveErrors; that shape is not in the type anymore, so the read
+    // is typed loosely on purpose. Stale mode keys that may ride along are
+    // stripped.
     const legacyPatch = patch as unknown as {
-      loop?: Partial<LoopState>
+      loop?: Partial<LoopState> & { mode?: unknown; degraded?: unknown; preferredMode?: unknown }
       degraded?: boolean
-      preferredMode?: Mode | null
+      preferredMode?: unknown
       consecutiveErrors?: number
     }
     const legacy = legacyPatch.loop
     if (legacy && typeof legacy.sessionID === "string" && legacy.sessionID !== "") {
-      const mode = patch.mode ?? base.mode
+      const { mode: _m, degraded: _d, preferredMode: _p, ...modelessLegacy } = legacy
       next.loops[legacy.sessionID] = {
-        ...loopState(mode),
-        ...legacy,
-        mode: legacy.mode ?? mode,
-        degraded: legacy.degraded ?? legacyPatch.degraded === true,
-        preferredMode: legacy.preferredMode ?? legacyPatch.preferredMode ?? null,
+        ...loopState(),
+        ...modelessLegacy,
         consecutiveErrors: legacy.consecutiveErrors ?? legacyPatch.consecutiveErrors ?? 0,
       }
     }
   }
-  next.intent = { ...base.intent, ...(patch.intent ?? {}) }
-  next.agentModels = { ...patch.agentModels }
-  next.cooldowns = { ...patch.cooldowns }
-  // Cooldowns written before sentinels were stored as themselves carry
-  // `now + sentinel`; normalize them back to the sentinel so the free-quota
-  // exclusions can be matched and lifted when a mode leaves `free` (engine's
-  // `liftPermanentCooldowns`). The deprecated sentinel sits one below and is
-  // left alone.
-  for (const [key, until] of Object.entries(next.cooldowns)) {
-    if (until >= PERMANENT_COOLDOWN_MS) next.cooldowns[key] = PERMANENT_COOLDOWN_MS
-  }
-  next.fundsProviders = { ...patch.fundsProviders }
+  const nextIntent = { ...base.intent, ...(patch.intent ?? {}) }
+  if ((nextIntent.action as string) === "mode") nextIntent.action = "none"
+  delete (nextIntent as Record<string, unknown>).mode
+  next.intent = nextIntent
   next.log = [...(patch.log ?? [])]
   return next
 }
@@ -293,20 +235,45 @@ function mergeState(base: PluginState, patch: Partial<PluginState>): PluginState
  *    mtime is therefore a true signal of change, which both the watcher and
  *    the TUI rely on.
  */
-export function writeState(state: PluginState): void {
+export function writeState(state: PluginState, ownInstanceID?: string): void {
   try {
     const file = statePath()
     mkdirSync(dirname(file), { recursive: true })
     const existing = readRaw(file)
-    const theirs = existing ? parsedIntent(existing) : undefined
+    const parsedExisting: Partial<PluginState> | null = existing
+      ? safeParse(existing)
+      : null
+    const theirs = parsedExisting?.intent
     if (theirs && theirs.seq > state.intent.seq) {
       state.intent = theirs
-      // A newer intent may name a mode this writer has not applied yet.
-      // Adopting the mode here keeps a writer with a stale copy from
-      // reverting the file to an older mode on its next persist — which is
-      // how a TUI mode change "stuck" for one beat and then snapped back.
-      if (theirs.action === "mode" && theirs.mode) state.mode = theirs.mode
     }
+    // Merge the loops map from disk so a stale in-memory snapshot cannot
+    // erase a row written by another instance. An instance may write (and
+    // possibly remove) only the rows it owns; everything else is adopted.
+    if (parsedExisting?.loops && typeof parsedExisting.loops === "object") {
+      for (const [sid, diskRow] of Object.entries(parsedExisting.loops)) {
+        const local = state.loops[sid]
+        if (!local) {
+          state.loops[sid] = diskRow
+          continue
+        }
+        // An instance only keeps authority for rows it owns. A row it does
+        // not own always defers to what is on disk, so a stale instance never
+        // clobbers the owner's progress.
+        if (local.owner === ownInstanceID) {
+          if ((diskRow.ownerBeatAt ?? 0) > (local.ownerBeatAt ?? 0)) {
+            state.loops[sid] = diskRow
+          }
+        } else {
+          state.loops[sid] = diskRow
+        }
+      }
+    }
+    // Never shrink the surfaced log: if disk has more, take it.
+    if (parsedExisting?.log && Array.isArray(parsedExisting.log) && parsedExisting.log.length > state.log.length) {
+      state.log = [...parsedExisting.log]
+    }
+
     if (existing !== null && stableEqual(state, existing)) return
     state.updated = Date.now()
     const tmp = `${file}.tmp`
@@ -318,12 +285,9 @@ export function writeState(state: PluginState): void {
 }
 
 /** The intent a serialized state file carries, or undefined when it cannot be read. */
-function parsedIntent(raw: string): Intent | undefined {
-  try {
-    return (JSON.parse(raw) as Partial<PluginState>).intent
-  } catch {
-    return undefined
-  }
+/** Read a parsed Partial<PluginState>, or null when the file is incoherent. */
+function safeParse(raw: string): Partial<PluginState> | null {
+  try { return JSON.parse(raw) as Partial<PluginState> } catch { return null }
 }
 
 /** Raw file contents, or null when the file is absent or unreadable. */
@@ -348,15 +312,12 @@ function stableEqual(state: PluginState, raw: string): boolean {
 /**
  * Issue the next control instruction. Reads the file first so a halt written
  * by another half raises the sequence above it rather than fighting it.
- *
- * `mode` is carried only by mode intents; every other action drops it.
  */
-export function bumpIntent(state: PluginState, action: Intent["action"], mode?: Mode): Intent {
+export function bumpIntent(state: PluginState, action: Intent["action"]): Intent {
   const theirs = readState().intent
   state.intent = {
     seq: Math.max(theirs.seq, state.intent.seq) + 1,
     action,
-    ...(action === "mode" && mode ? { mode } : {}),
     at: Date.now(),
   }
   return state.intent
@@ -366,4 +327,15 @@ export function bumpIntent(state: PluginState, action: Intent["action"], mode?: 
 export function appendLog(state: PluginState, level: LogEntry["level"], message: string): void {
   state.log.push({ t: Date.now(), level, message })
   if (state.log.length > 200) state.log.splice(0, state.log.length - 200)
+}
+
+/* -------------------------------------------------------------------- types */
+
+export interface PluginState {
+  version: number
+  loops: Loops
+  /** The newest control instruction. Written by any half, applied by the owner. */
+  intent: Intent
+  log: LogEntry[]
+  updated: number
 }

@@ -7,9 +7,13 @@
  * restart without losing the other's view.
  *
  * The footer claim targets `prompt.footer.status`, appended rather than
- * replaced: the host publishes that slot for status contributions, and
- * `replace` takes the slot over from OpenCode's own status row. Rendering is reactive off the state file's
- * mtime, so a change made headlessly shows up in the next terminal too.
+ * replaced: the host publishes that slot for status contributions. Rendering
+ * is reactive off the state file's mtime, so a change made headlessly shows up
+ * in the next terminal too.
+ *
+ * Model selection, modes, ranking — all owned exclusively by the sibling
+ * model-selector plugin. This TUI only shows loop status: iterations, session turns, active
+ * state.
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs"
@@ -19,8 +23,7 @@ import { Plugin } from "@opencode/plugin/tui"
 import type { JSX } from "@opentui/solid"
 import { createSignal, onCleanup } from "solid-js"
 
-import { MODES, dontStopDisabled, readState, writeState, type LoopState, type Mode, type PluginState } from "./lib/state.ts"
-import { describeMode } from "./lib/modes.ts"
+import { dontStopDisabled, readState, writeState, type LoopState, type PluginState } from "./lib/state.ts"
 
 const statePath = join(homedir(), ".config", "opencode", "dont-stop-state.json")
 
@@ -49,13 +52,6 @@ export default {
 
     /* ------------------------------------------------------------- state feed */
 
-    // The state file is the bridge. Watch its mtime rather than polling its
-    // contents: the server half writes atomically via rename, so an mtime
-    // change is a reliable, cheap signal. The signal reaches the footer
-    // through a Solid `createSignal` (the slot render mounts it; the timer
-    // pushes into it), so the footer re-renders on every actual change —
-    // including a mode change while nothing else moves, which the old
-    // non-reactive read missed.
     let snapshot: PluginState = readState()
     let stamp = mtimeOf(statePath)
     let push: ((state: PluginState) => void) | null = null
@@ -75,14 +71,9 @@ export default {
 
     /* ---------------------------------------------------------------- footer */
 
-    // The footer shows the loop of the session the prompt belongs to when
-    // that session has one — per-session since 2026-10-12 — and falls back to
-    // the newest loop otherwise, so the plugin's state is never a mystery.
     const disposeFooter = ctx.ui.slot({
       append: "prompt.footer.status",
       render: (props: { sessionID?: string }) => {
-        // Session switched: the follow flags belong to the session the
-        // terminal was watching, not to the terminal itself.
         if (props.sessionID !== currentSessionID) {
           watchingLoop = false
           sawLoopHere = false
@@ -102,21 +93,12 @@ export default {
 
     /* ---------------------------------------------------------------- toasts */
 
-    // Announce transitions that a user would otherwise miss: a mode change, a
-    // loop starting or stopping, and a model rotation. Deduplicated twice —
-    // on the `updated` stamp so a heartbeat does not spam, and on the message
-    // itself so a stale result cannot re-toast on every unrelated write.
-    // Scoped to the terminal's own session (fed by the footer render below):
-    // one rotation must not pop a toast in every open terminal.
+    // Announce transitions that a user would otherwise miss: a loop starting,
+    // stopping, or rotating. Deduplicated twice — on the `updated` stamp so a
+    // heartbeat does not spam, and on the message itself.
     let lastAnnounced = 0
     let lastMessage = ""
     let currentSessionID: string | null = null
-    // Whether the last observation had THIS terminal's session as an active
-    // loop's home, and whether this terminal has EVER seen a loop record on
-    // its session. A terminal that saw one and then finds it gone — rotations
-    // delete the record — follows the loop that claims to have left, so a tab
-    // can never sit staring at a retired loop, even one opened after the
-    // rotation moment.
     let watchingLoop = false
     let sawLoopHere = false
     const announceInterval = setInterval(() => {
@@ -129,33 +111,21 @@ export default {
       const primary = loops.find((l) => l.status === "active")
       const here = currentSessionID ? state.loops[currentSessionID] : undefined
 
-      // The loop left this terminal's session — a rotation. Move the view to
-      // the successor so a terminal that was watching the loop keeps
-      // watching it. Chains follow naturally — once this terminal lands on
-      // the successor, the next rotation retires it the same way.
       if (here) {
         sawLoopHere = true
       } else if (sawLoopHere && primary && primary.sessionID === currentSessionID) {
-        // still on the same session — keep watching it
         sawLoopHere = false
         followSession(primary.sessionID!)
       }
       watchingLoop = here?.status === "active"
 
       if (primary && previous === 0) {
-        toast(ctx, "info", "dont-stop", `loop running in ${primary.mode} mode`)
+        toast(ctx, "info", "dont-stop", `loop running`)
         return
       }
-      // Only loops this terminal can see are announced: the one on its own
-      // session, or the one that just rotated away from it — so a retirement
-      // is answered with where the loop went instead of a frozen-looking tab.
       const loop = here ?? loops.find((l) => l.status === "active")
       const message = loop?.lastResult
       if (previous === 0) {
-        // First look at a settled state: this terminal never saw the stop
-        // that produced the last result, so announcing it would toast
-        // "plugin unloaded" on every session start. Record it and wait for
-        // a real transition.
         if (message) lastMessage = message
         return
       }
@@ -165,12 +135,7 @@ export default {
       }
     }, 1000)
 
-    /**
-     * Move this terminal's view to the session the loop now lives on.
-     *
-     * Tabbed sessions focus the loop's tab (opening it when needed); the
-     * single-view layout navigates the router to the session directly.
-     */
+    /** Move this terminal's view to the session the loop now lives on. */
     function followSession(sessionID: string): void {
       try {
         const ui = ctx.ui as {
@@ -180,8 +145,7 @@ export default {
         if (ui.tabs?.enabled()) ui.tabs.focus(sessionID)
         else ui.router?.navigate({ type: "session", sessionID })
       } catch {
-        // No terminal attached, or navigation unavailable here; the toast
-        // and the state file still say where the loop went.
+        // No terminal attached; the toast and the state file still say where.
       }
     }
 
@@ -200,45 +164,16 @@ export default {
 
     /* ----------------------------------------------------------------- keymap */
 
-    // Cycle modes with a keybinding. The order follows the cost ranking in
-    // lib/modes.ts so repeated presses walk free -> cheap -> local -> power.
-    const modeOrder: Mode[] = MODES.filter((m) => m !== "stop") as Mode[]
-
-    /**
-     * Register the keymap layer.
-     *
-     * `keymap.layer` reads the keymap through a reactive context, so it can
-     * only be called from inside the component tree — calling it from `setup`
-     * fails with "Keymap.Provider is missing", because the provider the read
-     * resolves against has not been established yet. An `app` slot renders
-     * inside that tree, so registration is deferred to its render function and
-     * torn down with the slot.
-     */
     const commands = [
       {
         id: "dont-stop.status",
         title: "dont-stop: show status",
-        description: "Report mode, loop state, iterations and model",
+        description: "Report loop state, iterations and intent",
         group: "dont-stop",
         suggested: true,
         run: () => {
           const s = read()
           toast(ctx, "info", "dont-stop", statusLine(s))
-        },
-      },
-      {
-        id: "dont-stop.cycle-mode",
-        title: "dont-stop: cycle mode",
-        description: "Cycle free, cheap, local, power",
-        group: "dont-stop",
-        suggested: true,
-        slash: { name: "dont-stop-toggle", arguments: true },
-        run: () => {
-          const state = read()
-          const index = modeOrder.indexOf(state.mode)
-          const next = modeOrder[(index + 1) % modeOrder.length]
-          writeMode(next)
-          toast(ctx, "info", "dont-stop", `mode: ${next} — ${describeMode(next)}`)
         },
       },
       {
@@ -258,12 +193,6 @@ export default {
     const disposeKeymapSlot = ctx.ui.slot({
       append: "app",
       render: () => {
-        // Dispose the previous layer before registering the next one. The app
-        // slot can re-render (a state-file churn re-renders the tree it sits
-        // in), and a render that registered a fresh layer on top of the old
-        // one left both live — every re-render added a duplicate "dont-stop"
-        // command to the palette, which is the "Session/System sections
-        // cycling" symptom: the palette wasn't refreshing, it was growing.
         disposeKeymap?.()
         disposeKeymap = ctx.keymap.layer(() => ({
           mode: "global",
@@ -276,53 +205,11 @@ export default {
     })
 
     /**
-     * Write a mode request into the state file. The server half reconciles
-     * this on its next watch tick, which is the one direction the terminal is
-     * allowed to drive.
-     *
-     * A mode change is a control intent, not a status field: the engine that
-     * owns the loop rewrites the whole file on its beats, and a plain
-     * `state.mode` write was reverted by the next beat of any instance whose
-     * memory still said the old mode — "I set cheap and it stayed free". The
-     * sequential intent survives every status write and every instance
-     * applies it to its own memory before persisting again.
-     */
-    function writeMode(mode: Mode): void {
-      const state = readState()
-      if (state.mode === mode) return
-      const theirs = readState().intent
-      state.intent = {
-        seq: Math.max(theirs.seq, state.intent.seq) + 1,
-        action: "mode",
-        mode,
-        at: Date.now(),
-      }
-      state.mode = mode
-      // Bump `updated` so the server half sees the change even though the
-      // loop fields are untouched.
-      state.updated = Date.now()
-      writeState(state)
-      snapshot = state
-      stamp = mtimeOf(statePath)
-      push?.(snapshot)
-    }
-
-    /**
-     * Ask the loop to stop.
-     *
-     * The terminal does not own the loop's status: the engine reports it and
-     * rewrites the whole file on every heartbeat, so writing `loop.status`
-     * directly was a request that could be — and was — overwritten before it
-     * was read. An intent is the opposite shape. It carries a sequence number,
-     * every writer merges intents by that number instead of last-write-wins,
-     * and the engine applies a halt it has not already acted on. The request
-     * therefore outlives the race that used to swallow it.
+     * Write a halt intent into the state file. The server half reconciles
+     * this on its next watch tick.
      */
     function requestHalt(): void {
       const state = readState()
-      // Raise the sequence above any intent another writer has in flight, so
-      // two halts racing from the same base cannot stamp the same number and
-      // let one of them be read as already-applied.
       const theirs = readState().intent
       state.intent = {
         seq: Math.max(theirs.seq, state.intent.seq) + 1,
@@ -339,8 +226,6 @@ export default {
     return () => {
       clearInterval(timer)
       clearInterval(announceInterval)
-      // The layer is torn down with the slot that registered it, so unregister
-      // that too rather than calling a disposer that may never have run.
       disposeKeymap?.()
       if (typeof disposeKeymapSlot === "function") disposeKeymapSlot()
       disposeFooter()
@@ -351,42 +236,23 @@ export default {
 /* ------------------------------------------------------------------- render */
 
 /**
- * The footer. Always visible, so the loop's state is never a mystery. Shows
- * the loop of the CURRENT session when it has one (per-session, 2026-10-12),
- * else the newest loop anywhere: mode, iterations while running, a pending
- * halt, the model, and the cooling count. Kept to two short segments so it
- * never crowds the composer it sits beside.
+ * The footer. Always visible. Shows the loop of the CURRENT session when it
+ * has one (per-session since 2026-10-12), else the newest loop anywhere.
+ * Loop status only: iterations while running, pending halt.
  */
 function DontStopFooter(props: { state: PluginState; sessionID: string | null }): JSX.Element {
   const state = props.state
   const loop = loopForFooter(state, props.sessionID)
   const active = loop?.status === "active"
 
-  // The mode shown is the loop's own while it runs; otherwise the default
-  // mode, which is what mode changes actually move. A stopped loop's stale
-  // mode must not hide the new default from the footer.
-  const mode = active ? loop!.mode : state.mode
-
-  const degraded = !active ? false : loop!.degraded === true
-  // A halt is a request, not an event: the status keeps reading "active" until
-  // the owning instance applies it, so the pending request is what the footer
-  // shows in the meantime — otherwise a halt looks like it did nothing.
   const halting =
     active &&
     state.intent.action === "halt" &&
     state.intent.at > (loop!.startedAt ?? 0)
 
-  // Cooling is shown next to the mode, not at the end of the row: the model
-  // segment is long, and a segment past it is the first thing clipped — which
-  // reads as "cooling went away". Only unexpired entries count, so a stale
-  // state file cannot show a phantom sentence.
-  const cooling = Object.entries(state.cooldowns ?? {}).filter(([, until]) => until > Date.now()).length
-
   return (
     <box flexDirection="row" gap={1}>
       <text fg="magenta">◍</text>
-      <text fg="cyan">{mode}{degraded ? "!" : ""}</text>
-      {cooling > 0 ? <text fg="yellow">cooling {cooling}</text> : null}
       {active ? (
         halting ? (
           <text fg="yellow">halting…</text>
@@ -394,7 +260,6 @@ function DontStopFooter(props: { state: PluginState; sessionID: string | null })
           <>
             <text fg="green">⟳ {loop!.iterations}</text>
             <text fg="gray">s{loop!.sessionIterations}</text>
-            {state.main ? <text fg="gray">{state.main.providerID}/{state.main.id}</text> : null}
             {loop!.turnStartedAt ? <text fg="brightBlack">working</text> : null}
           </>
         )
@@ -420,20 +285,17 @@ function loopForFooter(state: PluginState, sessionID: string | null): LoopState 
 /** One line per loop, for the palette command and status toasts. */
 function statusLine(state: PluginState): string {
   const loops = Object.values(state.loops)
-  const parts = [`default mode ${state.mode}`]
+  const parts = [`dont-stop`]
   if (loops.length === 0) {
     parts.push("no loops")
   } else {
     for (const loop of loops) {
       const where = loop.sessionID ? loop.sessionID.slice(0, 12) : "?"
       parts.push(
-        `${where} ${loop.status}${loop.iterations > 0 ? ` ${loop.iterations}it` : ""} ` +
-          `${loop.mode}${loop.degraded ? "!" : ""}`,
+        `${where} ${loop.status}${loop.iterations > 0 ? ` ${loop.iterations}it` : ""}`,
       )
     }
   }
-  const cooling = Object.keys(state.cooldowns).length
-  if (cooling > 0) parts.push(`${cooling} model${cooling === 1 ? "" : "s"} cooling`)
   return parts.join(" · ")
 }
 

@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Self-sustaining agent loop with deterministic model selection.",
+  "description": "Self-sustaining session loop: reinjects prompts, manages sessions.",
   "exports": {
     ".": "./index.ts",
     "./tui": "./tui.tsx"

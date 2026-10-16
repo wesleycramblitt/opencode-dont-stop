@@ -1,13 +1,13 @@
 /**
  * dont-stop — server entrypoint.
  *
- * Wires the engine to the opencode server context and owns everything that
+ * Wires the loop engine to the opencode server context and owns everything that
  * must exist headlessly: the command API, the state-file watcher the TUI
  * writes through, and the event pump.
  *
- * The root-cause fix lives in `lib/apply.ts` and is exercised here: on every
- * meaningful change we push the plan through *both* channels, so a mode
- * switch reaches sessions that already pinned a model.
+ * Model selection, modes, ranking, cooldowns, funds tracking — all moved to
+ * the sibling model-selector plugin. This plugin's only job is the loop:
+ * reinjecting prompts, managing sessions, recovering from hangs and restarts.
  */
 
 import { watch } from "node:fs"
@@ -17,18 +17,13 @@ import { basename, dirname, resolve } from "node:path"
 import { LoopEngine } from "./lib/engine.ts"
 import { createLogger } from "./lib/log.ts"
 import { eventData, eventSignals, TURN_END_TYPES, type SessionEvent } from "./lib/events.ts"
-import { catalogueRefreshDue, CATALOGUE_FILE, fetchCatalogue, writeCatalogue } from "./lib/fetch.ts"
 import {
-  MODES,
   dontStopDisabled,
   readState,
   statePath,
   writeState,
-  type Mode,
   type PluginState,
 } from "./lib/state.ts"
-import { exportSummary, hardwareFromEnv } from "./lib/catalogue.ts"
-import { describeMode } from "./lib/modes.ts"
 import { loadDefaultPrompt } from "./lib/default-prompt.ts"
 import { DEFAULT_CLOCKS } from "./lib/clocks.ts"
 
@@ -69,6 +64,7 @@ function readPromptFile(path: string, baseDir?: string): string {
   return trimmed
 }
 
+// Actually let me just do this right with proper ESM imports
 export default {
   id: "dont-stop",
 
@@ -88,16 +84,17 @@ export default {
     const state: PluginState = readState()
     const log = createLogger(state)
 
-    const persist = () => writeState(state)
-
-    const engine = new LoopEngine(
+    // `ownInstanceID` resolves lazily so the closure can be handed to the
+    // engine's constructor (which creates the instance id) before persist runs.
+    const persist = () => writeState(state, engine?.instanceID)
+    let engine!: LoopEngine
+    engine = new LoopEngine(
       context as unknown as ConstructorParameters<typeof LoopEngine>[0],
       state,
       log,
       {
         clocks: DEFAULT_CLOCKS,
         onStateChange: persist,
-        hardware: hardwareFromEnv(),
       },
     )
 
@@ -107,7 +104,7 @@ export default {
       editor.add({
         name: "dont-stop-set",
         description:
-          "Control dont-stop: status, mode free|cheap|local|power, start <prompt | --prompt-file PATH>, stop, probe, best-for <agent>, update-model-catalogue",
+          "Control dont-stop: status, start <prompt | --prompt-file PATH>, stop, track",
         execute: async (input: { prompt?: string | { text?: string }; sessionID?: string }) => {
           const raw =
             typeof input?.prompt === "string" ? input.prompt : input?.prompt?.text ?? ""
@@ -138,47 +135,25 @@ export default {
           const event = next.value as SessionEvent
           engine.observe(event)
 
-          // A failed request is the recovery funnel. v2 reports failures as
-          // `session.error` (provider errors) and on `session.execution.failed`
-          // (a turn that ended in failure); both carry the same error shape.
-          if (event.type === "session.error" || event.type === "session.execution.failed") {
-            const signals = eventSignals(event)
-            if (signals.sessionID) {
-              await engine.onError({
-                sessionID: signals.sessionID,
-                agent: signals.agent ?? undefined,
-                message: signals.error?.message,
-                status: signals.error?.status,
-                type: signals.error?.type,
-              })
-            }
-          }
-
-          // A retry was scheduled for a turn: the endpoint already failed
-          // once and opencode is backing off. The free sweep cuts the storm
-          // short — classify the failure now, cool and rotate — instead of
-          // letting five attempts play out on a model that is not answering.
-          if (event.type === "session.retry.scheduled" && eventData(event).sessionID) {
-            const signals = eventSignals(event)
-            const sid = signals.sessionID
-            if (sid) {
-              await engine.onRetryScheduled(sid, signals.error)
-              persist()
-            }
-          }
-
           // A turn of a loop's session ended — this is the loop's driver.
-          // The event names the ending, so a subagent ending its own turn, or
-          // an ending in an instance that is not driving the loop, cannot
-          // touch the counter. `onTurnEnd` also stands down after the hang
-          // path's own interrupts, so the scheduled re-drive owns those.
-          // Per-session since 2026-10-12: the engine decides which loop (if
-          // any) this session's ending belongs to.
+          // Only the `session.execution.*` trio drives the loop. Per-session
+          // since 2026-10-12: the engine decides which loop (if any) this
+          // session's ending belongs to.
           if (TURN_END_TYPES.has(event.type)) {
             const sid = eventData(event).sessionID
             if (typeof sid === "string" && engine.loopFor(sid)) {
               await engine.onTurnEnd(sid, event.type)
               persist()
+            }
+          }
+
+          // Handle stale reasoning-state errors locally. Full error
+          // classification is owned by model-selector/lib/errors.ts, but
+          // we detect the common shape here and compact+re-drive.
+          if (event.type === "session.error") {
+            const signals = eventSignals(event)
+            if (typeof signals.sessionID === "string") {
+              await engine.onError({ sessionID: signals.sessionID, agent: signals.agent ?? undefined, message: signals.error?.message })
             }
           }
         }
@@ -191,29 +166,24 @@ export default {
 
     /* ------------------------------------------------------- state file watch */
 
-    // The TUI writes this file to request a mode change or a halt. Only the
-    // fields it can legitimately initiate are reconciled; the engine's own
-    // writes already describe the engine and are ignored. Loop control rides
+    // The TUI writes this file to request a halt. Only the fields it can
+    // legitimately initiate are reconciled; the engine's own writes already
+    // describe the engine and are ignored. Loop control rides
     // on the sequenced intent rather than the status fields, so a request
     // cannot be lost to a status write that happened to land after it.
     let settle: ReturnType<typeof setTimeout> | undefined
-    // `fs.watch` throws synchronously when the directory is absent, and this
-    // runs inside `setup`, so an unguarded call takes the whole plugin down
-    // with it (`failed to load plugin ... ENOENT ... watch`). The state
-    // directory is part of this plugin's own home, so treat it as optional and
-    // lose only the file-watching channel rather than the engine.
     let watcher: ReturnType<typeof watch> | undefined
     try {
       watcher = watch(dirname(statePath()), (_event, filename) => {
         if (filename && basename(filename) !== basename(statePath())) return
         clearTimeout(settle)
         settle = setTimeout(() => {
-          void reconcileFromFile()
+          void reconcileFromFile().catch(() => {})
         }, 150)
       })
     } catch (error) {
       log.warn(
-        `not watching ${dirname(statePath())}: ${messageOf(error)}; mode changes from the file need a restart`,
+        `not watching ${dirname(statePath())}: ${messageOf(error)}; halt requests from the file need a restart`,
       )
     }
 
@@ -221,140 +191,57 @@ export default {
       const incoming = readState()
       let changed = false
 
-      if (incoming.mode !== state.mode) {
-        const mode = MODES.includes(incoming.mode) ? incoming.mode : state.mode
-        log.info(`mode changed externally to ${mode}`)
-        await engine.setMode(mode)
-        changed = true
-      }
+      // Loop control via intent: apply intents the engine hasn't seen yet.
+      if (await engine.applyIntent(incoming)) changed = true
 
-      // Loop control no longer comes from the status fields — those are the
-      // engine's report and were being overwritten by whichever writer ran
-      // last, which is how a halt could be lost within a heartbeat. It comes
-      // from the intent, which is merged by sequence number and therefore
-      // survives the race.
-      if (await engine.applyIntent()) changed = true
-
-      // Persist only when the reconcile changed something. Writing on every
-      // pass is what made the watcher eat its own tail: each write re-triggered
-      // the watch event, the reconcile re-read an unchanged file and wrote it
-      // again — a feedback loop rewriting the state file ~twice a second,
-      // which re-rendered the TUI's app tree (the palette's "sections
-      // cycling") and kept toasts alive on a written-but-unchanged file.
       if (changed) persist()
     }
 
     /* ------------------------------------------------------------- startup */
 
     log.info(
-      `dont-stop starting in ${state.mode} mode (${describeMode(state.mode)}) as instance ${engine.instanceID}`,
+      `dont-stop starting as instance ${engine.instanceID}`,
     )
 
-    // Agents from agents/*.md are not in the registry when a transform first
-    // registers, so replay the transform once they have loaded.
-    const timers = [500, 2000, 5000].map((delay) =>
-      setTimeout(() => {
-        void context.agent.reload().catch(() => {})
-      }, delay),
-    )
+    // Start recovery on boot — adopt orphaned loops, re-seed restarted sessions.
+    void engine
+      .recoverOrphanedLoops()
+      .catch((error) => log.warn(`startup recovery failed: ${messageOf(error)}`))
 
-    // The model registry is likewise still settling while setup runs, so the
-    // reachability read `discover()` took can be missing providers that load
-    // moments later. Re-derive until it settles; each pass is an in-process
-    // read that logs only when the counts move.
-    for (const delay of [500, 2000, 5000, 15000]) {
-      setTimeout(() => {
-        void engine.recheckReachability().catch(() => {})
-      }, delay)
-    }
-
-    // Discovery must not hold up startup; the engine applies the plan the
-    // moment it lands.
     const heartbeat = setInterval(() => {
-      void maybeRefreshCatalogue().catch((error) => log.warn(`catalogue refresh failed: ${messageOf(error)}`))
       void engine.beat().catch((error) => log.warn(`heartbeat failed: ${messageOf(error)}`))
     }, DEFAULT_CLOCKS.intervalMs)
 
-    // The catalogue refreshes itself on a cadence (owner, 2026-10-12): a stale
-    // file is rebuilt from the live sources, reloaded into the engine, and the
-    // plan re-applied — so new free rows, price changes and retirements reach
-    // the loop without a manual command. The file's mtime is the clock, a
-    // failed fetch keeps the current catalogue, and one fetch at a time.
-    let catalogueFetching = false
-    // A failed refresh waits before trying again. The heartbeat is 30s, so a
-    // source that is down for an hour would otherwise be hammered 120 times;
-    // a success clears the wait. (Retrying on the next beat was the old
-    // contract, and it is what turned one broken source into a permanent
-    // stream of attempts.)
-    const REFRESH_RETRY_MS = 15 * 60 * 1000
-    let refreshRetryAt = 0
-    const refreshHours = Number(process.env.DONT_STOP_CATALOGUE_REFRESH_HOURS)
-    const refreshIntervalMs = Number.isFinite(refreshHours) && refreshHours > 0
-      ? refreshHours * 60 * 60 * 1000
-      : undefined
-    async function maybeRefreshCatalogue(): Promise<void> {
-      if (catalogueFetching) return
-      if (Date.now() < refreshRetryAt) return
-      if (!catalogueRefreshDue(CATALOGUE_FILE, Date.now(), refreshIntervalMs)) return
-      catalogueFetching = true
-      try {
-        log.info("catalogue is stale; refreshing automatically")
-        // In-server refresh never runs the registry subprocess: `execFileSync`
-        // blocks this server while the CLI it spawns waits for this server to
-        // answer — the deadlock that made the background service look
-        // unresponsive and got it restarted. Reachability is re-derived
-        // in-process by `engine.discover()`/`applyReachability` instead.
-        const document = await fetchCatalogue({ registry: false })
-        writeCatalogue(document)
-        refreshRetryAt = 0
-        await engine.discover()
-        await engine.refresh(true)
-        log.info("automatic catalogue refresh applied")
-        persist()
-      } catch (error) {
-        // A failed refresh keeps the file it failed to replace: the loop
-        // plans against the old catalogue, which is stale but working.
-        refreshRetryAt = Date.now() + REFRESH_RETRY_MS
-        log.warn(
-          `automatic catalogue refresh failed: ${messageOf(error)}; keeping the current catalogue ` +
-            `(next attempt in ${Math.round(REFRESH_RETRY_MS / 60000)}m)`,
-        )
-      } finally {
-        catalogueFetching = false
-      }
-    }
+    const setupAt = Date.now()
 
-    void engine
-      .discover()
-      // A loop left active in the state file belongs to an instance that is
-      // gone — a service restart kills the owner without its teardown. On boot
-      // those loops are *recovered*: the new instance adopts the loop and
-      // continues it, because the session itself survives in the shared store
-      // and a restart is the expected way an owner dies. Only a loop whose
-      // session cannot be read at all is halted. (`reapOrphanedLoops` on the
-      // heartbeat still halts loops that go orphaned mid-run.)
-      .then(() => engine.recoverOrphanedLoops())
-      .then(() => engine.refresh(true))
-      .catch((error) => log.warn(`startup discovery failed: ${messageOf(error)}`))
-
-    return () => {
+    const teardown = () => {
       abort.abort()
       watcher?.close()
       clearTimeout(settle)
       clearInterval(heartbeat)
-      for (const timer of timers) clearTimeout(timer)
-      void engine.stop("plugin unloaded")
-      persist()
+      const ownedActive = engine.ownedActiveSessions()
+      // A genuine long-running instance (uptime > 30s) tears down its loops.
+      // A load that dies within the boot window is almost always a hot reload
+      // of this plugin, not a real shutdown - and stopping the loops there
+      // kills a perfectly good running loop on every edit. Leave the loops on
+      // disk for the next instance to adopt (recoverOrphanedLoops handles the
+      // truly-dead case after the grace window expires).
+      if (ownedActive.length > 0 && Date.now() - setupAt > 30_000) {
+        void engine.stop("plugin unloaded").finally(() => {
+          persist()
+        })
+      } else {
+        persist()
+      }
       const termination = Promise.allSettled([consumer, iterator?.return?.()])
       void Promise.race([termination, new Promise((resolve) => setTimeout(resolve, 2000))])
     }
+
+    return teardown
   },
 }
 
 /* ----------------------------------------------------------------- commands */
-
-/** The mode names a user can select, `stop` excluded: halting is a verb. */
-const MODE_NAMES = MODES.filter((m) => m !== "stop")
 
 interface CommandEnv {
   state: PluginState
@@ -375,27 +262,7 @@ export function runCommand(raw: string, env: CommandEnv): string {
   const [verb, ...rest] = raw.trim().split(/\s+/)
 
   if (!verb || verb === "status" || verb === "help") {
-    return formatStatus(state, engine)
-  }
-
-  // `mode <name>` and a bare mode name both work. `stop` is a mode in the
-  // state machine but a verb here, so it is handled before the mode branch
-  // and never reaches it.
-  let modeName: string | undefined
-  if (verb === "mode" && rest.length > 0) modeName = rest[0].toLowerCase()
-  else if ((MODES as readonly string[]).includes(verb) && verb !== "stop") modeName = verb
-
-  if (modeName) {
-    // `mode <name> [sessionID]` — a session names the SESSION's loop; without
-    // one, the default mode changes and the primary loop follows it.
-    const mode: Mode = modeName as Mode
-    const targetSession = rest[1]
-    void (async () => {
-      await engine.setMode(mode, targetSession && (MODES as readonly string[]).includes(targetSession) ? undefined : targetSession)
-      persist()
-    })()
-    const where = targetSession ? ` on ${targetSession}` : " (default + primary loop)"
-    return `mode set to ${modeName}${where} — ${describeMode(mode)}`
+    return formatStatus(state)
   }
 
   if (verb === "start") {
@@ -403,14 +270,12 @@ export function runCommand(raw: string, env: CommandEnv): string {
     // prompt itself. The flag may appear anywhere in the arguments.
     const fileIndex = rest.findIndex((arg) => arg === "--prompt-file")
     if (fileIndex !== -1) {
-      const path = rest[fileIndex + 1]
-      if (!path) return "usage: dont-stop-set start --prompt-file <path>"
+      const filePath = rest[fileIndex + 1]
+      if (!filePath) return "usage: dont-stop-set start --prompt-file <path>"
       let prompt: string
       try {
-        prompt = readPromptFile(path, baseDir)
+        prompt = readPromptFile(filePath, baseDir)
       } catch (error) {
-        // The return value is discarded by the palette in v2, so a missing or
-        // unreadable file must leave a trace somewhere the user can see it.
         log.warn(`start --prompt-file failed: ${messageOf(error)}`)
         persist()
         return `error: ${messageOf(error)}`
@@ -421,85 +286,32 @@ export function runCommand(raw: string, env: CommandEnv): string {
       const target = sessionID ?? newestTrackedFor(engine)
       if (!target) return "error: no session to run the loop on"
       void engine.start(target, prompt).then(persist)
-      return `loop started from ${path} on ${target} (mode: ${state.mode})`
+      return `loop started from ${filePath} on ${target}`
     }
 
     const target = sessionID ?? newestTrackedFor(engine)
     if (!target) return "error: no session to run the loop on"
     const prompt = rest.join(" ").trim()
-    // A start WITH text runs that text. Only an empty start means "resume":
-    // the most recent loop's stored prompt is re-used, so a restarted (or
-    // fresh) session lands back on the loop with one verb. Checking the
-    // stored prompt first is what made `start <new prompt>` inject the
-    // PREVIOUS loop's prompt — and an empty `start` inject nothing at all —
-    // while the palette showed no error, because a command's return value is
-    // discarded in v2.
     if (prompt) {
       void engine.start(target, prompt).then(persist)
-      return `loop started on ${target} (mode: ${state.mode})`
+      return `loop started on ${target}`
     }
     const prior = engine.primaryLoop()
     if (prior?.prompt) {
       void engine.start(target, prior.prompt).then(persist)
-      return `loop restarted on ${target} with the stored prompt (mode: ${state.mode})`
+      return `loop restarted on ${target} with the stored prompt`
     }
-    // No stored prompt — fall through to the plugin-shipped default so a bare
-    // `start` always works and never prints usage.
     const fallback = loadDefaultPrompt(baseDir)
     void engine.start(target, fallback).then(persist)
-    return `loop started on ${target} using the default prompt (mode: ${state.mode})`
+    return `loop started on ${target} using the default prompt`
   }
 
   if (verb === "stop") {
-    // `stop [sessionID]`: a session id halts that one loop, nothing else
-    // halts every loop this instance drives.
     const target = rest[0] && rest[0].startsWith("ses") ? rest[0] : undefined
     void engine.stop("stopped by command", target).then(persist)
     return target
       ? `halting the loop on ${target}: its in-flight turn is cancelled`
       : "halting every loop: in-flight turns are cancelled and every instance stops driving them"
-  }
-
-  if (verb === "probe" || verb === "discover") {
-    const catalogue = engine.model
-    if (!catalogue) return "catalogue not built yet; try again shortly"
-    return exportSummary(catalogue)
-  }
-
-  if (verb === "best-for") {
-    const agent = rest[0]?.toLowerCase() || "general"
-    const catalogue = engine.model
-    if (!catalogue) return "catalogue not built yet; try again shortly"
-    const ranked = engine.buildPlan()
-    const slot = ranked.agents[agent] ?? ranked.main
-    if (!slot) return `no model assigned for ${agent}`
-    return `${agent}: ${slot.providerID}/${slot.id}`
-  }
-
-  if (verb === "update-model-catalogue" || verb === "update-catalogue" || verb === "catalogue-update") {
-    // Rebuilds the catalogue from the live sources (models.dev, the local
-    // ollama daemon, and — when a key is configured — Alibaba's own
-    // inventory), writes data/catalogue.json, then reloads it and re-plans.
-    // Network-bound on purpose: it is an explicit command, not a heartbeat.
-    void (async () => {
-      try {
-        // In-server, the registry subprocess is skipped for the same reason
-        // the automatic refresh skips it: `execFileSync` would block this
-        // server while the CLI it spawns waits for this server to answer.
-        // For the full rebuild including the registry read, run the
-        // standalone `npx tsx scripts/update-catalogue.ts`.
-        const document = await fetchCatalogue({ registry: false })
-        writeCatalogue(document)
-        log.info(`catalogue rebuilt: ${document.models.length} models`)
-        persist()
-        await engine.discover()
-        await engine.refresh(true)
-        persist()
-      } catch (error) {
-        log.error(`catalogue update failed: ${messageOf(error)}`)
-      }
-    })()
-    return "catalogue rebuild started: fetching live sources into data/catalogue.json"
   }
 
   if (verb === "track") {
@@ -511,22 +323,19 @@ export function runCommand(raw: string, env: CommandEnv): string {
 
   return [
     `unknown verb: ${verb}`,
-    `try: status · mode ${MODE_NAMES.join("|")} · start <prompt | --prompt-file PATH> · stop · probe · best-for <agent> · update-model-catalogue`,
+    `try: status · start <prompt | --prompt-file PATH> · stop · track`,
   ].join("\n")
 }
 
-function formatStatus(state: PluginState, engine: LoopEngine): string {
+function formatStatus(state: PluginState): string {
   const loops = Object.values(state.loops)
-  const lines = [
-    `dont-stop — default mode ${state.mode}`,
-    `  ${describeMode(state.mode)}`,
-  ]
+  const lines = [`dont-stop`]
   if (loops.length === 0) {
     lines.push("  loops: none")
   } else {
     for (const loop of loops) {
       lines.push(
-        `  loop: ${loop.status}${loop.sessionID ? ` on ${loop.sessionID}` : ""}${loop.owner ? ` (owner ${loop.owner})` : ""} — mode ${loop.mode}${loop.degraded ? ` (degraded from ${loop.preferredMode})` : ""}`,
+        `  loop: ${loop.status}${loop.sessionID ? ` on ${loop.sessionID}` : ""}${loop.owner ? ` (owner ${loop.owner})` : ""}`,
       )
       lines.push(`    iterations: ${loop.iterations}`)
       lines.push(`    session turns: ${loop.sessionIterations}`)
@@ -534,7 +343,7 @@ function formatStatus(state: PluginState, engine: LoopEngine): string {
         lines.push(`    in flight: turn working since ${new Date(loop.turnStartedAt).toLocaleTimeString()}`)
       }
       if (loop.rotations > 0) {
-        lines.push(`    rotations without a completed turn: ${loop.rotations}`)
+        lines.push(`    rotations: ${loop.rotations}`)
       }
       if (loop.prompt) lines.push(`    prompt: ${truncate(loop.prompt, 60)}`)
       if (loop.lastResult) lines.push(`    last: ${loop.lastResult}`)
@@ -543,32 +352,11 @@ function formatStatus(state: PluginState, engine: LoopEngine): string {
   if (state.intent && state.intent.action !== "none") {
     lines.push(`  intent: ${state.intent.action} #${state.intent.seq}`)
   }
-  if (state.main) lines.push(`  main model: ${state.main.providerID}/${state.main.id}`)
-
-  const agents = Object.entries(state.agentModels)
-  if (agents.length > 0) {
-    lines.push("  agents:")
-    for (const [agent, slot] of agents) {
-      lines.push(`    ${agent}: ${slot.providerID}/${slot.id}`)
-    }
-  }
-
-  const cooldowns = Object.entries(state.cooldowns).filter(([, until]) => until > Date.now())
-  if (cooldowns.length > 0) {
-    lines.push(`  cooling: ${cooldowns.map(([key]) => key).join(", ")}`)
-  }
-
-  const catalogue = engine.model
-  if (catalogue) {
-    lines.push(`  catalogue: ${catalogue.models.length} models`)
-  }
-
   const errors = state.log.filter((entry) => entry.level === "error" || entry.level === "warn").slice(-3)
   if (errors.length > 0) {
     lines.push("  recent:")
     for (const entry of errors) lines.push(`    [${entry.level}] ${entry.message}`)
   }
-
   return lines.join("\n")
 }
 
@@ -593,11 +381,6 @@ function messageOf(error: unknown): string {
 }
 
 /* -------------------------------------------------------------------- types */
-
-interface AgentEditor {
-  list(): Array<{ id: string; model?: unknown }>
-  update(id: string, update: (agent: { model?: unknown }) => void): void
-}
 
 interface PluginServerContext {
   /** The location this plugin instance is loaded for; the user's working directory. */

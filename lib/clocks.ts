@@ -26,8 +26,6 @@
  * request, not the long one.
  */
 
-import type { Logger } from "./log.ts"
-
 export interface ClockOptions {
   /** Heartbeat cadence. */
   intervalMs: number
@@ -189,7 +187,6 @@ export class ClockSet {
 
   constructor(
     private readonly options: ClockOptions = DEFAULT_CLOCKS,
-    private readonly log?: Logger,
     now: number = Date.now(),
   ) {
     this.lastBeat = now
