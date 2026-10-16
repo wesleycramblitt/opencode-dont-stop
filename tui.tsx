@@ -120,11 +120,11 @@ export default {
       }
       watchingLoop = here?.status === "active"
 
-      if (primary && previous === 0) {
+      if (here && here.status === "active" && previous === 0) {
         toast(ctx, "info", "dont-stop", `loop running`)
         return
       }
-      const loop = here ?? loops.find((l) => l.status === "active")
+      const loop = here
       const message = loop?.lastResult
       if (previous === 0) {
         if (message) lastMessage = message
@@ -238,8 +238,7 @@ export default {
 
 /**
  * The footer. Always visible. Shows the loop of the CURRENT session when it
- * has one (per-session since 2026-10-12), else the newest loop anywhere.
- * Loop status only: iterations while running, pending halt.
+ * has one, else idle. Loop status only: iterations while running, pending halt.
  */
 function DontStopFooter(props: { state: () => PluginState; sessionID: string | null }): JSX.Element {
   return (
@@ -267,16 +266,10 @@ function DontStopFooter(props: { state: () => PluginState; sessionID: string | n
   )
 }
 
-/** Which loop a footer shows: the current session's, else the newest. */
+/** Which loop a footer shows: the current session's, else idle (null). */
 function loopForFooter(state: PluginState, sessionID: string | null): LoopState | null {
   if (sessionID && state.loops[sessionID]) return state.loops[sessionID]
-  const loops = Object.values(state.loops)
-  if (loops.length === 0) return null
-  const active = loops.filter((l) => l.status === "active")
-  const pool = active.length > 0 ? active : loops
-  return [...pool].sort(
-    (a, b) => (b.ownerBeatAt || b.startedAt || 0) - (a.ownerBeatAt || a.startedAt || 0),
-  )[0]
+  return null
 }
 
 /** One line per loop, for the palette command and status toasts. */
