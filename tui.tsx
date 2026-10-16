@@ -87,7 +87,8 @@ export default {
         onCleanup(() => {
           if (version === slotVersion) push = null
         })
-        return <DontStopFooter state={snap()} sessionID={props.sessionID ?? null} />
+        // Pass the accessor so the footer re-renders on every 500ms poll push.
+        return <DontStopFooter state={snap} sessionID={props.sessionID ?? null} />
       },
     })
 
@@ -240,32 +241,28 @@ export default {
  * has one (per-session since 2026-10-12), else the newest loop anywhere.
  * Loop status only: iterations while running, pending halt.
  */
-function DontStopFooter(props: { state: PluginState; sessionID: string | null }): JSX.Element {
-  const state = props.state
-  const loop = loopForFooter(state, props.sessionID)
-  const active = loop?.status === "active"
-
-  const halting =
-    active &&
-    state.intent.action === "halt" &&
-    state.intent.at > (loop!.startedAt ?? 0)
-
+function DontStopFooter(props: { state: () => PluginState; sessionID: string | null }): JSX.Element {
   return (
     <box flexDirection="row" gap={1}>
       <text fg="magenta">◍</text>
-      {active ? (
-        halting ? (
-          <text fg="yellow">halting…</text>
-        ) : (
+      {(() => {
+        const state = props.state()
+        const loop = loopForFooter(state, props.sessionID)
+        const active = loop?.status === "active"
+        const halting =
+          active &&
+          state.intent.action === "halt" &&
+          state.intent.at > (loop!.startedAt ?? 0)
+        if (!active) return <text fg="gray">idle</text>
+        if (halting) return <text fg="yellow">halting…</text>
+        return (
           <>
             <text fg="green">⟳ {loop!.iterations}</text>
             <text fg="gray">s{loop!.sessionIterations}</text>
             {loop!.turnStartedAt ? <text fg="brightBlack">working</text> : null}
           </>
         )
-      ) : (
-        <text fg="gray">idle</text>
-      )}
+      })()}
     </box>
   )
 }
