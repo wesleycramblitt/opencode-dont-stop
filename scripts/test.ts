@@ -447,7 +447,7 @@ test("a hang triggers interrupt-tree, marks interrupt, schedules redrive", async
   assert.equal(fakes.interrupted[0], "ses_loop", "the session was interrupted")
 })
 
-test("halt interrupts the whole tree, drops clocks, keeps the loop session tracked", async () => {
+test("halt interrupts only its own session, drops clocks, untracks it", async () => {
   const { engine, state, fakes } = makeEngine("i1")
   armLoop(engine, state, "i1", "ses_loop")
   engine.track("ses_child", "general")
@@ -459,9 +459,9 @@ test("halt interrupts the whole tree, drops clocks, keeps the loop session track
   await engine.stop("halted by test")
 
   assert.equal(state.loops["ses_loop"]!.status, "stopped")
-  assert.deepEqual(fakes.interrupted.sort(), ["ses_child", "ses_loop"])
-  assert.ok(engine.trackedSessions().some((s) => s.sessionID === "ses_loop"))
-  assert.ok(!engine.trackedSessions().some((s) => s.sessionID === "ses_child"))
+  assert.deepEqual(fakes.interrupted.sort(), ["ses_loop"])
+  assert.ok(!engine.trackedSessions().some((s) => s.sessionID === "ses_loop"))
+  assert.ok(engine.trackedSessions().some((s) => s.sessionID === "ses_child"))
 })
 
 test("a foreign owner's loop is not driven", async () => {
@@ -626,25 +626,7 @@ test("the state file round-trips without a live server", () => {
   assert.ok(!("mode" in state), "no top-level mode survives the merge")
 })
 
-/* ------------------------------------------------------- rotation helpers */
-
-test("rotation title skips leading mode line", () => {
-  const { engine } = makeEngine("i1")
-  const loopA = { status: "stopped" as const, sessionID: null, sessionNumber: 1, prompt: "mode free\nTask changing widgets", iterations: 0, sessionIterations: 0, startedAt: null, lastResult: null, owner: null, ownerBeatAt: 0, rotations: 0, consecutiveErrors: 0, turnStartedAt: null }
-  const loopB = { status: "stopped" as const, sessionID: null, sessionNumber: 1, prompt: "Just a plain task description here", iterations: 0, sessionIterations: 0, startedAt: null, lastResult: null, owner: null, ownerBeatAt: 0, rotations: 0, consecutiveErrors: 0, turnStartedAt: null }
-  const loopC = { status: "stopped" as const, sessionID: null, sessionNumber: 1, prompt: "mode power\nmode cheap\nTask renaming everything", iterations: 0, sessionIterations: 0, startedAt: null, lastResult: null, owner: null, ownerBeatAt: 0, rotations: 0, consecutiveErrors: 0, turnStartedAt: null }
-
-  assert.equal((engine as unknown as { rotationTitle(loop: typeof loopA): string }).rotationTitle(loopA), "Task changing widgets")
-  assert.equal((engine as unknown as { rotationTitle(loop: typeof loopB): string }).rotationTitle(loopB), "Just a plain task description here")
-  assert.equal((engine as unknown as { rotationTitle(loop: typeof loopC): string }).rotationTitle(loopC), "Task renaming everything")
-})
-
-test("rotation seed frames the original task", () => {
-  const { engine } = makeEngine("i1")
-  const seed = (engine as unknown as { rotationSeed(prompt: string): string }).rotationSeed("task description")
-  assert.match(seed, /previous session finished/i)
-  assert.match(seed, /Original task: task description/)
-})
+/* ------------------------------------------------------- helpers */
 
 test("missionText wraps prompt with keep-going instruction", () => {
   assert.equal(missionText("do stuff"), "do stuff\n\nKeep working.")

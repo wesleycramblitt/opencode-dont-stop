@@ -2,7 +2,7 @@
  * dont-stop — Loop engine.
  *
  * The engine owns the loop: it watches sessions, detects hangs, keeps turning
- * the prompt, manages session rotations, and recovers from failures. It holds
+ * the prompt, manages sessions, and recovers from failures. It holds
  * no model-selection logic — that lives in the sibling model-selector plugin,
  * which observes the same error events and rotates models in-process. This
  * plugin never writes to it, imports it, or depends on it being installed.
@@ -15,26 +15,17 @@
  * *the loop may only touch what it owns*:
  *
  * - **Ownership.** A loop belongs to the instance that started it (`owner`).
- *   Advancing, interrupting and rotating happen only there, so a second live
+ *   Advancing and interrupting happen only there, so a second live
  *   opencode process reports a loop but never drives it. A loop left behind by
  *   a dead owner is recovered on boot: adopted when its session still exists,
  *   halted when it does not.
- * - **A budget per failure, not per recovery.** Every model gets one try per
- *   episode — rotation moves to a model that has not been attempted since the
- *   last completed turn, so a chain of ten is walked and then stops instead of
- *   being cycled. Rotations are also counted against completed turns, so a
- *   wide chain cannot buy an unbounded number of losing bets either.
+ * - **A budget per failure, not per recovery.** Each model gets one try per
+ *   episode, so a chain of ten is walked and then stops instead of being
+ *   cycled.
  */
 
 import { ClockSet, DEFAULT_CLOCKS, type ClockOptions } from "./clocks.ts"
-import {
-  DEFAULT_ROTATION_THRESHOLD,
-  measureContext,
-  shouldRotate,
-  rotate as rotateSession,
-  sessionTree as fetchSessionTree,
-  type RotationContext,
-} from "./rotation.ts"
+
 import type { Logger } from "./log.ts"
 import { bumpIntent, readState, type LoopState, type PluginState } from "./state.ts"
 import { eventSignals, TURN_END_TYPES, type SessionEvent } from "./events.ts"
@@ -87,9 +78,7 @@ export interface EngineOptions {
   seedSessions?: string[]
   /** Hard cap on iterations, so a loop cannot run forever. */
   maxIterations?: number
-  /** Fraction of the effective context window at which to rotate. */
-  rotationThreshold?: number
-  /** Turns in one session before a fresh one is started. */
+  /** Turns in one session before the transcript is compacted. */
   sessionSteps?: number
   /** How often to re-inject the full loop prompt into an active session.
    *  Reinjection keeps the mission in front of the model once per-turn
@@ -126,7 +115,7 @@ export interface EngineOptions {
  */
 export const DEFAULT_MAX_ITERATIONS = 100
 
-/** Turns in one session before the loop rotates to a fresh one. */
+/** Turns in one session before the transcript is compacted. */
 export const DEFAULT_SESSION_STEPS = 30
 
 /** How many turns between scheduled full-prompt reinjections. */
@@ -190,7 +179,6 @@ export class LoopEngine {
   private readonly startedAt = Date.now()
 
   private readonly maxIterations: number
-  private readonly rotationThreshold: number
   private readonly sessionSteps: number
   private readonly reinjectEvery: number
   private readonly redriveDelayMs: number
@@ -217,7 +205,6 @@ export class LoopEngine {
     // will never be stopped.
     this.appliedIntent = 0
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS
-    this.rotationThreshold = options.rotationThreshold ?? DEFAULT_ROTATION_THRESHOLD
     this.sessionSteps = options.sessionSteps ?? DEFAULT_SESSION_STEPS
     this.reinjectEvery = options.reinjectEvery ?? DEFAULT_REINJECT_EVERY
     this.redriveDelayMs = options.redriveDelayMs ?? DEFAULT_REDRIVE_DELAY_MS
@@ -342,51 +329,6 @@ export class LoopEngine {
     }
 
     await this.advance(sessionID)
-  }
-
-  /* ------------------------------------------------------------ session tree */
-
-  private async sessionTree(rootID: string): Promise<string[]> {
-    const ctx = this.ctx as unknown as Pick<RotationContext, "session">
-    try {
-      return [rootID, ...(await fetchSessionTree(ctx, rootID))]
-    } catch {
-      return [rootID]
-    }
-  }
-
-  private async activeSessionIDs(): Promise<Set<string>> {
-    try {
-      const api = this.ctx as unknown as {
-        session: { active(): Promise<unknown> }
-      }
-      const active = await api.session.active()
-      const ids = new Set<string>()
-      if (Array.isArray(active)) {
-        for (const entry of active) {
-          if (typeof entry === "string") ids.add(entry)
-          else if (entry && typeof entry === "object") {
-            const id = (entry as Record<string, unknown>).id ?? (entry as Record<string, unknown>).sessionID
-            if (typeof id === "string") ids.add(id)
-          }
-        }
-      } else if (active && typeof active === "object") {
-        const data = (active as Record<string, unknown>).data
-        for (const key of Object.keys(data && typeof data === "object" ? data : active)) ids.add(key)
-      }
-      return ids
-    } catch {
-      return new Set()
-    }
-  }
-
-  private async interruptTree(rootID: string): Promise<void> {
-    const tree = await this.sessionTree(rootID)
-    const active = await this.activeSessionIDs()
-    for (const id of tree) {
-      const running = active.has(id) || this.clocks.peek(id)?.activity.running === true
-      if (running) await this.interrupt(id)
-    }
   }
 
   /* ----------------------------------------------------- best-effort cancel */
@@ -602,7 +544,7 @@ export class LoopEngine {
     this.log.warn(`hang detected on ${sessionID}: ${reason}`)
 
     this.hangInterrupts.set(sessionID, Date.now())
-    await this.interruptTree(sessionID)
+    await this.interrupt(sessionID)
     this.clocks.clocksFor(sessionID).interrupted(Date.now())
 
     const current = this.loopFor(sessionID)
@@ -745,15 +687,6 @@ export class LoopEngine {
         this.log.info(`compacted ${sessionID}: step budget exceeded, reset sessionIterations`)
       }
 
-      // Check rotation: step budget or context pressure
-      const rotationReason = await this.rotationReason(sessionID, loop)
-      if (rotationReason) {
-        await this.doRotate(sessionID, loop)
-        // If rotation happened, don't send a prompt — the successor starts its own turn
-        this.emit()
-        return
-      }
-
       const stagnant = !this.turnToolUse.has(sessionID)
       const lastRestated = this.lastReinjections.get(sessionID) ?? 0
       const overdue = this.reinjectEvery > 0 && iteration - lastRestated >= this.reinjectEvery
@@ -787,111 +720,6 @@ export class LoopEngine {
 
   private resetEpisode(): void {
     for (const loop of this.loops()) loop.rotations = 0
-  }
-
-  private async rotationReason(sessionID: string, loop: LoopState): Promise<string | null> {
-    if (loop.sessionIterations >= this.sessionSteps) return "session budget"
-    const limit = await this.contextLimitFor(sessionID)
-    if (limit <= 0) return null
-    const used = await this.contextUsed(sessionID)
-    if (used <= 0 || !shouldRotate(used, limit, this.rotationThreshold)) return null
-    return `context ${Math.round((used / limit) * 100)}%`
-  }
-
-  private rotationTitle(loop: LoopState): string {
-    // Title hygiene only, not a mode feature: loop prompts written in the wild
-    // may start with a `mode <word>` first line, which would otherwise become
-    // the session title.
-    const lines = loop.prompt
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0)
-    const task = lines.find((l) => !/^mode\s+\w+$/i.test(l)) ?? "loop"
-    return task.slice(0, 70)
-  }
-
-  private rotationSeed(prompt: string): string {
-    return (
-      `A previous session finished a stretch of work and was retired to keep context fresh. ` +
-      `Nothing was carried over: the repository is the state. Re-establish where the work stands ` +
-      `from the plans and task files, reading only as much as you need — the retired session ` +
-      `filled its window, so do not re-read large material wholesale and leave room in this one ` +
-      `for the work itself.\n\n` +
-      `Original task: ${prompt.trim() || "(none recorded)"}`
-    )
-  }
-
-  private async doRotate(sessionID: string, loop: LoopState): Promise<void> {
-    const title = this.rotationTitle(loop)
-    const seed = this.rotationSeed(loop.prompt)
-    const agent = this.tracked.get(sessionID)?.agent ?? "general"
-    const result = await rotateSession(this.ctx as unknown as RotationContext, {
-      sessionID,
-      seed,
-      agent,
-      title: `${title} · loop ${loop.sessionNumber + 1}`,
-    })
-
-    if (!result.rotated) {
-      loop.lastResult = `rotation deferred: ${result.deferred ?? "unknown"}`
-      this.log.info(`${sessionID}: rotation deferred (${result.deferred})`)
-      return
-    }
-
-    // Retire the old row in place — never delete it. writeState merges rows
-    // from disk that memory is missing, so a deleted row is resurrected as
-    // active on the next persist and driven alongside its successor. The
-    // retired row keeps its owner and a fresh beat so the merge prefers this
-    // stopped row over the active one still on disk.
-    loop.status = "stopped"
-    loop.lastResult = `rotated to ${result.newSessionID} after ${loop.sessionIterations} turns`
-    loop.ownerBeatAt = Date.now()
-    loop.turnStartedAt = null
-    this.log.info(
-      `loop on ${sessionID} rotated to ${result.newSessionID} after ${loop.sessionIterations} turns; ` +
-        `old session retired${result.deletedOld ? " and deleted" : ""}` +
-        `${result.deleteError ? ` (delete failed: ${result.deleteError})` : ""}`,
-    )
-
-    const newLoop: LoopState = {
-      ...loop,
-      sessionID: result.newSessionID ?? sessionID,
-      status: "active",
-      iterations: loop.iterations,
-      sessionIterations: 0,
-      sessionNumber: loop.sessionNumber + 1,
-      rotations: loop.rotations + 1,
-      turnStartedAt: null,
-      startedAt: Date.now(),
-      owner: this.instanceID,
-      ownerBeatAt: Date.now(),
-    }
-    this.state.loops[newLoop.sessionID!] = newLoop
-
-    this.clearRedrive(sessionID)
-    this.armedSessions.delete(sessionID)
-    this.hangInterrupts.delete(sessionID)
-    this.turnToolUse.delete(sessionID)
-    this.lastReinjections.delete(sessionID)
-    this.messageCounts.delete(sessionID)
-    this.messageCounts.set(newLoop.sessionID!, 0)
-
-    this.emit()
-  }
-
-  private async contextLimitFor(_sessionID: string): Promise<number> {
-    // Without catalogue access, return a generous default. Model-selector
-    // tracks actual context limits on pinned models.
-    return 200_000
-  }
-
-  private async contextUsed(sessionID: string): Promise<number> {
-    try {
-      const messages = await this.readMessages(sessionID)
-      return measureContext(messages)
-    } catch {
-      return 0
-    }
   }
 
   private async readMessages(sessionID: string): Promise<unknown> {
@@ -985,13 +813,9 @@ export class LoopEngine {
       this.turnToolUse.delete(sid)
       this.lastReinjections.delete(sid)
 
-      await this.interruptTree(sid)
+      await this.interrupt(sid)
       this.clocks.forget(sid)
-      const tree = await this.sessionTree(sid)
-      for (const id of tree) {
-        if (id === sid) continue
-        this.untrack(id)
-      }
+      this.untrack(sid)
     }
     if (acted) this.resetEpisode()
 

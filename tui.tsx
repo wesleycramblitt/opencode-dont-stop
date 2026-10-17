@@ -109,22 +109,29 @@ export default {
       lastAnnounced = state.updated
 
       const loops = Object.values(state.loops)
-      const primary = loops.find((l) => l.status === "active")
+      const primary = [...loops.filter((l) => l.status === "active")].sort(
+        (a, b) => (b.ownerBeatAt || b.startedAt || 0) - (a.ownerBeatAt || a.startedAt || 0),
+      )[0]
       const here = currentSessionID ? state.loops[currentSessionID] : undefined
+      const hereActive = here?.status === "active"
 
-      if (here) {
+      // Follow a rotation: we were watching an active loop on this session,
+      // and now it is stopped/retired but a different active loop exists.
+      // The old row is kept as `stopped` (not deleted), so we trigger on
+      // `hereActive` going false, not on `here` becoming undefined. Parse
+      // the successor from lastResult when present, otherwise fall back to
+      // the newest primary.
+      // No rotation in single-session mode: the loop stays on its session.
+      if (hereActive) {
         sawLoopHere = true
-      } else if (sawLoopHere && primary && primary.sessionID === currentSessionID) {
-        sawLoopHere = false
-        followSession(primary.sessionID!)
       }
-      watchingLoop = here?.status === "active"
+      watchingLoop = hereActive
 
-      if (here && here.status === "active" && previous === 0) {
+      if (hereActive && previous === 0) {
         toast(ctx, "info", "dont-stop", `loop running`)
         return
       }
-      const loop = here
+      const loop = hereActive ? here : undefined
       const message = loop?.lastResult
       if (previous === 0) {
         if (message) lastMessage = message
@@ -259,7 +266,9 @@ function DontStopFooter(props: { state: () => PluginState; sessionID: string | n
           state.intent.action === "halt" &&
           state.intent.at > (loop!.startedAt ?? 0)
         const halting = pendingHalt && Date.now() - state.intent.at < 90_000
-        if (!active) return <text fg="gray">idle</text>
+        if (!active) {
+          return <text fg="gray">idle</text>
+        }
         if (halting) return <text fg="yellow">halting…</text>
         return (
           <>
