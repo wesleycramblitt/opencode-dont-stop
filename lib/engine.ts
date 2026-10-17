@@ -769,6 +769,12 @@ export class LoopEngine {
     this.log.info(`loop started on ${sessionID}: ${prompt.slice(0, 80)}`)
 
     try {
+      // Every new loop starts from a compacted transcript, so stale context
+      // from prior work never pollutes the fresh run. Forced: bypasses the
+      // step-budget cooldown — a new loop always wants a clean slate.
+      // Failure is non-fatal (logged inside compactSession); the loop still
+      // starts.
+      await this.compactSession(sessionID, true)
       await this.sendPrompt(sessionID, prompt)
       this.clocks.clocksFor(sessionID).start(Date.now())
       const count = await this.messageCount(sessionID)
@@ -846,9 +852,11 @@ export class LoopEngine {
 
   /* ---------------------------------------------------------- compaction */
 
-  private async compactSession(sessionID: string): Promise<boolean> {
-    const last = this.compactionRequests.get(sessionID) ?? 0
-    if (Date.now() - last < COMPACTION_REQUEST_COOLDOWN_MS) return false
+  private async compactSession(sessionID: string, force = false): Promise<boolean> {
+    if (!force) {
+      const last = this.compactionRequests.get(sessionID) ?? 0
+      if (Date.now() - last < COMPACTION_REQUEST_COOLDOWN_MS) return false
+    }
     this.compactionRequests.set(sessionID, Date.now())
     try {
       const api = this.ctx as {
